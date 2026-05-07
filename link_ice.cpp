@@ -1,0 +1,574 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
+/// @file   plugins/links/ice/link_ice.cpp
+
+#include "link_ice.hpp"
+
+#include "candidate.hpp"
+
+#include <sdk/conn_events.h>
+#include <sdk/convenience.h>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace gn::link::ice {
+
+namespace {
+
+constexpr std::uint32_t kReaperIntervalSeconds = 30;
+constexpr std::uint32_t kIdleSessionLimitSeconds = 60;
+
+constexpr std::array<std::string_view, 1> kDefaultStunServers = {
+    "stun.l.google.com:19302"
+};
+
+}  // namespace
+
+IceLink::IceLink()
+    : ioc_(),
+      work_(asio::make_work_guard(ioc_)),
+      reaper_timer_(ioc_) {
+    {
+        /// Default config snapshot — overwritten by `apply_config`
+        /// once `set_host_api` binds the kernel.
+        std::lock_guard lk(cfg_mu_);
+        for (auto sv : kDefaultStunServers) {
+            cfg_.stun_servers.emplace_back(sv);
+        }
+    }
+    /// `weak_from_this()` is unusable until the enclosing
+    /// `make_shared` finishes, so the reaper boot has to wait until
+    /// the first `set_host_api`. The worker thread spins immediately
+    /// because it does not need `shared_from_this()`.
+    worker_ = std::thread([this] { ioc_.run(); });
+}
+
+IceLink::~IceLink() {
+    shutdown();
+}
+
+void IceLink::apply_config() noexcept {
+    if (api_ == nullptr || api_->config_get == nullptr) return;
+
+    IceConfig cfg;
+    /// Default STUN entry — same as constructor; reload that drops
+    /// the `ice.stun_servers` key falls back to the public Google
+    /// resolver instead of disabling STUN gathering outright.
+    for (auto sv : kDefaultStunServers) {
+        cfg.stun_servers.emplace_back(sv);
+    }
+
+    std::size_t arr_size = 0;
+    if (gn_config_get_array_size(api_, "ice.stun_servers", &arr_size) == GN_OK) {
+        cfg.stun_servers.clear();
+        for (std::size_t i = 0; i < arr_size; ++i) {
+            const char* value = nullptr;
+            void* user_data = nullptr;
+            void (*free_fn)(void*, void*) = nullptr;
+            if (gn_config_get_array_string(api_, "ice.stun_servers", i,
+                                            &value, &user_data, &free_fn) == GN_OK
+                && value != nullptr) {
+                cfg.stun_servers.emplace_back(value);
+                if (free_fn != nullptr) {
+                    free_fn(user_data, const_cast<char*>(value));
+                }
+            }
+        }
+    }
+
+    /// Single-server TURN config covers the common deployment case;
+    /// multi-server fallback is a v1.1 extension.
+    {
+        const char* value = nullptr;
+        void* user_data = nullptr;
+        void (*free_fn)(void*, void*) = nullptr;
+        if (gn_config_get_string(api_, "ice.turn_servers",
+                                  &value, &user_data, &free_fn) == GN_OK
+            && value != nullptr) {
+            std::string s(value);
+            if (free_fn != nullptr) {
+                free_fn(user_data, const_cast<char*>(value));
+            }
+            auto colon = s.rfind(':');
+            if (colon != std::string::npos) {
+                cfg.turn.server = s.substr(0, colon);
+                try {
+                    cfg.turn.port = static_cast<std::uint16_t>(
+                        std::stoul(s.substr(colon + 1)));
+                } catch (...) {
+                    cfg.turn.port = 3478;
+                }
+            } else {
+                cfg.turn.server = std::move(s);
+            }
+        }
+    }
+    {
+        const char* value = nullptr;
+        void* user_data = nullptr;
+        void (*free_fn)(void*, void*) = nullptr;
+        if (gn_config_get_string(api_, "ice.turn_username",
+                                  &value, &user_data, &free_fn) == GN_OK
+            && value != nullptr) {
+            cfg.turn.username = value;
+            if (free_fn != nullptr) {
+                free_fn(user_data, const_cast<char*>(value));
+            }
+        }
+    }
+    {
+        const char* value = nullptr;
+        void* user_data = nullptr;
+        void (*free_fn)(void*, void*) = nullptr;
+        if (gn_config_get_string(api_, "ice.turn_password",
+                                  &value, &user_data, &free_fn) == GN_OK
+            && value != nullptr) {
+            cfg.turn.password = value;
+            if (free_fn != nullptr) {
+                free_fn(user_data, const_cast<char*>(value));
+            }
+        }
+    }
+
+    std::int64_t v = 0;
+    if (gn_config_get_int64(api_, "ice.session_timeout_s", &v) == GN_OK
+        && v > 0 && v < 3600) {
+        cfg.session_timeout_s = static_cast<int>(v);
+    }
+    if (gn_config_get_int64(api_, "ice.keepalive_interval_s", &v) == GN_OK
+        && v > 0 && v < 3600) {
+        cfg.keepalive_interval_s = static_cast<int>(v);
+    }
+    if (gn_config_get_int64(api_, "ice.consent_max_failures", &v) == GN_OK
+        && v > 0 && v < 100) {
+        cfg.consent_max_failures = static_cast<int>(v);
+    }
+    if (gn_config_get_int64(api_, "ice.check_interval_ms", &v) == GN_OK
+        && v > 0 && v < 60000) {
+        cfg.check_interval_ms = static_cast<int>(v);
+    }
+
+    std::lock_guard lk(cfg_mu_);
+    cfg_ = std::move(cfg);
+}
+
+void IceLink::set_host_api(const host_api_t* api) noexcept {
+    if (api_ != nullptr && api_->unsubscribe != nullptr
+        && reload_sub_id_ != 0) {
+        (void)api_->unsubscribe(api_->host_ctx, reload_sub_id_);
+        reload_sub_id_ = 0;
+    }
+
+    api_ = api;
+    apply_config();
+
+    /// Reaper rides `weak_from_this()`; first `set_host_api` is the
+    /// earliest point at which the enclosing `make_shared` has
+    /// guaranteed the weak-ptr machinery, so the boot is staged here
+    /// rather than in the constructor.
+    if (!reaper_started_) {
+        reaper_started_ = true;
+        start_reaper();
+    }
+
+    if (api_ != nullptr && api_->subscribe_config_reload != nullptr) {
+        gn_subscription_id_t token = GN_INVALID_SUBSCRIPTION_ID;
+        const auto rc = api_->subscribe_config_reload(
+            api_->host_ctx,
+            +[](void* user_data) {
+                auto* self = static_cast<IceLink*>(user_data);
+                self->apply_config();
+            },
+            this,
+            /*ud_destroy*/ nullptr,
+            &token);
+        if (rc == GN_OK) {
+            reload_sub_id_ = token;
+        }
+    }
+}
+
+std::size_t IceLink::session_count() const noexcept {
+    std::lock_guard lk(sessions_mu_);
+    return sessions_.size();
+}
+
+IceLink::Stats IceLink::stats() const noexcept {
+    Stats s{};
+    s.bytes_in           = bytes_in_.load(std::memory_order_relaxed);
+    s.bytes_out          = bytes_out_.load(std::memory_order_relaxed);
+    s.frames_in          = frames_in_.load(std::memory_order_relaxed);
+    s.frames_out         = frames_out_.load(std::memory_order_relaxed);
+    s.active_connections = session_count();
+    return s;
+}
+
+gn_link_caps_t IceLink::capabilities() noexcept {
+    gn_link_caps_t c{};
+    c.flags       = GN_LINK_CAP_DATAGRAM;
+    c.max_payload = kDefaultMtu;
+    return c;
+}
+
+bool IceLink::parse_peer_pk_hex(std::string_view hex,
+                                  std::uint8_t out[GN_PUBLIC_KEY_BYTES]) {
+    if (hex.size() != GN_PUBLIC_KEY_BYTES * 2) return false;
+    for (std::size_t i = 0; i < GN_PUBLIC_KEY_BYTES; ++i) {
+        const auto a = hex[i * 2];
+        const auto b = hex[i * 2 + 1];
+        const auto digit = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return -1;
+        };
+        const auto hi = digit(a);
+        const auto lo = digit(b);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+std::string IceLink::pk_to_hex(const std::uint8_t pk[GN_PUBLIC_KEY_BYTES]) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out(GN_PUBLIC_KEY_BYTES * 2, '0');
+    for (std::size_t i = 0; i < GN_PUBLIC_KEY_BYTES; ++i) {
+        out[i * 2]     = digits[pk[i] >> 4];
+        out[i * 2 + 1] = digits[pk[i] & 0x0F];
+    }
+    return out;
+}
+
+IceSessionCallbacks IceLink::make_callbacks(gn_conn_id_t id) {
+    auto weak_self = std::weak_ptr<IceLink>(shared_from_this());
+    return {
+        .on_gathered = [weak_self, id](const std::string&) {
+            (void)id;
+            auto self = weak_self.lock();
+            if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+        },
+        .on_connected = [weak_self, id](const std::string&,
+                                          const std::string& /*ip*/,
+                                          std::uint16_t /*port*/) {
+            (void)id;
+            auto self = weak_self.lock();
+            if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            /// `notify_connect` already fired when the session was
+            /// allocated; nomination is just the path coming online.
+        },
+        .on_failed = [weak_self, id](const std::string&, int /*err*/) {
+            auto self = weak_self.lock();
+            if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            if (!self->claim_disconnect(id)) return;
+            if (self->api_ && self->api_->notify_disconnect) {
+                (void)self->api_->notify_disconnect(
+                    self->api_->host_ctx, id, GN_ERR_NOT_FOUND);
+            }
+        },
+        .on_data = [weak_self, id](const std::string&,
+                                     std::span<const std::uint8_t> data) {
+            auto self = weak_self.lock();
+            if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            if (!self->api_ || !self->api_->notify_inbound_bytes) return;
+            self->bytes_in_.fetch_add(data.size(), std::memory_order_relaxed);
+            self->frames_in_.fetch_add(1, std::memory_order_relaxed);
+            (void)self->api_->notify_inbound_bytes(
+                self->api_->host_ctx, id, data.data(), data.size());
+        },
+    };
+}
+
+gn_result_t IceLink::listen(std::string_view uri) {
+    /// ICE is peer-to-peer; the listen surface is shape-only. Reject
+    /// anything that does not parse as `ice://...` so a malformed URI
+    /// fails fast instead of silently succeeding.
+    if (!uri.starts_with("ice://")) return GN_ERR_INVALID_ENVELOPE;
+    return GN_OK;
+}
+
+gn_result_t IceLink::connect(std::string_view uri) {
+    if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
+    if (!uri.starts_with("ice://")) return GN_ERR_INVALID_ENVELOPE;
+    auto suffix = uri.substr(6);
+    /// Strip a trailing `/` for symmetry with WS / TCP URI shapes.
+    if (!suffix.empty() && suffix.back() == '/') {
+        suffix.remove_suffix(1);
+    }
+
+    std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES] = {};
+    if (!parse_peer_pk_hex(suffix, peer_pk)) {
+        return GN_ERR_INVALID_ENVELOPE;
+    }
+    const auto peer_hex = std::string(suffix);
+
+    if (!api_ || !api_->notify_connect) return GN_ERR_NOT_IMPLEMENTED;
+
+    gn_conn_id_t conn = GN_INVALID_ID;
+    {
+        std::lock_guard lk(sessions_mu_);
+        if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
+            return GN_OK;
+        }
+
+        const std::string canonical = "ice://" + peer_hex;
+        const auto rc = api_->notify_connect(
+            api_->host_ctx, peer_pk, canonical.c_str(),
+            GN_TRUST_UNTRUSTED, GN_ROLE_INITIATOR, &conn);
+        if (rc != GN_OK || conn == GN_INVALID_ID) return rc;
+
+        IceConfig cfg_snap;
+        {
+            std::lock_guard cfg_lk(cfg_mu_);
+            cfg_snap = cfg_;
+        }
+        auto session = std::make_shared<IceSession>(
+            ioc_, cfg_snap, peer_hex, /*controlling=*/true,
+            make_callbacks(conn));
+        sessions_[conn] = {conn, session, peer_hex};
+        peer_to_id_[peer_hex] = conn;
+        published_ids_.push_back(conn);
+
+        asio::post(ioc_, [session] { session->gather(); });
+    }
+
+    if (api_->kick_handshake) {
+        (void)api_->kick_handshake(api_->host_ctx, conn);
+    }
+    return GN_OK;
+}
+
+gn_result_t IceLink::send(gn_conn_id_t conn,
+                            std::span<const std::uint8_t> bytes) {
+    if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
+    if (bytes.size() > mtu_.load(std::memory_order_relaxed)) {
+        return GN_ERR_PAYLOAD_TOO_LARGE;
+    }
+    std::shared_ptr<IceSession> session;
+    {
+        std::lock_guard lk(sessions_mu_);
+        auto it = sessions_.find(conn);
+        if (it == sessions_.end()) return GN_ERR_NOT_FOUND;
+        session = it->second.session;
+    }
+    session->send(bytes);
+    bytes_out_.fetch_add(bytes.size(), std::memory_order_relaxed);
+    frames_out_.fetch_add(1, std::memory_order_relaxed);
+    return GN_OK;
+}
+
+gn_result_t IceLink::send_batch(
+    gn_conn_id_t conn,
+    std::span<const std::span<const std::uint8_t>> frames) {
+    /// Datagram link semantics: pre-validate all frames against MTU
+    /// up front so a partial batch never hits the wire when one
+    /// frame is malformed.
+    const auto cap = mtu_.load(std::memory_order_relaxed);
+    for (const auto& f : frames) {
+        if (f.size() > cap) return GN_ERR_PAYLOAD_TOO_LARGE;
+    }
+    for (const auto& f : frames) {
+        if (const auto rc = send(conn, f); rc != GN_OK) return rc;
+    }
+    return GN_OK;
+}
+
+gn_result_t IceLink::disconnect(gn_conn_id_t conn) {
+    std::shared_ptr<IceSession> session;
+    bool erased = false;
+    {
+        std::lock_guard lk(sessions_mu_);
+        auto it = sessions_.find(conn);
+        if (it == sessions_.end()) return GN_OK;
+        session = it->second.session;
+        peer_to_id_.erase(it->second.peer_pk_hex);
+        sessions_.erase(it);
+        erased = true;
+    }
+    if (session) session->close();
+    if (erased && api_ && api_->notify_disconnect) {
+        (void)api_->notify_disconnect(api_->host_ctx, conn, GN_OK);
+    }
+    return GN_OK;
+}
+
+bool IceLink::claim_disconnect(gn_conn_id_t id) {
+    std::lock_guard lk(sessions_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    auto it = sessions_.find(id);
+    if (it == sessions_.end()) return false;
+    peer_to_id_.erase(it->second.peer_pk_hex);
+    sessions_.erase(it);
+    return true;
+}
+
+gn_result_t IceLink::deliver_signal(
+    const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+    std::uint8_t kind,
+    std::span<const std::uint8_t> blob) {
+    if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
+    if (kind != ICE_SIGNAL_OFFER && kind != ICE_SIGNAL_ANSWER) {
+        return GN_ERR_INVALID_ENVELOPE;
+    }
+    if (blob.size() < sizeof(IceSignalData)) return GN_ERR_INVALID_ENVELOPE;
+
+    IceSignalData hdr{};
+    std::vector<Candidate> candidates;
+    if (!deserialize_signal(blob, hdr, candidates)) {
+        return GN_ERR_INVALID_ENVELOPE;
+    }
+    std::string ufrag(hdr.ufrag, ::strnlen(hdr.ufrag, sizeof(hdr.ufrag)));
+    std::string pwd(hdr.pwd, ::strnlen(hdr.pwd, sizeof(hdr.pwd)));
+
+    const auto peer_hex = pk_to_hex(peer_pk);
+
+    if (kind == ICE_SIGNAL_OFFER) {
+        if (!api_ || !api_->notify_connect) return GN_ERR_NOT_IMPLEMENTED;
+        gn_conn_id_t conn = GN_INVALID_ID;
+        std::shared_ptr<IceSession> session;
+        {
+            std::lock_guard lk(sessions_mu_);
+            if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
+                /// Already gathering / checking against this peer —
+                /// fold the freshly arrived candidates into the
+                /// existing session.
+                auto sit = sessions_.find(it->second);
+                if (sit != sessions_.end()) {
+                    session = sit->second.session;
+                }
+            } else {
+                const std::string canonical = "ice://" + peer_hex;
+                const auto rc = api_->notify_connect(
+                    api_->host_ctx, peer_pk, canonical.c_str(),
+                    GN_TRUST_UNTRUSTED, GN_ROLE_RESPONDER, &conn);
+                if (rc != GN_OK || conn == GN_INVALID_ID) return rc;
+
+                IceConfig cfg_snap;
+                {
+                    std::lock_guard cfg_lk(cfg_mu_);
+                    cfg_snap = cfg_;
+                }
+                session = std::make_shared<IceSession>(
+                    ioc_, cfg_snap, peer_hex, /*controlling=*/false,
+                    make_callbacks(conn));
+                sessions_[conn] = {conn, session, peer_hex};
+                peer_to_id_[peer_hex] = conn;
+                published_ids_.push_back(conn);
+            }
+        }
+        if (session) {
+            asio::post(ioc_,
+                [session, ufrag = std::move(ufrag),
+                 pwd = std::move(pwd),
+                 cands = std::move(candidates)]() mutable {
+                    session->set_remote(ufrag, pwd, std::move(cands));
+                    session->gather();
+                });
+        }
+        return GN_OK;
+    }
+
+    /// ANSWER path — must correlate to an existing controller-role
+    /// session. A stray answer with no in-flight session is
+    /// `GN_ERR_NOT_FOUND` rather than spawning a fresh responder.
+    std::shared_ptr<IceSession> session;
+    {
+        std::lock_guard lk(sessions_mu_);
+        auto it = peer_to_id_.find(peer_hex);
+        if (it == peer_to_id_.end()) return GN_ERR_NOT_FOUND;
+        auto sit = sessions_.find(it->second);
+        if (sit == sessions_.end()) return GN_ERR_NOT_FOUND;
+        session = sit->second.session;
+    }
+    if (session) {
+        asio::post(ioc_,
+            [session, ufrag = std::move(ufrag),
+             pwd = std::move(pwd),
+             cands = std::move(candidates)]() mutable {
+                session->set_remote(ufrag, pwd, std::move(cands));
+            });
+    }
+    return GN_OK;
+}
+
+void IceLink::start_reaper() {
+    reaper_timer_.expires_after(std::chrono::seconds(kReaperIntervalSeconds));
+    reaper_timer_.async_wait([weak = std::weak_ptr<IceLink>(shared_from_this())](
+                                  const std::error_code& ec) {
+        auto self = weak.lock();
+        if (!self) return;
+        if (ec) return;
+        if (self->shutdown_.load(std::memory_order_acquire)) return;
+        self->reap_sessions();
+        self->start_reaper();
+    });
+}
+
+void IceLink::reap_sessions() {
+    auto now = std::chrono::steady_clock::now();
+    auto idle_limit = std::chrono::seconds(kIdleSessionLimitSeconds);
+
+    std::vector<gn_conn_id_t> to_drop;
+    {
+        std::lock_guard lk(sessions_mu_);
+        for (auto& [id, entry] : sessions_) {
+            if (entry.session->state() != SessionState::Connected
+                && now - entry.session->last_activity() > idle_limit) {
+                to_drop.push_back(id);
+            }
+        }
+    }
+    for (const auto id : to_drop) {
+        (void)disconnect(id);
+    }
+}
+
+void IceLink::shutdown() {
+    /// Cancel the reaper before we invalidate `weak_from_this()` —
+    /// the timer's bound shared_ptr captures the link, not the kernel,
+    /// so a fired-while-quiescing handler is benign but wasteful.
+    /// Standalone Asio's cancel() returns `size_t` (handlers cancelled)
+    /// without an error_code overload — the call cannot fail in a way
+    /// the caller can act on, so the value is discarded.
+    (void)reaper_timer_.cancel();
+
+    std::vector<gn_conn_id_t> ids_to_emit;
+    std::vector<std::shared_ptr<IceSession>> live_sessions;
+    {
+        std::lock_guard lk(sessions_mu_);
+        if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
+        ids_to_emit = std::move(published_ids_);
+        published_ids_.clear();
+        live_sessions.reserve(sessions_.size());
+        for (auto& [_id, entry] : sessions_) {
+            live_sessions.push_back(entry.session);
+        }
+        sessions_.clear();
+        peer_to_id_.clear();
+    }
+    for (auto& s : live_sessions) {
+        if (s) s->close();
+    }
+
+    if (api_ && api_->notify_disconnect) {
+        for (const auto id : ids_to_emit) {
+            (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
+        }
+    }
+
+    work_.reset();
+    ioc_.stop();
+    if (worker_.joinable()) worker_.join();
+}
+
+}  // namespace gn::link::ice
