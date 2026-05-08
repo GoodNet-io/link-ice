@@ -20,20 +20,19 @@ serialized candidate sets; the link maps `peer_pk` onto an
 
 ## Build
 
-In-tree, alongside the kernel:
+This plugin lives in its own git with a flake that pulls the
+kernel SDK as a Nix input. From this checkout:
 
 ```sh
-nix build .#goodnet-link-ice
-# result/lib/goodnet/plugins/libgoodnet_link_ice.so
+nix run .#build         # release build of libgoodnet_link_ice.so
+nix run .#test          # vanilla ctest (FSM, STUN, TURN parsing)
+nix run .#test-asan     # AddressSanitizer + UBSan
+nix run .#test-tsan     # ThreadSanitizer
 ```
 
-Standalone, against an installed kernel SDK:
-
-```sh
-cd plugins/links/ice
-nix develop
-nix run .#test
-```
+The kernel monorepo also builds this plugin in-tree through its
+own `nix run .#build -- release` — operator install consumes
+every bundled `.so` from there.
 
 ## Configuration
 
@@ -50,6 +49,6 @@ nix run .#test
 
 ## Contract
 
-- Kernel-side link contract: `docs/contracts/link.md`
+- Kernel-side link contract: `docs/contracts/link.en.md`
 - ICE wire candidates: `candidate.hpp::CandidateWire` (24 bytes)
   and `IceSignalData` (44 bytes). Stable for interop with bridges.
