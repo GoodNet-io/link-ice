@@ -6,18 +6,30 @@
 /// Held by `IceSession` through a `shared_ptr`; async refresh and
 /// recv closures pin the client through `weak_from_this()` so a
 /// session that already tore down silently no-ops the next callback.
+///
+/// I/O model (Слайс 11a): TURN bytes flow through the shared
+/// `gn.link.udp` carrier instead of an inline `asio::ip::udp::socket`.
+/// The TURN server endpoint gets a dedicated carrier conn id
+/// (`server_cid_`) allocated by the session at construction time;
+/// `send_to_server` forwards on that cid and `on_inbound` is called
+/// by the session's per-cid data dispatcher.
 
 #include "stun.hpp"
 
 #include <asio/io_context.hpp>
-#include <asio/ip/udp.hpp>
 #include <asio/steady_timer.hpp>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+
+#include <sdk/cpp/link_carrier.hpp>
+#include <sdk/types.h>
 
 namespace gn::link::ice {
 
@@ -27,6 +39,23 @@ struct TurnConfig {
     uint16_t    port = 3478;
     std::string username;
     std::string password;
+    /// RFC 5389 §7.2.2 / RFC 5766 §2.1: TURN over TCP. UDP is the
+    /// default per RFC 5766 §2.1, but operators behind UDP-blocked
+    /// firewalls (corporate / mobile) frequently fall back to TCP.
+    /// When `true`, the session resolves `gn.link.tcp` as the
+    /// carrier for the TURN server endpoint and the TurnClient
+    /// applies STUN-over-TCP framing (2-byte big-endian length
+    /// prefix per message, RFC 5389 §7.2.2).
+    bool        tcp_transport = false;
+    /// TURN-over-TLS (the `turns://` scheme). When `true`, the
+    /// session resolves `gn.link.tls` for the TURN server endpoint
+    /// — the TLS plugin handles handshake + record-layer encryption
+    /// over a TCP carrier underneath. Framing is the same
+    /// length-prefixed STUN as plain TCP. `tls_transport` takes
+    /// precedence over `tcp_transport` if both are set. Used in
+    /// restrictive corporate firewalls that allow only outbound
+    /// 443/TCP.
+    bool        tls_transport = false;
 };
 
 /// Callback when data arrives via TURN relay.
@@ -44,12 +73,16 @@ using TurnAllocatedCallback = std::function<void(const std::string& relay_ip,
 /// safely no-op if the session has already torn it down.
 class TurnClient : public std::enable_shared_from_this<TurnClient> {
 public:
-    TurnClient(asio::io_context& io, const TurnConfig& cfg,
+    TurnClient(asio::io_context& io,
+               gn::sdk::LinkCarrier* carrier,
+               gn_conn_id_t server_cid,
+               const TurnConfig& cfg,
                TurnDataCallback data_cb,
                TurnAllocatedCallback alloc_cb = nullptr);
     ~TurnClient();
 
-    /// Start allocation. Returns false if config is invalid.
+    /// Start allocation. Returns false if config is invalid or the
+    /// carrier handle is missing.
     bool allocate();
 
     /// Send data through the relay to a peer.
@@ -58,6 +91,17 @@ public:
 
     /// Create permission for a peer IP.
     void create_permission(const std::string& peer_ip);
+
+    /// Bind a TURN channel (RFC 5766 §11) to (peer_ip, peer_port).
+    /// Allocates a 16-bit channel number from the 0x4000-0x7FFF
+    /// range, sends ChannelBind to the server, and switches
+    /// subsequent `send_indication` calls for that peer onto the
+    /// ChannelData fast path (4-byte header vs full Send-Indication
+    /// envelope ~36 bytes — meaningful saving on small payloads).
+    /// Channels expire after 10 minutes per RFC; `schedule_refresh`
+    /// re-binds before timeout. Idempotent — second call for the
+    /// same peer returns the existing channel.
+    void bind_channel(const std::string& peer_ip, uint16_t peer_port);
 
     /// Refresh allocation lifetime.
     void refresh();
@@ -69,14 +113,26 @@ public:
     MappedAddress relayed_address() const;
     bool is_allocated() const { return allocated_; }
 
+    /// Carrier conn id this client uses to talk to the TURN server.
+    /// The owning `IceSession` routes inbound bytes from this cid
+    /// here via `on_inbound`.
+    [[nodiscard]] gn_conn_id_t server_cid() const noexcept {
+        return server_cid_;
+    }
+
+    /// Feed bytes received on `server_cid_` into the TURN state
+    /// machine. Called by `IceSession::on_carrier_data` whenever the
+    /// per-cid dispatcher routes inbound bytes destined for TURN.
+    void on_inbound(std::span<const uint8_t> bytes);
+
 private:
     asio::io_context& io_;
+    gn::sdk::LinkCarrier* carrier_ = nullptr;
+    gn_conn_id_t server_cid_ = 0;
     TurnConfig cfg_;
     TurnDataCallback data_cb_;
     TurnAllocatedCallback alloc_cb_;
 
-    asio::ip::udp::socket socket_;
-    asio::ip::udp::endpoint server_ep_;
     asio::steady_timer refresh_timer_;
 
     std::mutex mu_;
@@ -89,13 +145,28 @@ private:
 
     std::unordered_set<std::string> permissions_;
 
-    std::array<uint8_t, 2048> recv_buf_{};
-    asio::ip::udp::endpoint sender_ep_;
+    /// Bound channels keyed by `ip:port`. The forward map drives
+    /// outbound (peer → channel for ChannelData encode); the reverse
+    /// map drives inbound (channel → peer for surfacing the source
+    /// to the data callback). Channels are allocated sequentially
+    /// starting at `TURN_CHANNEL_NUMBER_MIN`.
+    std::unordered_map<std::string, uint16_t>            peer_to_channel_;
+    std::unordered_map<uint16_t, std::pair<std::string,
+                                              uint16_t>> channel_to_peer_;
+    uint16_t                                              next_channel_ = 0x4000;
 
-    void start_recv();
-    void handle_recv(size_t bytes);
+    /// TURN-over-TCP reassembly buffer. STUN messages on a TCP
+    /// transport ride a 2-byte length prefix (RFC 5389 §7.2.2). The
+    /// carrier delivers TCP bytes in arbitrary-sized chunks; we
+    /// accumulate them here and extract complete messages whenever
+    /// the buffer holds at least a full prefixed envelope. Unused
+    /// when `cfg_.tcp_transport == false`.
+    std::vector<uint8_t> rx_buffer_;
+
+    void send_to_server(std::span<const std::uint8_t> bytes) noexcept;
     void handle_allocate_response(const StunMessage& msg);
     void handle_data_indication(const StunMessage& msg);
+    void handle_channel_data(std::span<const uint8_t> bytes);
     void compute_auth_key();
     void schedule_refresh();
 };

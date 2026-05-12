@@ -34,6 +34,7 @@
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
 
+#include <sdk/cpp/link_carrier.hpp>
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
 #include <sdk/trust.h>
@@ -77,8 +78,24 @@ extern "C" struct gn_link_ice_signal_api_s {
                            const std::uint8_t* blob,
                            std::size_t blob_size);
 
+    /// RFC 8838 §10 end-of-candidates variants. The signaling
+    /// transport emits these on the FINAL trickle batch to tell the
+    /// receiver "no more candidates from my side". The receiver
+    /// (us) marks the session and, under regular nomination, can
+    /// commit to the current best valid pair immediately rather
+    /// than waiting for a possibly-higher-priority candidate that
+    /// will never arrive.
+    gn_result_t (*offer_eoc)(void* ctx,
+                              const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+                              const std::uint8_t* blob,
+                              std::size_t blob_size);
+    gn_result_t (*answer_eoc)(void* ctx,
+                                const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+                                const std::uint8_t* blob,
+                                std::size_t blob_size);
+
     void* ctx;
-    void* _reserved[4];
+    void* _reserved[2];
 };
 using gn_link_ice_signal_api_t = struct gn_link_ice_signal_api_s;
 
@@ -133,6 +150,20 @@ public:
         std::uint8_t kind,
         std::span<const std::uint8_t> blob);
 
+    /// Snapshot of nomination metrics for `conn`. Used by future
+    /// `gn.link.ice` metrics extension consumers (strategy plugins
+    /// in Слайс 9). Returns `nominated == false` if the conn id is
+    /// unknown or its FSM hasn't reached `Connected`.
+    [[nodiscard]] NominationMetrics nomination_metrics(
+        gn_conn_id_t conn) const noexcept;
+
+    /// RFC 8445 §9 ICE restart for an already-tracked connection.
+    /// Regenerates ufrag/pwd and re-enters Gathering. Caller is
+    /// responsible for propagating the fresh credentials through
+    /// signaling so the peer can match incoming check requests.
+    /// Returns `GN_ERR_NOT_FOUND` if the conn id is unknown.
+    [[nodiscard]] gn_result_t restart_session(gn_conn_id_t conn);
+
     /// Number of live sessions; useful for tests.
     [[nodiscard]] std::size_t session_count() const noexcept;
 
@@ -141,6 +172,43 @@ public:
     [[nodiscard]] std::uint32_t mtu() const noexcept {
         return mtu_.load(std::memory_order_relaxed);
     }
+
+    /// ── Composer surface (Слайс 11b) ─────────────────────────────
+    ///
+    /// Layer-2 consumers (QUIC, DTLS) treat a nominated ICE pair as a
+    /// NAT-traversed UDP carrier. They `composer_connect("ice://pk")`
+    /// to spin up a fresh ICE session in composer-owned mode (bit 63
+    /// of the returned conn id marks it as composer-owned), subscribe
+    /// to per-cid data callbacks, and receive an accept-bus
+    /// notification once the FSM reaches `Connected`. Bytes sent on a
+    /// composer-owned cid travel through the same nominated path but
+    /// bypass the kernel `notify_*` pipeline — the L2 owns the conn
+    /// lifecycle.
+
+    /// composer-bit marks conn ids allocated through the composer
+    /// surface so `send` / `disconnect` can route to the composer
+    /// map by id range without scanning both sides.
+    static constexpr gn_conn_id_t kComposerIdBit = (1ULL << 63);
+
+    [[nodiscard]] gn_result_t composer_listen(std::string_view uri);
+    [[nodiscard]] gn_result_t composer_connect(std::string_view uri,
+                                                 gn_conn_id_t* out_conn);
+    [[nodiscard]] gn_result_t composer_subscribe_data(
+        gn_conn_id_t conn,
+        ::gn_link_data_cb_t cb,
+        void* user_data);
+    [[nodiscard]] gn_result_t composer_unsubscribe_data(gn_conn_id_t conn);
+    [[nodiscard]] gn_result_t composer_subscribe_accept(
+        ::gn_link_accept_cb_t cb,
+        void* user_data,
+        gn_subscription_id_t* out_token);
+    [[nodiscard]] gn_result_t composer_unsubscribe_accept(
+        gn_subscription_id_t token);
+    /// ICE has no port of its own — surfaces the underlying UDP
+    /// carrier's bound port. Returns 0 if no carrier or no listen
+    /// has occurred yet.
+    [[nodiscard]] gn_result_t composer_listen_port(
+        std::uint16_t* out_port) const noexcept;
 
     struct Stats {
         std::uint64_t bytes_in            = 0;
@@ -175,6 +243,14 @@ private:
     /// Build the FSM-side callback bundle wired back into
     /// `notify_connect / notify_inbound_bytes / notify_disconnect`.
     [[nodiscard]] IceSessionCallbacks make_callbacks(gn_conn_id_t id);
+
+    /// Composer-mode callback bundle: bytes route through the
+    /// per-cid data callback installed by `composer_subscribe_data`,
+    /// nomination fires the accept-bus subscribers, and failures
+    /// erase the composer entry without invoking kernel
+    /// `notify_disconnect` (the L2 owns conn lifecycle).
+    [[nodiscard]] IceSessionCallbacks make_composer_callbacks(
+        gn_conn_id_t cid, const std::string& canonical_uri);
 
     /// Reload `ice.*` config keys into `cfg_`. Idempotent; called at
     /// `set_host_api` time and from the config-reload subscription.
@@ -215,6 +291,49 @@ private:
     std::uint64_t                                 reload_sub_id_ = 0;
     bool                                          reaper_started_ = false;
     const host_api_t*                              api_ = nullptr;
+
+    /// Слайс 11a: UDP carrier handle. Resolved from `gn.link.udp`
+    /// extension at `set_host_api` time. Sessions take this as a
+    /// borrowed pointer; if `nullopt` the FSM degrades to a no-op
+    /// (test fixtures without a UDP provider still get the link
+    /// surface but no actual gather / check happens).
+    std::optional<gn::sdk::LinkCarrier>           carrier_udp_;
+    /// Optional TCP carrier, used only by TURN-over-TCP path when
+    /// `cfg_.turn.tcp_transport == true` (RFC 5389 §7.2.2). Resolved
+    /// the same way as `carrier_udp_`; nullptr / nullopt is safe
+    /// and silently downgrades TURN to UDP.
+    std::optional<gn::sdk::LinkCarrier>           carrier_tcp_;
+    /// Optional TLS carrier (`turns://` scheme). Used when
+    /// `cfg_.turn.tls_transport == true`; the TLS plugin runs on
+    /// TCP underneath transparently, so framing matches the plain
+    /// TCP path.
+    std::optional<gn::sdk::LinkCarrier>           carrier_tls_;
+
+    /// Composer-side state (Слайс 11b). Lives parallel to the kernel
+    /// `sessions_` map so the bit-63 id range lookup picks the right
+    /// path. Each entry binds a composer-owned cid to its underlying
+    /// IceSession plus per-cid L2 data callback storage.
+    struct ComposerEntry {
+        std::shared_ptr<IceSession> session;
+        std::string                 peer_pk_hex;
+        ::gn_link_data_cb_t         data_cb     = nullptr;
+        void*                       data_user   = nullptr;
+        bool                        nominated   = false;
+        std::string                 canonical_uri;
+    };
+
+    struct ComposerAcceptSub {
+        gn_subscription_id_t token;
+        ::gn_link_accept_cb_t cb;
+        void*                user_data;
+    };
+
+    mutable std::mutex                                    composer_mu_;
+    std::unordered_map<gn_conn_id_t, ComposerEntry>       composer_sessions_;
+    std::unordered_map<std::string, gn_conn_id_t>         composer_peer_to_id_;
+    std::vector<ComposerAcceptSub>                        composer_accept_subs_;
+    std::atomic<std::uint64_t>                            next_composer_id_{1};
+    std::atomic<gn_subscription_id_t>                     next_accept_token_{1};
 };
 
 }  // namespace gn::link::ice

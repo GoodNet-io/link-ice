@@ -199,6 +199,18 @@ StunBuilder& StunBuilder::add_data(std::span<const uint8_t> data) {
     return *this;
 }
 
+StunBuilder& StunBuilder::add_channel_number(uint16_t channel) {
+    /// CHANNEL-NUMBER attribute (RFC 5766 §14.1): 16-bit channel
+    /// followed by 16-bit RFFU (Reserved For Future Use; zeros).
+    uint8_t buf[4] = {
+        static_cast<uint8_t>(channel >> 8),
+        static_cast<uint8_t>(channel & 0xFF),
+        0, 0
+    };
+    add_attr(TURN_ATTR_CHANNEL_NUMBER, buf);
+    return *this;
+}
+
 StunBuilder& StunBuilder::add_requested_transport(uint8_t proto) {
     uint8_t buf[4] = {proto, 0, 0, 0};
     add_attr(TURN_ATTR_REQUESTED_TRANSPORT, buf);
@@ -395,6 +407,45 @@ bool verify_integrity(std::span<const uint8_t> raw, const std::string& key) {
 
     // Compare with stored HMAC (constant-time to prevent timing attacks)
     return sodium_memcmp(computed, raw.data() + mi_offset + 4, 20) == 0;
+}
+
+// ── ChannelData framing (RFC 5766 §11.4) ───────────────────────────────────
+
+std::vector<uint8_t> encode_channel_data(uint16_t channel,
+                                          std::span<const uint8_t> payload) {
+    /// 4-byte header: 16-bit channel + 16-bit length. Wire is padded
+    /// to a 4-byte boundary so receivers can scan a stream of frames
+    /// without a separate length signal — the length field still
+    /// reports the unpadded application byte count.
+    const uint16_t len = static_cast<uint16_t>(payload.size());
+    const std::size_t pad = (4 - (payload.size() & 3)) & 3;
+    std::vector<uint8_t> out;
+    out.reserve(4 + payload.size() + pad);
+    out.push_back(static_cast<uint8_t>(channel >> 8));
+    out.push_back(static_cast<uint8_t>(channel & 0xFF));
+    out.push_back(static_cast<uint8_t>(len >> 8));
+    out.push_back(static_cast<uint8_t>(len & 0xFF));
+    out.insert(out.end(), payload.begin(), payload.end());
+    out.insert(out.end(), pad, 0);
+    return out;
+}
+
+std::optional<ChannelDataView> parse_channel_data(
+    std::span<const uint8_t> raw) {
+    if (raw.size() < TURN_CHANNEL_DATA_HEADER_SIZE) return std::nullopt;
+    const uint16_t channel =
+        (static_cast<uint16_t>(raw[0]) << 8) | static_cast<uint16_t>(raw[1]);
+    if (channel < TURN_CHANNEL_NUMBER_MIN
+        || channel > TURN_CHANNEL_NUMBER_MAX) {
+        return std::nullopt;
+    }
+    const std::size_t len =
+        (static_cast<std::size_t>(raw[2]) << 8) | static_cast<std::size_t>(raw[3]);
+    if (4 + len > raw.size()) return std::nullopt;
+    return ChannelDataView{
+        channel,
+        raw.subspan(4, len),
+    };
 }
 
 } // namespace gn::link::ice

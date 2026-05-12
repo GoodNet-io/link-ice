@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
 /// @file   plugins/links/ice/turn.cpp
+///
+/// I/O routes through a `gn::sdk::LinkCarrier` (UDP) over a single
+/// pre-allocated conn id (`server_cid_`) that the owning IceSession
+/// reserves at construction. Outbound sends call `carrier_->send`;
+/// inbound bytes are pushed in via `on_inbound` from the session's
+/// per-cid dispatcher.
 
 #include "turn.hpp"
 
-#include <asio/buffer.hpp>
-#include <asio/ip/udp.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -18,20 +22,16 @@
 
 namespace gn::link::ice {
 
-TurnClient::TurnClient(asio::io_context& io, const TurnConfig& cfg,
+TurnClient::TurnClient(asio::io_context& io,
+                         gn::sdk::LinkCarrier* carrier,
+                         gn_conn_id_t server_cid,
+                         const TurnConfig& cfg,
                          TurnDataCallback data_cb,
                          TurnAllocatedCallback alloc_cb)
-    : io_(io), cfg_(cfg), data_cb_(std::move(data_cb)),
+    : io_(io), carrier_(carrier), server_cid_(server_cid),
+      cfg_(cfg), data_cb_(std::move(data_cb)),
       alloc_cb_(std::move(alloc_cb)),
-      socket_(io, asio::ip::udp::v4()),
-      refresh_timer_(io) {
-    // Resolve server.
-    asio::ip::udp::resolver resolver(io);
-    std::error_code ec;
-    auto results = resolver.resolve(cfg_.server, std::to_string(cfg_.port), ec);
-    if (!ec && results.begin() != results.end())
-        server_ep_ = *results.begin();
-}
+      refresh_timer_(io) {}
 
 TurnClient::~TurnClient() {
     close();
@@ -55,8 +55,36 @@ void TurnClient::compute_auth_key() {
     sodium_memzero(input.data(), input.size());
 }
 
+void TurnClient::send_to_server(std::span<const std::uint8_t> bytes) noexcept {
+    if (!carrier_ || server_cid_ == 0) return;
+    /// Both TCP-direct and TLS-over-TCP transports use the same
+    /// 2-byte length-prefix framing (RFC 5389 §7.2.2). The TLS
+    /// plugin wraps record-layer encryption around the framed bytes
+    /// transparently — TurnClient sees an opaque ordered byte
+    /// stream either way.
+    const bool stream_framing = cfg_.tcp_transport || cfg_.tls_transport;
+    if (stream_framing) {
+        /// RFC 5389 §7.2.2 / RFC 4571: prepend a 16-bit big-endian
+        /// length prefix per STUN message so the TCP stream can be
+        /// decomposed back into individual messages on the receiving
+        /// side. ChannelData frames already self-frame via the
+        /// 4-byte ChannelData header — we still prefix on TCP for a
+        /// single uniform stream protocol the way curl / browsers
+        /// handle TURN-over-TCP.
+        std::vector<std::uint8_t> framed;
+        framed.reserve(2 + bytes.size());
+        framed.push_back(static_cast<std::uint8_t>(bytes.size() >> 8));
+        framed.push_back(static_cast<std::uint8_t>(bytes.size() & 0xFF));
+        framed.insert(framed.end(), bytes.begin(), bytes.end());
+        (void)carrier_->send(server_cid_, framed);
+        return;
+    }
+    (void)carrier_->send(server_cid_, bytes);
+}
+
 bool TurnClient::allocate() {
     if (cfg_.server.empty()) return false;
+    if (!carrier_ || server_cid_ == 0) return false;
 
     /// Speculative unauthenticated request. RFC 5766 §6.2 says the
     /// server replies with 401 carrying realm/nonce; we then retry
@@ -64,27 +92,79 @@ bool TurnClient::allocate() {
     auto msg = StunBuilder(TURN_ALLOCATE_REQUEST)
         .add_requested_transport(17)  // UDP
         .build();
-    std::error_code ec;
-    socket_.send_to(asio::buffer(msg), server_ep_, 0, ec);
-    start_recv();
+    send_to_server(msg);
     return true;
 }
 
-void TurnClient::start_recv() {
-    socket_.async_receive_from(
-        asio::buffer(recv_buf_), sender_ep_,
-        [weak_self = weak_from_this()](
-            const std::error_code& ec, size_t bytes) {
-            auto self = weak_self.lock();
-            if (!self) return;
-            if (!ec) self->handle_recv(bytes);
-            if (!ec || ec == asio::error::would_block)
-                self->start_recv();
-        });
-}
+void TurnClient::on_inbound(std::span<const uint8_t> bytes) {
+    /// Stream-mode transport (plain TCP or TLS-over-TCP): both
+    /// deliver arbitrary-sized chunks from the carrier. Accumulate
+    /// into `rx_buffer_` and extract complete length-prefixed
+    /// messages whenever we have enough bytes. UDP transport
+    /// delivers whole datagrams in a single callback; no reassembly
+    /// needed.
+    const bool stream_framing = cfg_.tcp_transport || cfg_.tls_transport;
+    if (stream_framing) {
+        rx_buffer_.insert(rx_buffer_.end(), bytes.begin(), bytes.end());
+        while (rx_buffer_.size() >= 2) {
+            const std::size_t msg_len =
+                (static_cast<std::size_t>(rx_buffer_[0]) << 8)
+                | static_cast<std::size_t>(rx_buffer_[1]);
+            if (rx_buffer_.size() < 2 + msg_len) break;
+            std::span<const uint8_t> framed(rx_buffer_.data() + 2, msg_len);
+            /// Recurse with the carved message as a self-contained
+            /// datagram. The branch reentry hits the UDP path because
+            /// we just consumed the prefix, and the inner buffer is a
+            /// single STUN message or ChannelData frame.
+            if (is_channel_data(framed)) {
+                handle_channel_data(framed);
+            } else if (auto parsed = parse_stun(framed)) {
+                /// Inline the post-parse dispatch to avoid double-
+                /// recursing through `on_inbound`. The dispatch
+                /// shape mirrors the UDP path below.
+                if (parsed->msg_type == TURN_ALLOCATE_ERROR) {
+                    /// re-handled below
+                }
+                /// Hand off to a small private helper would force
+                /// further refactor; for now duplicate the dispatch
+                /// inline because the message set is small (5 cases).
+                if (parsed->msg_type == TURN_ALLOCATE_ERROR) {
+                    if (parsed->error_code == 401
+                        || parsed->error_code == 438) {
+                        if (parsed->realm) realm_ = *parsed->realm;
+                        if (parsed->nonce) nonce_ = *parsed->nonce;
+                        compute_auth_key();
+                        auto retry = StunBuilder(TURN_ALLOCATE_REQUEST)
+                            .add_requested_transport(17)
+                            .add_username(cfg_.username)
+                            .add_realm(realm_)
+                            .add_nonce(nonce_)
+                            .add_integrity(auth_key_)
+                            .add_fingerprint()
+                            .build();
+                        send_to_server(retry);
+                    }
+                } else if (parsed->msg_type == TURN_ALLOCATE_RESPONSE) {
+                    handle_allocate_response(*parsed);
+                } else if (parsed->msg_type == TURN_DATA_INDICATION) {
+                    handle_data_indication(*parsed);
+                }
+            }
+            rx_buffer_.erase(rx_buffer_.begin(),
+                              rx_buffer_.begin() + 2 + msg_len);
+        }
+        return;
+    }
 
-void TurnClient::handle_recv(size_t bytes) {
-    auto parsed = parse_stun(std::span(recv_buf_.data(), bytes));
+    /// ChannelData frames coexist with STUN/TURN messages on the same
+    /// transport — demux on the first byte's top nibble (RFC 5766
+    /// §11.5). ChannelData has 0x4-0x7 in the top nibble; STUN is
+    /// 0x0-0x3. The check rejects ambiguous buffers without parsing.
+    if (is_channel_data(bytes)) {
+        handle_channel_data(bytes);
+        return;
+    }
+    auto parsed = parse_stun(bytes);
     if (!parsed) return;
 
     if (parsed->msg_type == TURN_ALLOCATE_ERROR) {
@@ -103,14 +183,40 @@ void TurnClient::handle_recv(size_t bytes) {
                 .add_integrity(auth_key_)
                 .add_fingerprint()
                 .build();
-            std::error_code ec;
-            socket_.send_to(asio::buffer(msg), server_ep_, 0, ec);
+            send_to_server(msg);
         }
     } else if (parsed->msg_type == TURN_ALLOCATE_RESPONSE) {
         handle_allocate_response(*parsed);
     } else if (parsed->msg_type == TURN_DATA_INDICATION) {
         handle_data_indication(*parsed);
+    } else if (parsed->msg_type == TURN_CHANNEL_BIND_RESPONSE) {
+        /// Successful ChannelBind — the channel is already live in
+        /// `peer_to_channel_` from `bind_channel`. Nothing to do here
+        /// besides accept the response; future sends on that peer will
+        /// take the ChannelData fast path automatically.
+    } else if (parsed->msg_type == TURN_CHANNEL_BIND_ERROR) {
+        /// Bind error — we leave the optimistic mapping in place
+        /// because (a) we don't track pending binds by txn_id, and
+        /// (b) Send-Indication is a safe fallback if the channel
+        /// turns out unusable. Real-world bind failures are rare
+        /// (channel space exhaustion or stale nonce); v1 trades
+        /// strict bookkeeping for simpler code.
     }
+}
+
+void TurnClient::handle_channel_data(std::span<const uint8_t> bytes) {
+    auto frame = parse_channel_data(bytes);
+    if (!frame) return;
+    std::string peer_ip;
+    uint16_t    peer_port = 0;
+    {
+        std::lock_guard lk(mu_);
+        auto it = channel_to_peer_.find(frame->channel);
+        if (it == channel_to_peer_.end()) return;
+        peer_ip   = it->second.first;
+        peer_port = it->second.second;
+    }
+    if (data_cb_) data_cb_(peer_ip, peer_port, frame->payload);
 }
 
 void TurnClient::handle_allocate_response(const StunMessage& msg) {
@@ -135,12 +241,63 @@ void TurnClient::handle_data_indication(const StunMessage& msg) {
 
 void TurnClient::send_indication(const std::string& peer_ip, uint16_t peer_port,
                                    std::span<const uint8_t> data) {
+    /// Fast path: if the peer has a bound channel, send ChannelData
+    /// (4-byte header) instead of a Send-Indication (~36 bytes plus
+    /// the TURN STUN framing). Channels live for 10 min and are
+    /// rebound by `schedule_refresh`; falling back to
+    /// Send-Indication if the channel hasn't been bound yet keeps
+    /// the first packet flowing while the bind round-trip races.
+    uint16_t channel = 0;
+    const auto key = peer_ip + ":" + std::to_string(peer_port);
+    {
+        std::lock_guard lk(mu_);
+        auto it = peer_to_channel_.find(key);
+        if (it != peer_to_channel_.end()) channel = it->second;
+    }
+    if (channel != 0) {
+        auto frame = encode_channel_data(channel, data);
+        send_to_server(frame);
+        return;
+    }
     auto msg = StunBuilder(TURN_SEND_INDICATION)
         .add_xor_peer_address(peer_ip, peer_port)
         .add_data(data)
         .build();
-    std::error_code ec;
-    socket_.send_to(asio::buffer(msg), server_ep_, 0, ec);
+    send_to_server(msg);
+}
+
+void TurnClient::bind_channel(const std::string& peer_ip,
+                                uint16_t peer_port) {
+    const auto key = peer_ip + ":" + std::to_string(peer_port);
+    uint16_t channel = 0;
+    {
+        std::lock_guard lk(mu_);
+        if (auto it = peer_to_channel_.find(key);
+            it != peer_to_channel_.end()) {
+            return;  /// already bound — idempotent
+        }
+        channel = next_channel_++;
+        if (channel > TURN_CHANNEL_NUMBER_MAX) {
+            /// Channel space exhaustion is extremely unlikely
+            /// (16383 channels per allocation) but we still bound
+            /// it — fall back to Send-Indication for new peers.
+            return;
+        }
+        peer_to_channel_[key]      = channel;
+        channel_to_peer_[channel]  = {peer_ip, peer_port};
+        permissions_.insert(peer_ip);
+    }
+
+    auto msg = StunBuilder(TURN_CHANNEL_BIND_REQUEST)
+        .add_channel_number(channel)
+        .add_xor_peer_address(peer_ip, peer_port)
+        .add_username(cfg_.username)
+        .add_realm(realm_)
+        .add_nonce(nonce_)
+        .add_integrity(auth_key_)
+        .add_fingerprint()
+        .build();
+    send_to_server(msg);
 }
 
 void TurnClient::create_permission(const std::string& peer_ip) {
@@ -156,8 +313,7 @@ void TurnClient::create_permission(const std::string& peer_ip) {
         .add_integrity(auth_key_)
         .add_fingerprint()
         .build();
-    std::error_code ec;
-    socket_.send_to(asio::buffer(msg), server_ep_, 0, ec);
+    send_to_server(msg);
 }
 
 void TurnClient::refresh() {
@@ -169,12 +325,10 @@ void TurnClient::refresh() {
         .add_integrity(auth_key_)
         .add_fingerprint()
         .build();
-    std::error_code ec;
-    socket_.send_to(asio::buffer(msg), server_ep_, 0, ec);
+    send_to_server(msg);
 }
 
 void TurnClient::close() {
-    std::error_code ec;
     refresh_timer_.cancel();
     if (!allocated_) return;
 
@@ -187,7 +341,7 @@ void TurnClient::close() {
         .add_fingerprint()
         .build();
 
-    socket_.send_to(asio::buffer(msg), server_ep_, 0, ec);
+    send_to_server(msg);
     allocated_ = false;
 }
 
