@@ -42,10 +42,28 @@ every bundled `.so` from there.
 | `ice.turn_servers` | string | `""` | single `host:port`; multi-server fallback is v1.1 |
 | `ice.turn_username` | string | `""` | TURN long-term credential |
 | `ice.turn_password` | string | `""` | TURN long-term credential |
+| `ice.turn_tcp` | bool | `false` | RFC 5389 §7.2.2 TURN-over-TCP — fallback when UDP-blocked; needs `gn.link.tcp` carrier |
+| `ice.turn_tls` | bool | `false` | RFC 5389 §7.2.2 TURN-over-TLS via `turns://` — needs `gn.link.tls` carrier; precedence over `turn_tcp` |
 | `ice.session_timeout_s` | int64 | `10` | gather + checks deadline |
 | `ice.keepalive_interval_s` | int64 | `20` | consent-freshness probe period |
 | `ice.consent_max_failures` | int64 | `3` | missed probes before recovery |
 | `ice.check_interval_ms` | int64 | `50` | per-pair check pacing |
+| `ice.aggressive_nomination` | bool | `false` | RFC 8445 §8.1.1 — fastest-possible nomination at the cost of pair churn |
+| `ice.path_mtu` | int64 | `1200` | RFC 8085 datagram size budget; bypass discovery when set |
+
+## RFC coverage
+
+- RFC 8445 (core ICE) — full controlled / controlling FSM,
+  triggered checks (§7.3.1.4), regular nomination by default,
+  aggressive nomination opt-in (§8.1.1)
+- RFC 5389 / 5766 (STUN / TURN) — long-term credential auth,
+  ChannelBind fast path (§11), Send-Indication fallback,
+  TURN-over-TCP / TLS framing (§7.2.2)
+- RFC 8838 (Trickle ICE) — incremental candidates with
+  end-of-candidates marker (OFFER_EOC / ANSWER_EOC)
+- RFC 8305 (Happy Eyeballs) — dual-family pre-fire in begin_checks
+- RFC 8085 (UDP usage) — path-MTU floor knob; RFC 8899 active
+  probe discovery is on the v1.1 roadmap
 
 ## Contract
 

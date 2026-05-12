@@ -184,6 +184,14 @@ void IceLink::apply_config() noexcept {
     if (gn_config_get_int64(api_, "ice.turn_tcp", &v) == GN_OK) {
         cfg.turn.tcp_transport = (v != 0);
     }
+    /// TURN-over-TLS (RFC 5389 §7.2.2, `turns://` scheme). When
+    /// enabled the session resolves `gn.link.tls` for the TURN
+    /// server endpoint; framing is the same length-prefixed STUN
+    /// as plain TCP. Takes precedence over `ice.turn_tcp` when both
+    /// are set — operators behind 443-only firewalls flip this on.
+    if (gn_config_get_int64(api_, "ice.turn_tls", &v) == GN_OK) {
+        cfg.turn.tls_transport = (v != 0);
+    }
 
     std::lock_guard lk(cfg_mu_);
     cfg_ = std::move(cfg);
