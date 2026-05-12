@@ -22,6 +22,33 @@
 
 namespace gn::link::ice {
 
+bool encode_stream_frame(std::span<const std::uint8_t> payload,
+                          std::vector<std::uint8_t>& out) {
+    /// 16-bit length field caps each STUN message at 65 535 bytes on
+    /// a TCP transport. STUN headers + attributes fit comfortably
+    /// (the wire-protocol cap is well below this) but a malformed
+    /// caller-side oversize is rejected here so the framing path
+    /// never silently truncates.
+    if (payload.size() > 0xFFFFu) return false;
+    out.reserve(out.size() + 2 + payload.size());
+    out.push_back(static_cast<std::uint8_t>(payload.size() >> 8));
+    out.push_back(static_cast<std::uint8_t>(payload.size() & 0xFFu));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return true;
+}
+
+bool try_take_stream_frame(std::vector<std::uint8_t>& buffer,
+                            std::vector<std::uint8_t>& out) {
+    if (buffer.size() < 2) return false;
+    const std::size_t msg_len =
+        (static_cast<std::size_t>(buffer[0]) << 8)
+        | static_cast<std::size_t>(buffer[1]);
+    if (buffer.size() < 2 + msg_len) return false;
+    out.assign(buffer.begin() + 2, buffer.begin() + 2 + msg_len);
+    buffer.erase(buffer.begin(), buffer.begin() + 2 + msg_len);
+    return true;
+}
+
 TurnClient::TurnClient(asio::io_context& io,
                          gn::sdk::LinkCarrier* carrier,
                          gn_conn_id_t server_cid,
@@ -58,25 +85,16 @@ void TurnClient::compute_auth_key() {
 void TurnClient::send_to_server(std::span<const std::uint8_t> bytes) noexcept {
     if (!carrier_ || server_cid_ == 0) return;
     /// Both TCP-direct and TLS-over-TCP transports use the same
-    /// 2-byte length-prefix framing (RFC 5389 §7.2.2). The TLS
-    /// plugin wraps record-layer encryption around the framed bytes
-    /// transparently — TurnClient sees an opaque ordered byte
-    /// stream either way.
+    /// 2-byte length-prefix framing (RFC 5389 §7.2.2 / RFC 4571).
+    /// The TLS plugin wraps record-layer encryption around the
+    /// framed bytes transparently — TurnClient sees an opaque
+    /// ordered byte stream either way.
     const bool stream_framing = cfg_.tcp_transport || cfg_.tls_transport;
     if (stream_framing) {
-        /// RFC 5389 §7.2.2 / RFC 4571: prepend a 16-bit big-endian
-        /// length prefix per STUN message so the TCP stream can be
-        /// decomposed back into individual messages on the receiving
-        /// side. ChannelData frames already self-frame via the
-        /// 4-byte ChannelData header — we still prefix on TCP for a
-        /// single uniform stream protocol the way curl / browsers
-        /// handle TURN-over-TCP.
         std::vector<std::uint8_t> framed;
-        framed.reserve(2 + bytes.size());
-        framed.push_back(static_cast<std::uint8_t>(bytes.size() >> 8));
-        framed.push_back(static_cast<std::uint8_t>(bytes.size() & 0xFF));
-        framed.insert(framed.end(), bytes.begin(), bytes.end());
-        (void)carrier_->send(server_cid_, framed);
+        if (encode_stream_frame(bytes, framed)) {
+            (void)carrier_->send(server_cid_, framed);
+        }
         return;
     }
     (void)carrier_->send(server_cid_, bytes);
@@ -106,56 +124,16 @@ void TurnClient::on_inbound(std::span<const uint8_t> bytes) {
     const bool stream_framing = cfg_.tcp_transport || cfg_.tls_transport;
     if (stream_framing) {
         rx_buffer_.insert(rx_buffer_.end(), bytes.begin(), bytes.end());
-        while (rx_buffer_.size() >= 2) {
-            const std::size_t msg_len =
-                (static_cast<std::size_t>(rx_buffer_[0]) << 8)
-                | static_cast<std::size_t>(rx_buffer_[1]);
-            if (rx_buffer_.size() < 2 + msg_len) break;
-            std::span<const uint8_t> framed(rx_buffer_.data() + 2, msg_len);
-            /// Recurse with the carved message as a self-contained
-            /// datagram. The branch reentry hits the UDP path because
-            /// we just consumed the prefix, and the inner buffer is a
-            /// single STUN message or ChannelData frame.
-            if (is_channel_data(framed)) {
-                handle_channel_data(framed);
-            } else if (auto parsed = parse_stun(framed)) {
-                /// Inline the post-parse dispatch to avoid double-
-                /// recursing through `on_inbound`. The dispatch
-                /// shape mirrors the UDP path below.
-                if (parsed->msg_type == TURN_ALLOCATE_ERROR) {
-                    /// re-handled below
-                }
-                /// Hand off to a small private helper would force
-                /// further refactor; for now duplicate the dispatch
-                /// inline because the message set is small (5 cases).
-                if (parsed->msg_type == TURN_ALLOCATE_ERROR) {
-                    if (parsed->error_code == 401
-                        || parsed->error_code == 438) {
-                        if (parsed->realm) realm_ = *parsed->realm;
-                        if (parsed->nonce) nonce_ = *parsed->nonce;
-                        compute_auth_key();
-                        auto retry = StunBuilder(TURN_ALLOCATE_REQUEST)
-                            .add_requested_transport(17)
-                            .add_username(cfg_.username)
-                            .add_realm(realm_)
-                            .add_nonce(nonce_)
-                            .add_integrity(auth_key_)
-                            .add_fingerprint()
-                            .build();
-                        send_to_server(retry);
-                    }
-                } else if (parsed->msg_type == TURN_ALLOCATE_RESPONSE) {
-                    handle_allocate_response(*parsed);
-                } else if (parsed->msg_type == TURN_DATA_INDICATION) {
-                    handle_data_indication(*parsed);
-                }
-            }
-            rx_buffer_.erase(rx_buffer_.begin(),
-                              rx_buffer_.begin() + 2 + msg_len);
+        std::vector<std::uint8_t> frame;
+        while (try_take_stream_frame(rx_buffer_, frame)) {
+            dispatch_inbound_message(frame);
         }
         return;
     }
+    dispatch_inbound_message(bytes);
+}
 
+void TurnClient::dispatch_inbound_message(std::span<const std::uint8_t> bytes) {
     /// ChannelData frames coexist with STUN/TURN messages on the same
     /// transport — demux on the first byte's top nibble (RFC 5766
     /// §11.5). ChannelData has 0x4-0x7 in the top nibble; STUN is

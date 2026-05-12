@@ -33,6 +33,26 @@
 
 namespace gn::link::ice {
 
+/// Append a STUN-over-TCP framed envelope (RFC 5389 §7.2.2) for @p
+/// payload to @p out: a 2-byte big-endian length prefix followed by
+/// the payload bytes. Returns `false` if @p payload exceeds the
+/// 16-bit frame budget (65 535 bytes). The same framing applies to
+/// TURN-over-TLS, which delegates record encryption to the TLS
+/// carrier underneath.
+[[nodiscard]] bool encode_stream_frame(std::span<const std::uint8_t> payload,
+                                       std::vector<std::uint8_t>& out);
+
+/// Try to consume one complete length-prefixed frame from @p buffer.
+/// On success, writes the inner payload bytes into @p out, erases
+/// the consumed `2 + payload_size` bytes from the front of
+/// @p buffer, and returns `true`. On incomplete input (buffer holds
+/// fewer than 2 bytes, or fewer than `2 + payload_size` bytes) the
+/// function leaves @p buffer untouched and returns `false`. The
+/// caller drives a `while` loop until this returns `false` to drain
+/// all complete frames the carrier delivered in a single chunk.
+[[nodiscard]] bool try_take_stream_frame(std::vector<std::uint8_t>& buffer,
+                                         std::vector<std::uint8_t>& out);
+
 /// @brief TURN allocation parameters (server URI, credentials, lifetime).
 struct TurnConfig {
     std::string server;
@@ -164,6 +184,13 @@ private:
     std::vector<uint8_t> rx_buffer_;
 
     void send_to_server(std::span<const std::uint8_t> bytes) noexcept;
+    /// Dispatch a single STUN message — shared between the UDP path
+    /// (one datagram = one message) and the stream-framing path (one
+    /// reassembled frame = one message). Centralising the dispatch
+    /// keeps the auth-retry / allocate-response / data-indication
+    /// branches in one place; the two transport branches just decide
+    /// where the message bytes come from.
+    void dispatch_inbound_message(std::span<const std::uint8_t> bytes);
     void handle_allocate_response(const StunMessage& msg);
     void handle_data_indication(const StunMessage& msg);
     void handle_channel_data(std::span<const uint8_t> bytes);
