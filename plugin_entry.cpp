@@ -166,18 +166,68 @@ gn_result_t link_ext_close(void* ctx, gn_conn_id_t conn, int /*hard*/) noexcept 
     } catch (...) { return GN_ERR_NULL_ARG; }
 }
 
-gn_result_t link_ext_listen_unimpl(void*, const char*) noexcept {
-    return GN_ERR_NOT_IMPLEMENTED;
+gn_result_t link_ext_composer_listen(void* ctx, const char* uri) noexcept {
+    if (!ctx || !uri) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_listen(uri);
+    } catch (...) { return GN_ERR_NULL_ARG; }
 }
-gn_result_t link_ext_connect_unimpl(void*, const char*, gn_conn_id_t*) noexcept {
-    return GN_ERR_NOT_IMPLEMENTED;
+
+gn_result_t link_ext_composer_connect(void* ctx, const char* uri,
+                                        gn_conn_id_t* out_conn) noexcept {
+    if (!ctx || !uri || !out_conn) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_connect(uri, out_conn);
+    } catch (...) { return GN_ERR_NULL_ARG; }
 }
-gn_result_t link_ext_subscribe_unimpl(void*, gn_conn_id_t,
-                                        gn_link_data_cb_t, void*) noexcept {
-    return GN_ERR_NOT_IMPLEMENTED;
+
+gn_result_t link_ext_composer_subscribe_data(
+    void* ctx, gn_conn_id_t conn,
+    gn_link_data_cb_t cb, void* user_data) noexcept {
+    if (!ctx) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_subscribe_data(conn, cb, user_data);
+    } catch (...) { return GN_ERR_NULL_ARG; }
 }
-gn_result_t link_ext_unsubscribe_unimpl(void*, gn_conn_id_t) noexcept {
-    return GN_ERR_NOT_IMPLEMENTED;
+
+gn_result_t link_ext_composer_unsubscribe_data(
+    void* ctx, gn_conn_id_t conn) noexcept {
+    if (!ctx) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_unsubscribe_data(conn);
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
+gn_result_t link_ext_composer_subscribe_accept(
+    void* ctx, gn_link_accept_cb_t cb, void* user_data,
+    gn_subscription_id_t* out_token) noexcept {
+    if (!ctx) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_subscribe_accept(cb, user_data, out_token);
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
+gn_result_t link_ext_composer_unsubscribe_accept(
+    void* ctx, gn_subscription_id_t token) noexcept {
+    if (!ctx) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_unsubscribe_accept(token);
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
+gn_result_t link_ext_composer_listen_port(void* ctx,
+                                            std::uint16_t* out_port) noexcept {
+    if (!ctx || !out_port) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->composer_listen_port(out_port);
+    } catch (...) { return GN_ERR_NULL_ARG; }
 }
 
 // ── gn.link.ice.signal thunks ─────────────────────────────────────────────
@@ -210,19 +260,53 @@ gn_result_t signal_ext_answer(void* ctx,
     } catch (...) { return GN_ERR_NULL_ARG; }
 }
 
+gn_result_t signal_ext_offer_eoc(void* ctx,
+                                   const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+                                   const std::uint8_t* blob,
+                                   std::size_t size) {
+    if (!ctx || !peer_pk) return GN_ERR_NULL_ARG;
+    if (!blob && size > 0) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->deliver_signal(
+            peer_pk, ::gn::link::ice::ICE_SIGNAL_OFFER_EOC,
+            std::span<const std::uint8_t>(blob, size));
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
+gn_result_t signal_ext_answer_eoc(void* ctx,
+                                     const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+                                     const std::uint8_t* blob,
+                                     std::size_t size) {
+    if (!ctx || !peer_pk) return GN_ERR_NULL_ARG;
+    if (!blob && size > 0) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->deliver_signal(
+            peer_pk, ::gn::link::ice::ICE_SIGNAL_ANSWER_EOC,
+            std::span<const std::uint8_t>(blob, size));
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
 void install_link_extension(IcePlugin* p) {
     auto& v = p->link_extension_vtable;
-    v               = gn_link_api_t{};
-    v.api_size      = sizeof(gn_link_api_t);
-    v.get_stats     = &link_ext_get_stats;
+    v                  = gn_link_api_t{};
+    v.api_size         = sizeof(gn_link_api_t);
+    v.get_stats        = &link_ext_get_stats;
     v.get_capabilities = &link_ext_get_caps;
-    v.send          = &link_ext_send;
-    v.send_batch    = &link_ext_send_batch;
-    v.close         = &link_ext_close;
-    v.listen           = &link_ext_listen_unimpl;
-    v.connect          = &link_ext_connect_unimpl;
-    v.subscribe_data   = &link_ext_subscribe_unimpl;
-    v.unsubscribe_data = &link_ext_unsubscribe_unimpl;
+    v.send             = &link_ext_send;
+    v.send_batch       = &link_ext_send_batch;
+    v.close            = &link_ext_close;
+    /// Composer surface (Слайс 11b) — L2 plugins can `composer_connect`
+    /// over this ICE link to ride a NAT-traversed UDP pair as a
+    /// reliable / encrypted stream carrier (QUIC, DTLS).
+    v.listen             = &link_ext_composer_listen;
+    v.connect            = &link_ext_composer_connect;
+    v.subscribe_data     = &link_ext_composer_subscribe_data;
+    v.unsubscribe_data   = &link_ext_composer_unsubscribe_data;
+    v.subscribe_accept   = &link_ext_composer_subscribe_accept;
+    v.unsubscribe_accept = &link_ext_composer_unsubscribe_accept;
+    v.composer_listen_port = &link_ext_composer_listen_port;
     v.ctx = p;
 }
 
@@ -232,6 +316,8 @@ void install_signal_extension(IcePlugin* p) {
     v.api_size      = sizeof(gn_link_ice_signal_api_t);
     v.offer         = &signal_ext_offer;
     v.answer        = &signal_ext_answer;
+    v.offer_eoc     = &signal_ext_offer_eoc;
+    v.answer_eoc    = &signal_ext_answer_eoc;
     v.ctx           = p;
 }
 

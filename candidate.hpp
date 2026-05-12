@@ -67,6 +67,19 @@ static_assert(sizeof(IceSignalData) == 44);
 
 constexpr uint8_t ICE_SIGNAL_OFFER  = 0;
 constexpr uint8_t ICE_SIGNAL_ANSWER = 1;
+/// RFC 8838 §10 end-of-candidates indication. A signaling sender
+/// emits OFFER_EOC / ANSWER_EOC instead of plain OFFER / ANSWER on
+/// the FINAL trickle batch to tell the receiver "no more candidates
+/// will arrive on my side". The receiver can then fail the
+/// connection faster once its check list is exhausted with no
+/// valid pair — without EOC the session has to wait the full
+/// `session_timeout_s` ceiling before declaring failure. EOC
+/// variants are wire-identical to their non-EOC counterparts;
+/// older peers that don't know the kind simply reject the
+/// envelope and the sender falls back to plain OFFER / ANSWER on
+/// the next batch.
+constexpr uint8_t ICE_SIGNAL_OFFER_EOC  = 2;
+constexpr uint8_t ICE_SIGNAL_ANSWER_EOC = 3;
 
 /// Compute candidate priority per RFC 8445.
 inline uint32_t compute_priority(CandidateType type, uint16_t local_pref, uint8_t component) {

@@ -3,6 +3,7 @@ include(GoogleTest)
 
 add_executable(test_ice
     test_ice.cpp
+    test_ice_composer.cpp
     test_ice_conformance.cpp)
 target_link_libraries(test_ice PRIVATE
     GoodNet::sdk

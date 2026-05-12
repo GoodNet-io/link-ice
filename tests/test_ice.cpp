@@ -16,6 +16,8 @@
 #include "../session.hpp"
 #include "../stun.hpp"
 
+#include <sdk/cpp/test/poll.hpp>
+#include <sdk/cpp/test/stub_host.hpp>
 #include <sdk/host_api.h>
 #include <sdk/trust.h>
 #include <sdk/types.h>
@@ -37,56 +39,11 @@ namespace {
 using namespace std::chrono_literals;
 using gn::link::ice::IceLink;
 
-struct StubHost {
-    std::atomic<int>                          connects{0};
-    std::atomic<int>                          disconnects{0};
-    std::mutex                                 mu;
-    std::vector<gn_conn_id_t>                  conns;
-    std::vector<gn_handshake_role_t>           roles;
-    std::atomic<gn_conn_id_t>                  next_id{1};
-
-    static gn_result_t on_connect(void* host_ctx,
-                                    const std::uint8_t /*remote_pk*/[GN_PUBLIC_KEY_BYTES],
-                                    const char* /*uri*/,
-                                    gn_trust_class_t /*trust*/,
-                                    gn_handshake_role_t role,
-                                    gn_conn_id_t* out_conn) {
-        auto* h = static_cast<StubHost*>(host_ctx);
-        const auto id = h->next_id.fetch_add(1);
-        {
-            std::lock_guard lk(h->mu);
-            h->conns.push_back(id);
-            h->roles.push_back(role);
-        }
-        *out_conn = id;
-        h->connects.fetch_add(1);
-        return GN_OK;
-    }
-
-    static gn_result_t on_inbound(void*, gn_conn_id_t,
-                                    const std::uint8_t*, std::size_t) {
-        return GN_OK;
-    }
-
-    static gn_result_t on_disconnect(void* host_ctx, gn_conn_id_t /*conn*/,
-                                       gn_result_t /*reason*/) {
-        auto* h = static_cast<StubHost*>(host_ctx);
-        h->disconnects.fetch_add(1);
-        return GN_OK;
-    }
-
-    static gn_result_t on_kick(void*, gn_conn_id_t) { return GN_OK; }
-};
-
-host_api_t make_stub_api(StubHost& h) {
-    host_api_t api{};
-    api.api_size              = sizeof(host_api_t);
-    api.host_ctx              = &h;
-    api.notify_connect        = &StubHost::on_connect;
-    api.notify_inbound_bytes  = &StubHost::on_inbound;
-    api.notify_disconnect     = &StubHost::on_disconnect;
-    api.kick_handshake        = &StubHost::on_kick;
-    return api;
+/// Migrated 2026-05-12 from the local 50-LOC StubHost copy to the
+/// shared `gn::sdk::test::LinkStub`. See `sdk/cpp/test/stub_host.hpp`.
+using StubHost = ::gn::sdk::test::LinkStub;
+inline host_api_t make_stub_api(StubHost& h) noexcept {
+    return ::gn::sdk::test::make_link_host_api(h);
 }
 
 constexpr const char* kPeerPkHex =
@@ -107,15 +64,12 @@ std::array<std::uint8_t, GN_PUBLIC_KEY_BYTES> peer_pk_bytes() {
     return pk;
 }
 
-void wait_for(const std::function<bool()>& pred,
-              std::chrono::milliseconds timeout,
-              const char* what) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) return;
-        std::this_thread::sleep_for(5ms);
+inline void wait_for(const std::function<bool()>& pred,
+                      std::chrono::milliseconds timeout,
+                      const char* what) {
+    if (!::gn::sdk::test::wait_for(pred, timeout)) {
+        FAIL() << "timeout waiting for: " << what;
     }
-    FAIL() << "timeout waiting for: " << what;
 }
 
 }  // namespace
@@ -338,6 +292,128 @@ TEST(IceLink, SendOversizedRejected) {
     t->shutdown();
 }
 
+TEST(IceLink, NominationMetricsBeforeConnectedReturnsDefaults) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    const std::string uri = std::string("ice://") + kPeerPkHex;
+    ASSERT_EQ(t->connect(uri), GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s,
+              "initial connect");
+    gn_conn_id_t conn = GN_INVALID_ID;
+    {
+        std::lock_guard lk(h.mu);
+        conn = h.conns.front();
+    }
+
+    /// Pre-nomination: FSM is still Gathering / WaitingRemote. The
+    /// metrics snapshot must report `nominated == false` and a zero
+    /// RTT so strategy plugins can recognise the path as "unranked".
+    const auto m = t->nomination_metrics(conn);
+    EXPECT_FALSE(m.nominated);
+    EXPECT_EQ(m.rtt_us, 0u);
+
+    /// Unknown conn id returns the same default snapshot, not crash.
+    const auto bad = t->nomination_metrics(0xDEAD);
+    EXPECT_FALSE(bad.nominated);
+
+    t->shutdown();
+}
+
+TEST(IceLink, TrickleSecondOfferReusesSession) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    /// Initial OFFER allocates the responder-side session.
+    gn::link::ice::IceSignalData hdr{};
+    const char ufrag[] = "ABCDufra";
+    std::memcpy(hdr.ufrag, ufrag, sizeof(hdr.ufrag));
+    const char pwd[] = "PWDtestpwd_secret_value_here";
+    std::memcpy(hdr.pwd, pwd, std::min(sizeof(hdr.pwd), sizeof(pwd)));
+    hdr.candidate_count = 0;
+    std::vector<std::uint8_t> blob(sizeof(hdr));
+    std::memcpy(blob.data(), &hdr, sizeof(hdr));
+
+    auto pk = peer_pk_bytes();
+    ASSERT_EQ(t->deliver_signal(pk.data(),
+                                  gn::link::ice::ICE_SIGNAL_OFFER,
+                                  std::span<const std::uint8_t>(
+                                      blob.data(), blob.size())),
+              GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s, "first offer");
+    const auto first_connects = h.connects.load();
+    EXPECT_EQ(t->session_count(), 1u);
+
+    /// Second OFFER with the SAME peer + ufrag must NOT spawn a fresh
+    /// session — it folds the (still empty) candidate batch into the
+    /// existing one. RFC 8838 trickle semantics: incremental signal,
+    /// stable session.
+    ASSERT_EQ(t->deliver_signal(pk.data(),
+                                  gn::link::ice::ICE_SIGNAL_OFFER,
+                                  std::span<const std::uint8_t>(
+                                      blob.data(), blob.size())),
+              GN_OK);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(h.connects.load(), first_connects);
+    EXPECT_EQ(t->session_count(), 1u);
+
+    t->shutdown();
+}
+
+TEST(IceLink, RestartSessionRegeneratesCredentials) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    const std::string uri = std::string("ice://") + kPeerPkHex;
+    ASSERT_EQ(t->connect(uri), GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s,
+              "initial gather");
+
+    gn_conn_id_t conn = GN_INVALID_ID;
+    {
+        std::lock_guard lk(h.mu);
+        conn = h.conns.front();
+    }
+
+    /// Unknown conn id is rejected — restart must not allocate.
+    EXPECT_EQ(t->restart_session(0xFFFF), GN_ERR_NOT_FOUND);
+
+    /// Known conn id reposts work to the session strand; the FSM
+    /// then re-enters Gathering. No new conn record is allocated,
+    /// no extra `notify_connect` fires.
+    const auto before = h.connects.load();
+    EXPECT_EQ(t->restart_session(conn), GN_OK);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(h.connects.load(), before);
+
+    t->shutdown();
+}
+
+TEST(IceLink, RestartSessionAfterShutdownIsInvalidState) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    const std::string uri = std::string("ice://") + kPeerPkHex;
+    ASSERT_EQ(t->connect(uri), GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s, "connect");
+    gn_conn_id_t conn = GN_INVALID_ID;
+    {
+        std::lock_guard lk(h.mu);
+        conn = h.conns.front();
+    }
+
+    t->shutdown();
+    EXPECT_EQ(t->restart_session(conn), GN_ERR_INVALID_STATE);
+}
+
 TEST(IceLink, DisconnectIsIdempotent) {
     auto t = std::make_shared<IceLink>();
     StubHost h;
@@ -429,4 +505,72 @@ TEST(IceStun, ParseRejectsBadMagicCookie) {
     buf[0] = 0x00; buf[1] = 0x01;  // BINDING_REQUEST
     buf[4] = 0xff;                 // not magic cookie
     EXPECT_FALSE(parse_stun(buf).has_value());
+}
+
+// ── TURN ChannelData (RFC 5766 §11.4) ─────────────────────────────────
+
+TEST(IceTurnChannel, EncodeDecodeRoundTrip) {
+    using namespace gn::link::ice;
+    const std::vector<std::uint8_t> payload{0x11, 0x22, 0x33, 0x44, 0x55};
+    auto frame = encode_channel_data(0x4001, payload);
+    /// 4-byte header + 5 payload + 3 padding to 4-byte boundary = 12.
+    EXPECT_EQ(frame.size(), 12u);
+    EXPECT_TRUE(is_channel_data(frame));
+    auto view = parse_channel_data(frame);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->channel, 0x4001u);
+    ASSERT_EQ(view->payload.size(), payload.size());
+    EXPECT_EQ(0, std::memcmp(view->payload.data(), payload.data(),
+                                payload.size()));
+}
+
+TEST(IceTurnChannel, DemuxRejectsStunFrame) {
+    using namespace gn::link::ice;
+    /// STUN messages have top nibble 0x0-0x3 (method classes); the
+    /// ChannelData demux must NOT misclassify a Binding Request as
+    /// channel traffic.
+    auto stun = StunBuilder(STUN_BINDING_REQUEST)
+        .set_txn_id(generate_txn_id())
+        .build();
+    EXPECT_FALSE(is_channel_data(stun));
+}
+
+TEST(IceTurnChannel, ParseRejectsOutOfRangeChannel) {
+    using namespace gn::link::ice;
+    /// Channel numbers must fall in [0x4000, 0x7FFF]; anything else
+    /// is reserved and parse_channel_data should reject.
+    std::vector<std::uint8_t> bad(8, 0);
+    bad[0] = 0x80;  // channel 0x8000 — invalid
+    bad[1] = 0x00;
+    bad[2] = 0x00;
+    bad[3] = 0x04;
+    EXPECT_FALSE(parse_channel_data(bad).has_value());
+}
+
+TEST(IceTurnChannel, ParseRejectsTruncatedFrame) {
+    using namespace gn::link::ice;
+    /// Length field says 100 bytes but buffer is only 6 — must
+    /// reject before reading past the end.
+    std::vector<std::uint8_t> bad(6, 0);
+    bad[0] = 0x40;  // valid channel 0x4000
+    bad[2] = 0x00;
+    bad[3] = 0x64;  // length 100
+    EXPECT_FALSE(parse_channel_data(bad).has_value());
+}
+
+TEST(IceTurnChannel, BuilderEmitsChannelBindAttributes) {
+    using namespace gn::link::ice;
+    auto txn = generate_txn_id();
+    auto msg = StunBuilder(TURN_CHANNEL_BIND_REQUEST)
+        .set_txn_id(txn)
+        .add_channel_number(0x4002)
+        .add_xor_peer_address("127.0.0.1", 12345)
+        .build();
+    auto parsed = parse_stun(msg);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->msg_type, TURN_CHANNEL_BIND_REQUEST);
+    EXPECT_EQ(parsed->txn_id, txn);
+    ASSERT_TRUE(parsed->xor_peer.has_value());
+    EXPECT_EQ(parsed->xor_peer->ip, "127.0.0.1");
+    EXPECT_EQ(parsed->xor_peer->port, 12345u);
 }

@@ -49,6 +49,19 @@ constexpr uint16_t TURN_CREATE_PERM_REQUEST = 0x0008;
 constexpr uint16_t TURN_CREATE_PERM_RESPONSE= 0x0108;
 constexpr uint16_t TURN_SEND_INDICATION     = 0x0016;
 constexpr uint16_t TURN_DATA_INDICATION     = 0x0017;
+constexpr uint16_t TURN_CHANNEL_BIND_REQUEST  = 0x0009;
+constexpr uint16_t TURN_CHANNEL_BIND_RESPONSE = 0x0109;
+constexpr uint16_t TURN_CHANNEL_BIND_ERROR    = 0x0119;
+
+/// ChannelData per RFC 5766 §11.4 — efficient binary framing for
+/// data sent over a TURN-bound channel. First 2 bytes are the
+/// channel number (0x4000-0x7FFF); next 2 bytes are payload length;
+/// payload follows. Total minimum frame = 4 bytes. The first byte's
+/// top nibble (0x4-0x7) lets receivers demux ChannelData vs STUN
+/// messages (top nibble 0x0 / 0x1 for STUN methods).
+constexpr uint16_t TURN_CHANNEL_NUMBER_MIN  = 0x4000;
+constexpr uint16_t TURN_CHANNEL_NUMBER_MAX  = 0x7FFF;
+constexpr std::size_t TURN_CHANNEL_DATA_HEADER_SIZE = 4;
 
 // TURN attributes
 constexpr uint16_t TURN_ATTR_CHANNEL_NUMBER      = 0x000C;
@@ -86,6 +99,7 @@ public:
     StunBuilder& add_ice_controlling(uint64_t tiebreaker);
     StunBuilder& add_ice_controlled(uint64_t tiebreaker);
     StunBuilder& add_xor_peer_address(const std::string& ip, uint16_t port);
+    StunBuilder& add_channel_number(uint16_t channel);
     StunBuilder& add_data(std::span<const uint8_t> data);
     StunBuilder& add_requested_transport(uint8_t proto);
     StunBuilder& add_lifetime(uint32_t seconds);
@@ -136,5 +150,32 @@ std::optional<StunMessage> parse_stun(std::span<const uint8_t> data);
 
 /// Verify MESSAGE-INTEGRITY.
 bool verify_integrity(std::span<const uint8_t> raw, const std::string& key);
+
+/// Encode a ChannelData frame (RFC 5766 §11.4). Result has the
+/// 4-byte header prepended to the payload. The wire is padded to
+/// a 4-byte boundary per the RFC; padding bytes are not part of
+/// the application payload.
+std::vector<uint8_t> encode_channel_data(uint16_t channel,
+                                          std::span<const uint8_t> payload);
+
+/// Demux helper: a buffer starts with a ChannelData frame if the
+/// top nibble of the first byte is in [0x4, 0x7]. STUN messages
+/// have top nibble in [0x0, 0x3] for the method class encoding.
+inline bool is_channel_data(std::span<const uint8_t> raw) noexcept {
+    if (raw.size() < TURN_CHANNEL_DATA_HEADER_SIZE) return false;
+    const uint8_t top = static_cast<uint8_t>(raw[0] & 0xC0);
+    return top == 0x40;
+}
+
+/// Parsed ChannelData view — `channel` is the 16-bit channel number,
+/// `payload` is the unpadded application bytes inside the frame.
+/// Returns nullopt for malformed frames (short header, length
+/// overflow).
+struct ChannelDataView {
+    uint16_t                    channel;
+    std::span<const uint8_t>    payload;
+};
+std::optional<ChannelDataView> parse_channel_data(
+    std::span<const uint8_t> raw);
 
 } // namespace gn::link::ice
