@@ -5,7 +5,8 @@ add_executable(test_ice
     test_ice.cpp
     test_ice_composer.cpp
     test_ice_conformance.cpp
-    test_ice_turn_framing.cpp)
+    test_ice_turn_framing.cpp
+    test_ice_dns.cpp)
 target_link_libraries(test_ice PRIVATE
     GoodNet::sdk
     goodnet_ice_objects

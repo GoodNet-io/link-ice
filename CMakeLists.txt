@@ -24,6 +24,7 @@ add_library(goodnet_ice_objects OBJECT
     session.cpp
     stun.cpp
     turn.cpp
+    dns_ext_client.cpp
 )
 target_link_libraries(goodnet_ice_objects PUBLIC
     GoodNet::sdk asio::asio Threads::Threads OpenSSL::Crypto PkgConfig::SODIUM)

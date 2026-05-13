@@ -4,6 +4,7 @@
 #include "link_ice.hpp"
 
 #include "candidate.hpp"
+#include "dns_ext_client.hpp"
 
 #include <sdk/conn_events.h>
 #include <sdk/convenience.h>
@@ -60,6 +61,15 @@ IceLink::~IceLink() {
 void IceLink::apply_config() noexcept {
     if (api_ == nullptr || api_->config_get == nullptr) return;
 
+    /// Resolve the `gn.dns` extension once per apply_config call.
+    /// When present, `stun:<host>` / `turn:<host>` entries without
+    /// an explicit port trigger SRV expansion. When absent (the
+    /// handler-dns plugin isn't loaded) the entries pass through
+    /// unmodified — the operator will see a hostname in the config
+    /// that needs OS-resolver lookup at probe time, or one that
+    /// never resolves; either way the legacy path is unchanged.
+    auto dns_ext = DnsExtClient::query(api_);
+
     IceConfig cfg;
     /// Default STUN entry — same as constructor; reload that drops
     /// the `ice.stun_servers` key falls back to the public Google
@@ -67,6 +77,39 @@ void IceLink::apply_config() noexcept {
     for (auto sv : kDefaultStunServers) {
         cfg.stun_servers.emplace_back(sv);
     }
+
+    /// Helper to append one STUN string into cfg, doing SRV
+    /// expansion when the input is `stun:<host>` without a port
+    /// AND `gn.dns` is reachable. Falls back to push-as-is
+    /// otherwise.
+    auto push_stun = [&](std::string_view raw) {
+        const auto svc = parse_service_uri(raw);
+        if (svc && svc->scheme == "stun" && svc->port == 0 && dns_ext) {
+            const auto srv =
+                dns_ext->resolve_service("stun", "udp", svc->host, 16);
+            if (!srv.empty()) {
+                for (const auto& r : srv) {
+                    cfg.stun_servers.emplace_back(
+                        r.target + ":" + std::to_string(r.port));
+                }
+                return;
+            }
+            /// SRV lookup yielded nothing — fall through to legacy
+            /// form. Common when the operator's DNS plugin is up
+            /// but the upstream doesn't publish `_stun._udp` SRV
+            /// records (typical for many providers). The host
+            /// segment alone, without a port, won't fly through
+            /// the rest of ICE — log + push the bare hostname so
+            /// the path-not-found shows up as a probe failure
+            /// rather than a silent config drop.
+        }
+        if (svc && svc->scheme == "stun" && svc->port != 0) {
+            cfg.stun_servers.emplace_back(
+                svc->host + ":" + std::to_string(svc->port));
+            return;
+        }
+        cfg.stun_servers.emplace_back(raw);
+    };
 
     std::size_t arr_size = 0;
     if (gn_config_get_array_size(api_, "ice.stun_servers", &arr_size) == GN_OK) {
@@ -78,7 +121,7 @@ void IceLink::apply_config() noexcept {
             if (gn_config_get_array_string(api_, "ice.stun_servers", i,
                                             &value, &user_data, &free_fn) == GN_OK
                 && value != nullptr) {
-                cfg.stun_servers.emplace_back(value);
+                push_stun(value);
                 if (free_fn != nullptr) {
                     free_fn(user_data, const_cast<char*>(value));
                 }
@@ -87,7 +130,10 @@ void IceLink::apply_config() noexcept {
     }
 
     /// Single-server TURN config covers the common deployment case;
-    /// multi-server fallback is a v1.1 extension.
+    /// multi-server fallback is a v1.1 extension. The string can be
+    /// one of: `host:port` (legacy), `turn:host:port` (explicit
+    /// scheme + port), or `turn:host` (no port → SRV expansion via
+    /// `gn.dns` for `_turn._udp.<host>`).
     {
         const char* value = nullptr;
         void* user_data = nullptr;
@@ -99,17 +145,43 @@ void IceLink::apply_config() noexcept {
             if (free_fn != nullptr) {
                 free_fn(user_data, const_cast<char*>(value));
             }
-            auto colon = s.rfind(':');
-            if (colon != std::string::npos) {
-                cfg.turn.server = s.substr(0, colon);
-                try {
-                    cfg.turn.port = static_cast<std::uint16_t>(
-                        std::stoul(s.substr(colon + 1)));
-                } catch (...) {
-                    cfg.turn.port = 3478;
+
+            const auto svc = parse_service_uri(s);
+            if (svc && svc->scheme == "turn" && svc->port == 0 && dns_ext) {
+                /// Pick the proto from the existing `ice.turn_tcp`
+                /// / `ice.turn_tls` knobs already set below; for
+                /// the lookup we default to UDP and let downstream
+                /// re-resolve TCP/TLS via a follow-up SRV when the
+                /// operator wants it. Multi-proto SRV expansion
+                /// lands alongside the multi-server array work
+                /// (C.2 from the master plan).
+                const auto srv =
+                    dns_ext->resolve_service("turn", "udp", svc->host, 1);
+                if (!srv.empty()) {
+                    cfg.turn.server = srv[0].target;
+                    cfg.turn.port   = srv[0].port;
                 }
+                /// SRV miss → leave TURN config empty so the
+                /// session simply doesn't allocate a relay
+                /// candidate (which is the existing behaviour
+                /// when the operator never configured one).
+            } else if (svc && svc->scheme == "turn" && svc->port != 0) {
+                cfg.turn.server = svc->host;
+                cfg.turn.port   = svc->port;
             } else {
-                cfg.turn.server = std::move(s);
+                /// Legacy host:port string.
+                auto colon = s.rfind(':');
+                if (colon != std::string::npos) {
+                    cfg.turn.server = s.substr(0, colon);
+                    try {
+                        cfg.turn.port = static_cast<std::uint16_t>(
+                            std::stoul(s.substr(colon + 1)));
+                    } catch (...) {
+                        cfg.turn.port = 3478;
+                    }
+                } else {
+                    cfg.turn.server = std::move(s);
+                }
             }
         }
     }
