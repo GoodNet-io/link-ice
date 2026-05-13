@@ -382,14 +382,20 @@ void IceSession::gather_host_candidates() {
             c.family = AddressFamily::IPv4;
             std::memcpy(c.addr.data(), &sin->sin_addr, 4);
             c.priority = compute_priority(CandidateType::Host, 65535, 1);
-            local_candidates_.push_back(c);
+            if (candidate_allowed(c.type, c.family,
+                                   cfg_.candidate_filter_flags)) {
+                local_candidates_.push_back(c);
+            }
         } else if (ifa->ifa_addr->sa_family == AF_INET6) {
             auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr);
             if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) continue;
             c.family = AddressFamily::IPv6;
             std::memcpy(c.addr.data(), &sin6->sin6_addr, 16);
             c.priority = compute_priority(CandidateType::Host, 65534, 1);
-            local_candidates_.push_back(c);
+            if (candidate_allowed(c.type, c.family,
+                                   cfg_.candidate_filter_flags)) {
+                local_candidates_.push_back(c);
+            }
         }
     }
     freeifaddrs(iflist);
@@ -520,12 +526,21 @@ void IceSession::handle_gather_response(const StunMessage& msg) {
     }
     c.port = msg.xor_mapped->port;
 
-    local_candidates_.push_back(c);
+    if (candidate_allowed(c.type, c.family,
+                           cfg_.candidate_filter_flags)) {
+        local_candidates_.push_back(c);
+    }
     on_gathering_complete();
 }
 
 void IceSession::gather_relay() {
     if (cfg_.turn.server.empty()) return;
+    /// Operator may have disabled relay candidates via
+    /// `ice.candidate_filters = ["host-only"]` etc. Short-circuit
+    /// the entire TURN allocation in that case — saves a STUN
+    /// request roundtrip and avoids holding a TURN refresh timer
+    /// for a candidate we'd just drop.
+    if ((cfg_.candidate_filter_flags & kCandidateFilterHostOnly) != 0) return;
 
     /// Pick the carrier scheme for the TURN server endpoint. Order
     /// of precedence: TLS > TCP > UDP. Each higher tier requires its
@@ -602,6 +617,10 @@ void IceSession::gather_relay() {
             c.priority = compute_priority(CandidateType::Relay, 65535, 1);
 
             asio::post(self->strand_, [self, c = std::move(c)]() mutable {
+                if (!candidate_allowed(c.type, c.family,
+                                        self->cfg_.candidate_filter_flags)) {
+                    return;
+                }
                 self->local_candidates_.push_back(std::move(c));
 
                 /// If remote candidates already arrived and we are

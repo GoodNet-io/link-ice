@@ -294,6 +294,35 @@ void IceLink::apply_config() noexcept {
     if (gn_config_get_int64(api_, "ice.aggressive_nomination", &v) == GN_OK) {
         cfg.aggressive_nomination = (v != 0);
     }
+    /// Operator-side candidate filter tokens (C.6). Array of
+    /// string tokens — each token sets one bit in
+    /// `cfg.candidate_filter_flags`. Unknown tokens are ignored
+    /// silently so an operator can adopt new tokens in a config
+    /// file without breaking older kernels that don't recognise
+    /// them.
+    {
+        std::size_t arr = 0;
+        if (gn_config_get_array_size(api_, "ice.candidate_filters",
+                                      &arr) == GN_OK) {
+            for (std::size_t i = 0; i < arr; ++i) {
+                const char* value = nullptr;
+                void* user_data = nullptr;
+                void (*free_fn)(void*, void*) = nullptr;
+                if (gn_config_get_array_string(api_, "ice.candidate_filters", i,
+                                                &value, &user_data, &free_fn) == GN_OK
+                    && value != nullptr) {
+                    const std::string_view tok(value);
+                    if      (tok == "exclude-ipv4") cfg.candidate_filter_flags |= kCandidateFilterExcludeIpv4;
+                    else if (tok == "exclude-ipv6") cfg.candidate_filter_flags |= kCandidateFilterExcludeIpv6;
+                    else if (tok == "relay-only")   cfg.candidate_filter_flags |= kCandidateFilterRelayOnly;
+                    else if (tok == "host-only")    cfg.candidate_filter_flags |= kCandidateFilterHostOnly;
+                    if (free_fn != nullptr) {
+                        free_fn(user_data, const_cast<char*>(value));
+                    }
+                }
+            }
+        }
+    }
     /// TURN-over-TCP toggle (RFC 5389 §7.2.2). When set, sessions
     /// resolve `gn.link.tcp` for the TURN server endpoint and apply
     /// length-prefix framing on STUN messages. Useful behind UDP-

@@ -65,6 +65,20 @@ constexpr const char* session_state_name(SessionState s) {
     return "UNKNOWN";
 }
 
+/// Bit flags for `IceConfig::candidate_filter_flags`. Operators
+/// reach them through the `ice.candidate_filters` config array of
+/// string tokens — `"exclude-ipv4"`, `"exclude-ipv6"`,
+/// `"relay-only"`, `"host-only"`. Combinations make sense (e.g.
+/// `relay-only` + `exclude-ipv6` keeps only IPv4 relay candidates
+/// for an operator running through TURN on a v4-only carrier);
+/// contradictions (`relay-only` + `host-only`) silently drop both
+/// kinds so no candidate is generated — useful for diagnostics
+/// where you want a session to ICE-fail deliberately.
+inline constexpr std::uint32_t kCandidateFilterExcludeIpv4 = 1u << 0;
+inline constexpr std::uint32_t kCandidateFilterExcludeIpv6 = 1u << 1;
+inline constexpr std::uint32_t kCandidateFilterRelayOnly   = 1u << 2;
+inline constexpr std::uint32_t kCandidateFilterHostOnly    = 1u << 3;
+
 /// @brief ICE session configuration: STUN/TURN servers, timeouts, keepalive.
 struct IceConfig {
     std::vector<std::string> stun_servers{};
@@ -96,7 +110,28 @@ struct IceConfig {
     /// (e.g. dual-stack hosts where v4 wins the race but v6 has
     /// higher priority); aggressive nominates faster.
     bool aggressive_nomination  = false;
+    /// Operator-side candidate filtering. OR-ed combination of the
+    /// `kCandidateFilter*` flags above. Default 0 = no filtering;
+    /// every host / srflx / relay candidate is gathered as usual.
+    std::uint32_t candidate_filter_flags = 0;
 };
+
+/// Decide whether a candidate of `(type, family)` survives the
+/// operator's filter mask. Called at push sites in the session
+/// FSM so a filter-out candidate never enters the check list.
+[[nodiscard]] constexpr bool candidate_allowed(
+        CandidateType type, AddressFamily family,
+        std::uint32_t filter_flags) noexcept {
+    if ((filter_flags & kCandidateFilterExcludeIpv4) != 0 &&
+        family == AddressFamily::IPv4) return false;
+    if ((filter_flags & kCandidateFilterExcludeIpv6) != 0 &&
+        family == AddressFamily::IPv6) return false;
+    if ((filter_flags & kCandidateFilterRelayOnly) != 0 &&
+        type != CandidateType::Relay) return false;
+    if ((filter_flags & kCandidateFilterHostOnly) != 0 &&
+        type != CandidateType::Host) return false;
+    return true;
+}
 
 /// @brief ICE candidate pair under connectivity check.
 struct CheckPair {

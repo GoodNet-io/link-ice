@@ -8,7 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <candidate.hpp>
 #include <dns_ext_client.hpp>
+#include <session.hpp>
 
 #include <sdk/extensions/dns.h>
 #include <sdk/host_api.h>
@@ -25,6 +27,64 @@
 
 namespace gn::link::ice {
 namespace {
+
+// ── C.6 candidate filter helper ────────────────────────────────────────────
+
+TEST(CandidateFilter, DefaultAllowsEverything) {
+    /// flags == 0 → no filtering, every kind survives.
+    EXPECT_TRUE(candidate_allowed(CandidateType::Host,  AddressFamily::IPv4, 0));
+    EXPECT_TRUE(candidate_allowed(CandidateType::Srflx, AddressFamily::IPv6, 0));
+    EXPECT_TRUE(candidate_allowed(CandidateType::Relay, AddressFamily::IPv4, 0));
+    EXPECT_TRUE(candidate_allowed(CandidateType::Prflx, AddressFamily::IPv6, 0));
+}
+
+TEST(CandidateFilter, ExcludeIpv6) {
+    const auto f = kCandidateFilterExcludeIpv6;
+    EXPECT_TRUE (candidate_allowed(CandidateType::Host, AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Host, AddressFamily::IPv6, f));
+}
+
+TEST(CandidateFilter, ExcludeIpv4) {
+    const auto f = kCandidateFilterExcludeIpv4;
+    EXPECT_FALSE(candidate_allowed(CandidateType::Host, AddressFamily::IPv4, f));
+    EXPECT_TRUE (candidate_allowed(CandidateType::Host, AddressFamily::IPv6, f));
+}
+
+TEST(CandidateFilter, RelayOnly) {
+    const auto f = kCandidateFilterRelayOnly;
+    EXPECT_FALSE(candidate_allowed(CandidateType::Host,  AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Srflx, AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Prflx, AddressFamily::IPv4, f));
+    EXPECT_TRUE (candidate_allowed(CandidateType::Relay, AddressFamily::IPv4, f));
+}
+
+TEST(CandidateFilter, HostOnly) {
+    const auto f = kCandidateFilterHostOnly;
+    EXPECT_TRUE (candidate_allowed(CandidateType::Host,  AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Srflx, AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Relay, AddressFamily::IPv4, f));
+}
+
+TEST(CandidateFilter, CombinedRelayOnlyExcludeIpv6) {
+    /// Operator running TURN over a v4-only carrier and wanting
+    /// nothing else — relay + IPv4 survives, everything else
+    /// drops.
+    const auto f = kCandidateFilterRelayOnly | kCandidateFilterExcludeIpv6;
+    EXPECT_FALSE(candidate_allowed(CandidateType::Host,  AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Relay, AddressFamily::IPv6, f));
+    EXPECT_TRUE (candidate_allowed(CandidateType::Relay, AddressFamily::IPv4, f));
+}
+
+TEST(CandidateFilter, ContradictoryFlagsDropEverything) {
+    /// `relay-only` + `host-only` is a diagnostic mode — the
+    /// session generates no candidates and ICE fails
+    /// deliberately. Verifies the AND-semantics of the two
+    /// type-filters.
+    const auto f = kCandidateFilterRelayOnly | kCandidateFilterHostOnly;
+    EXPECT_FALSE(candidate_allowed(CandidateType::Host,  AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Srflx, AddressFamily::IPv4, f));
+    EXPECT_FALSE(candidate_allowed(CandidateType::Relay, AddressFamily::IPv4, f));
+}
 
 // ── parse_service_uri ──────────────────────────────────────────────────────
 
