@@ -16,7 +16,7 @@
 
 stdenv.mkDerivation {
   pname   = "goodnet-link-ice";
-  version = "0.1.0";
+  version = "1.0.0-rc1";
   src     = ./.;
   nativeBuildInputs = [ cmake ninja pkg-config ];
   buildInputs       = [ goodnet-core gtest rapidcheck openssl ];
