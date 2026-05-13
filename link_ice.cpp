@@ -129,62 +129,105 @@ void IceLink::apply_config() noexcept {
         }
     }
 
-    /// Single-server TURN config covers the common deployment case;
-    /// multi-server fallback is a v1.1 extension. The string can be
-    /// one of: `host:port` (legacy), `turn:host:port` (explicit
-    /// scheme + port), or `turn:host` (no port → SRV expansion via
-    /// `gn.dns` for `_turn._udp.<host>`).
-    {
-        const char* value = nullptr;
-        void* user_data = nullptr;
-        void (*free_fn)(void*, void*) = nullptr;
-        if (gn_config_get_string(api_, "ice.turn_servers",
-                                  &value, &user_data, &free_fn) == GN_OK
-            && value != nullptr) {
-            std::string s(value);
-            if (free_fn != nullptr) {
-                free_fn(user_data, const_cast<char*>(value));
-            }
+    /// Helper that turns one raw TURN config string into a TurnConfig
+    /// — accepts `host:port`, `turn:host`, and `turn:host:port`. SRV
+    /// expansion fires when `turn:host` arrives without a port AND
+    /// `gn.dns` is reachable. Returns nullopt when the string can't
+    /// be parsed into a usable entry.
+    auto parse_turn_entry = [&](std::string_view raw) -> std::optional<TurnConfig> {
+        if (raw.empty()) return std::nullopt;
+        TurnConfig t;
 
-            const auto svc = parse_service_uri(s);
-            if (svc && svc->scheme == "turn" && svc->port == 0 && dns_ext) {
-                /// Pick the proto from the existing `ice.turn_tcp`
-                /// / `ice.turn_tls` knobs already set below; for
-                /// the lookup we default to UDP and let downstream
-                /// re-resolve TCP/TLS via a follow-up SRV when the
-                /// operator wants it. Multi-proto SRV expansion
-                /// lands alongside the multi-server array work
-                /// (C.2 from the master plan).
-                const auto srv =
-                    dns_ext->resolve_service("turn", "udp", svc->host, 1);
-                if (!srv.empty()) {
-                    cfg.turn.server = srv[0].target;
-                    cfg.turn.port   = srv[0].port;
-                }
-                /// SRV miss → leave TURN config empty so the
-                /// session simply doesn't allocate a relay
-                /// candidate (which is the existing behaviour
-                /// when the operator never configured one).
-            } else if (svc && svc->scheme == "turn" && svc->port != 0) {
-                cfg.turn.server = svc->host;
-                cfg.turn.port   = svc->port;
-            } else {
-                /// Legacy host:port string.
-                auto colon = s.rfind(':');
-                if (colon != std::string::npos) {
-                    cfg.turn.server = s.substr(0, colon);
-                    try {
-                        cfg.turn.port = static_cast<std::uint16_t>(
-                            std::stoul(s.substr(colon + 1)));
-                    } catch (...) {
-                        cfg.turn.port = 3478;
+        const auto svc = parse_service_uri(raw);
+        if (svc && svc->scheme == "turn" && svc->port == 0 && dns_ext) {
+            const auto srv =
+                dns_ext->resolve_service("turn", "udp", svc->host, 1);
+            if (srv.empty()) return std::nullopt;
+            t.server = srv[0].target;
+            t.port   = srv[0].port;
+            return t;
+        }
+        if (svc && svc->scheme == "turn" && svc->port != 0) {
+            t.server = svc->host;
+            t.port   = svc->port;
+            return t;
+        }
+        /// Legacy `host:port` string.
+        const std::string s(raw);
+        const auto colon = s.rfind(':');
+        if (colon != std::string::npos) {
+            t.server = s.substr(0, colon);
+            try {
+                const auto p = std::stoul(s.substr(colon + 1));
+                if (p == 0 || p > 65535) return std::nullopt;
+                t.port = static_cast<std::uint16_t>(p);
+            } catch (...) {
+                return std::nullopt;
+            }
+            return t;
+        }
+        if (s.empty()) return std::nullopt;
+        t.server = s;
+        return t;
+    };
+
+    /// `ice.turn_servers` accepts BOTH a single-string legacy form
+    /// AND a string-array (C.2 from the master plan). The array
+    /// shape is the new canonical layout — first entry populates
+    /// `cfg.turn` for session-side compatibility, every entry lands
+    /// in `cfg.turn_servers` so a future commit can iterate them
+    /// for allocation fallover (RFC 8445 §6.1.4).
+    {
+        std::size_t turn_arr_size = 0;
+        if (gn_config_get_array_size(api_, "ice.turn_servers",
+                                      &turn_arr_size) == GN_OK) {
+            for (std::size_t i = 0; i < turn_arr_size; ++i) {
+                const char* value = nullptr;
+                void* user_data = nullptr;
+                void (*free_fn)(void*, void*) = nullptr;
+                if (gn_config_get_array_string(api_, "ice.turn_servers", i,
+                                                &value, &user_data, &free_fn) == GN_OK
+                    && value != nullptr) {
+                    if (auto t = parse_turn_entry(value)) {
+                        cfg.turn_servers.push_back(std::move(*t));
                     }
-                } else {
-                    cfg.turn.server = std::move(s);
+                    if (free_fn != nullptr) {
+                        free_fn(user_data, const_cast<char*>(value));
+                    }
+                }
+            }
+        } else {
+            /// Single-string legacy form. Same parser, same shape.
+            const char* value = nullptr;
+            void* user_data = nullptr;
+            void (*free_fn)(void*, void*) = nullptr;
+            if (gn_config_get_string(api_, "ice.turn_servers",
+                                      &value, &user_data, &free_fn) == GN_OK
+                && value != nullptr) {
+                if (auto t = parse_turn_entry(value)) {
+                    cfg.turn_servers.push_back(std::move(*t));
+                }
+                if (free_fn != nullptr) {
+                    free_fn(user_data, const_cast<char*>(value));
                 }
             }
         }
+
+        /// Mirror the first entry into `cfg.turn` for session-side
+        /// reads. Session FSM continues to consume the singleton
+        /// until the follow-up commit adds iteration logic.
+        if (!cfg.turn_servers.empty()) {
+            cfg.turn = cfg.turn_servers.front();
+        }
     }
+    /// Credentials apply to every TURN entry — same realm in
+    /// practice for an operator's TURN fleet. Per-server creds
+    /// would need a richer config schema (object array) which
+    /// isn't worth the churn until multi-realm fallover is real.
+    auto apply_to_all_turns = [&](auto setter) {
+        setter(cfg.turn);
+        for (auto& t : cfg.turn_servers) setter(t);
+    };
     {
         const char* value = nullptr;
         void* user_data = nullptr;
@@ -192,7 +235,8 @@ void IceLink::apply_config() noexcept {
         if (gn_config_get_string(api_, "ice.turn_username",
                                   &value, &user_data, &free_fn) == GN_OK
             && value != nullptr) {
-            cfg.turn.username = value;
+            const std::string u(value);
+            apply_to_all_turns([&](TurnConfig& t) { t.username = u; });
             if (free_fn != nullptr) {
                 free_fn(user_data, const_cast<char*>(value));
             }
@@ -205,7 +249,8 @@ void IceLink::apply_config() noexcept {
         if (gn_config_get_string(api_, "ice.turn_password",
                                   &value, &user_data, &free_fn) == GN_OK
             && value != nullptr) {
-            cfg.turn.password = value;
+            const std::string p(value);
+            apply_to_all_turns([&](TurnConfig& t) { t.password = p; });
             if (free_fn != nullptr) {
                 free_fn(user_data, const_cast<char*>(value));
             }
@@ -254,7 +299,8 @@ void IceLink::apply_config() noexcept {
     /// length-prefix framing on STUN messages. Useful behind UDP-
     /// blocked firewalls.
     if (gn_config_get_int64(api_, "ice.turn_tcp", &v) == GN_OK) {
-        cfg.turn.tcp_transport = (v != 0);
+        const bool b = (v != 0);
+        apply_to_all_turns([&](TurnConfig& t) { t.tcp_transport = b; });
     }
     /// TURN-over-TLS (RFC 5389 §7.2.2, `turns://` scheme). When
     /// enabled the session resolves `gn.link.tls` for the TURN
@@ -262,7 +308,8 @@ void IceLink::apply_config() noexcept {
     /// as plain TCP. Takes precedence over `ice.turn_tcp` when both
     /// are set — operators behind 443-only firewalls flip this on.
     if (gn_config_get_int64(api_, "ice.turn_tls", &v) == GN_OK) {
-        cfg.turn.tls_transport = (v != 0);
+        const bool b = (v != 0);
+        apply_to_all_turns([&](TurnConfig& t) { t.tls_transport = b; });
     }
 
     std::lock_guard lk(cfg_mu_);

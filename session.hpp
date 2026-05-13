@@ -68,7 +68,19 @@ constexpr const char* session_state_name(SessionState s) {
 /// @brief ICE session configuration: STUN/TURN servers, timeouts, keepalive.
 struct IceConfig {
     std::vector<std::string> stun_servers{};
+    /// Active TURN allocation parameters. When `turn_servers` carries
+    /// more than one entry `turn` mirrors the first; session-side
+    /// iteration across the fallback list lands in a follow-up
+    /// commit. Kept as a top-level field for read-site compatibility
+    /// with the rest of the FSM.
     TurnConfig turn;
+    /// RFC 8445 §6.1.4 (TURN as fallback) — array of TURN
+    /// allocations the operator wants to try. The first
+    /// non-empty entry populates `turn` above so existing
+    /// allocation paths keep working; the rest are reserved
+    /// for follow-up multi-TURN fallover. Empty array means
+    /// no relay candidate is generated.
+    std::vector<TurnConfig> turn_servers{};
     int  session_timeout_s      = 10;
     int  keepalive_interval_s   = 20;
     int  consent_max_failures   = 3;
