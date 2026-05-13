@@ -270,6 +270,15 @@ void IceLink::apply_config() noexcept {
         && v > 0 && v < 100) {
         cfg.consent_max_failures = static_cast<int>(v);
     }
+    /// Consent recovery cap — how many `Checking` re-entries the
+    /// FSM attempts before declaring the nominated pair dead.
+    /// Default 3; 0 means "die at first consent failure". Bounded
+    /// at 10 to keep a misconfigured value from holding a session
+    /// alive forever.
+    if (gn_config_get_int64(api_, "ice.consent_max_recovery", &v) == GN_OK
+        && v >= 0 && v <= 10) {
+        cfg.consent_max_recovery = static_cast<int>(v);
+    }
     if (gn_config_get_int64(api_, "ice.check_interval_ms", &v) == GN_OK
         && v > 0 && v < 60000) {
         cfg.check_interval_ms = static_cast<int>(v);

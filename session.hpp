@@ -98,6 +98,21 @@ struct IceConfig {
     int  session_timeout_s      = 10;
     int  keepalive_interval_s   = 20;
     int  consent_max_failures   = 3;
+    /// RFC 7675 consent freshness: when `consent_max_failures`
+    /// keepalive STUN binding requests in a row go unanswered the
+    /// session restarts connectivity checks against the current
+    /// candidate set (resets to `Checking`, rebuilds the check
+    /// list, re-probes). The session attempts at most
+    /// `consent_max_recovery` such restarts before declaring the
+    /// nominated pair dead and transitioning to `Failed`. Default
+    /// 3 — the FSM goes through three round-trips of re-checks
+    /// before giving up, which covers ~30 s of transient network
+    /// loss for the typical 50 ms check interval. Drop to 0 for a
+    /// session that should die at the first consent failure
+    /// (real-time gaming where stale state hurts more than a fresh
+    /// session); raise it for slow-changing networks where ICE
+    /// restart cost is prohibitive.
+    int  consent_max_recovery   = 3;
     int  check_interval_ms      = 50;
     int  max_check_retries      = 4;
     /// Nomination strategy per RFC 8445 §8.1.1. `false` (default) =
@@ -344,7 +359,6 @@ private:
     asio::steady_timer keepalive_timer_;
     std::atomic<uint32_t> consent_missed_{0};
     uint32_t consent_recovery_attempts_ = 0;
-    static constexpr uint32_t MAX_CONSENT_RECOVERY = 3;
 
     // TURN
     std::shared_ptr<TurnClient> turn_;

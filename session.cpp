@@ -1061,7 +1061,8 @@ void IceSession::on_keepalive() {
 
     auto missed = consent_missed_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (missed >= static_cast<uint32_t>(cfg_.consent_max_failures)) {
-        if (consent_recovery_attempts_ < MAX_CONSENT_RECOVERY) {
+        if (consent_recovery_attempts_ <
+                static_cast<uint32_t>(cfg_.consent_max_recovery)) {
             ++consent_recovery_attempts_;
             consent_missed_.store(0, std::memory_order_release);
 
