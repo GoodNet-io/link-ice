@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
 /// @file   plugins/links/ice/tests/test_ice_composer.cpp
-/// @brief  Composer-surface coverage for IceLink (Слайс 11b).
+/// @brief  Composer-surface coverage for IceLink.
 ///
 /// Tests exercise the L2 composer entry points — `composer_listen` /
 /// `composer_connect` / `composer_subscribe_data` /

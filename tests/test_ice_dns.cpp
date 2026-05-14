@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
 /// @file   plugins/links/ice/tests/test_ice_dns.cpp
-/// @brief  D-DNS.5 — link-ice consuming the gn.dns extension for
-///         SRV-driven `stun:<host>` / `turn:<host>` configs.
+/// @brief  link-ice consuming the gn.dns extension for SRV-driven
+///         `stun:<host>` / `turn:<host>` configs.
 ///         Covers `parse_service_uri`, `DnsExtClient::resolve_srv`
 ///         (priority/weight ordering), and a stubbed gn.dns
 ///         extension end-to-end.
@@ -28,7 +28,7 @@
 namespace gn::link::ice {
 namespace {
 
-// ── C.6 candidate filter helper ────────────────────────────────────────────
+// ── candidate filter helper ────────────────────────────────────────────────
 
 TEST(CandidateFilter, DefaultAllowsEverything) {
     /// flags == 0 → no filtering, every kind survives.

@@ -9,7 +9,7 @@
 /// hop. The nominated-pair tuple (ip / port / relay) is guarded by a
 /// dedicated mutex so the hot send path doesn't hop strands either.
 ///
-/// I/O model (Слайс 11a): the session does not own a UDP socket.
+/// I/O model: the session does not own a UDP socket.
 /// Inbound and outbound bytes flow through a shared `gn.link.udp`
 /// carrier resolved by the parent `IceLink`. Each remote endpoint
 /// (STUN server, peer candidate, TURN relay, nominated peer) gets
@@ -181,7 +181,8 @@ struct CheckPair {
 };
 
 /// Nomination snapshot exposed to strategy plugins (`gn.link.ice`
-/// extension consumers — `gn.float-send.*` from Слайс 9). Filled
+/// extension consumers — `gn.float-send.*` is the reference
+/// consumer). Filled
 /// post-nomination; reads before nomination return defaults.
 struct NominationMetrics {
     uint64_t      rtt_us       = 0;

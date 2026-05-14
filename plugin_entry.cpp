@@ -297,7 +297,7 @@ void install_link_extension(IcePlugin* p) {
     v.send             = &link_ext_send;
     v.send_batch       = &link_ext_send_batch;
     v.close            = &link_ext_close;
-    /// Composer surface (Слайс 11b) — L2 plugins can `composer_connect`
+    /// Composer surface — L2 plugins can `composer_connect`
     /// over this ICE link to ride a NAT-traversed UDP pair as a
     /// reliable / encrypted stream carrier (QUIC, DTLS).
     v.listen             = &link_ext_composer_listen;

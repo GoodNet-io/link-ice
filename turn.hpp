@@ -7,7 +7,7 @@
 /// recv closures pin the client through `weak_from_this()` so a
 /// session that already tore down silently no-ops the next callback.
 ///
-/// I/O model (Слайс 11a): TURN bytes flow through the shared
+/// I/O model: TURN bytes flow through the shared
 /// `gn.link.udp` carrier instead of an inline `asio::ip::udp::socket`.
 /// The TURN server endpoint gets a dedicated carrier conn id
 /// (`server_cid_`) allocated by the session at construction time;

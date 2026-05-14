@@ -172,8 +172,8 @@ void IceLink::apply_config() noexcept {
     };
 
     /// `ice.turn_servers` accepts BOTH a single-string legacy form
-    /// AND a string-array (C.2 from the master plan). The array
-    /// shape is the new canonical layout — first entry populates
+    /// AND a string-array (the new canonical config layout). First
+    /// entry populates
     /// `cfg.turn` for session-side compatibility, every entry lands
     /// in `cfg.turn_servers` so a future commit can iterate them
     /// for allocation fallover (RFC 8445 §6.1.4).
@@ -364,11 +364,9 @@ void IceLink::set_host_api(const host_api_t* api) noexcept {
     api_ = api;
     apply_config();
 
-    /// Слайс 11a-prelude: resolve UDP carrier when the host exposes
-    /// `gn.link.udp`. Held passively for now — IceSession + TurnClient
-    /// still drive I/O through their inline asio sockets. Subsequent
-    /// sub-slices migrate sends, then receives, onto the carrier and
-    /// drop the inline sockets. Tests that lack a UDP provider in
+    /// Resolve UDP carrier when the host exposes `gn.link.udp`. The
+    /// session and TurnClient drive I/O through this carrier rather
+    /// than inline asio sockets. Tests that lack a UDP provider in
     /// their host_api stub simply get `nullopt`; the legacy path
     /// stays unchanged.
     if (api_ != nullptr && !carrier_udp_) {

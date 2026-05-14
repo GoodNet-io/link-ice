@@ -150,9 +150,10 @@ public:
         std::uint8_t kind,
         std::span<const std::uint8_t> blob);
 
-    /// Snapshot of nomination metrics for `conn`. Used by future
+    /// Snapshot of nomination metrics for `conn`. Used by
     /// `gn.link.ice` metrics extension consumers (strategy plugins
-    /// in Слайс 9). Returns `nominated == false` if the conn id is
+    /// such as `gn.float-send.*`). Returns `nominated == false` if
+    /// the conn id is
     /// unknown or its FSM hasn't reached `Connected`.
     [[nodiscard]] NominationMetrics nomination_metrics(
         gn_conn_id_t conn) const noexcept;
@@ -173,7 +174,7 @@ public:
         return mtu_.load(std::memory_order_relaxed);
     }
 
-    /// ── Composer surface (Слайс 11b) ─────────────────────────────
+    /// ── Composer surface ─────────────────────────────────────────
     ///
     /// Layer-2 consumers (QUIC, DTLS) treat a nominated ICE pair as a
     /// NAT-traversed UDP carrier. They `composer_connect("ice://pk")`
@@ -292,7 +293,7 @@ private:
     bool                                          reaper_started_ = false;
     const host_api_t*                              api_ = nullptr;
 
-    /// Слайс 11a: UDP carrier handle. Resolved from `gn.link.udp`
+    /// UDP carrier handle. Resolved from `gn.link.udp`
     /// extension at `set_host_api` time. Sessions take this as a
     /// borrowed pointer; if `nullopt` the FSM degrades to a no-op
     /// (test fixtures without a UDP provider still get the link
@@ -309,7 +310,7 @@ private:
     /// TCP path.
     std::optional<gn::sdk::LinkCarrier>           carrier_tls_;
 
-    /// Composer-side state (Слайс 11b). Lives parallel to the kernel
+    /// Composer-side state. Lives parallel to the kernel
     /// `sessions_` map so the bit-63 id range lookup picks the right
     /// path. Each entry binds a composer-owned cid to its underlying
     /// IceSession plus per-cid L2 data callback storage.

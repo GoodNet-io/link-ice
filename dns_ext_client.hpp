@@ -4,8 +4,7 @@
 ///         ICE plugin expand `stun:<hostname>` / `turn:<hostname>`
 ///         configs by asking the handler-dns plugin for
 ///         `_stun._udp.<host>` / `_turn._<proto>.<host>` SRV
-///         records — closes the master plan's §C.1 (DNS SRV
-///         resolution).
+///         records — the SRV-driven STUN / TURN config path.
 ///
 /// Pattern mirrors `sdk/cpp/link_carrier.hpp:58-75`: query the
 /// host_api for a versioned extension, hold the returned vtable
