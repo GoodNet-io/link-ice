@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
 /// @file   plugins/links/ice/link_ice.cpp
 ///
-/// Backpressure note (B-LINKS-05 partial): unlike TCP / IPC / TLS /
-/// QUIC, the ICE link plugin does not publish
-/// `GN_CONN_EVENT_BACKPRESSURE_SOFT` / `_CLEAR`. ICE is a NAT-
-/// traversal coordination layer — `IceSession::send` (in
-/// `session.cpp:151`) dispatches each chunk through the UDP
-/// carrier or TURN relay immediately, with no per-session send
-/// queue suitable for high / low watermarks. The UDP carrier
-/// underneath handles transport-level congestion; ICE itself
-/// has no queue to watermark.
-///
-/// `pending_stun_probes_` in `session.cpp` is STUN connectivity-
-/// check state, not user-data queueing, so it does not feed the
-/// backpressure surface either.
+/// Backpressure note: unlike TCP / IPC / TLS / QUIC, the ICE link
+/// plugin does not publish `GN_CONN_EVENT_BACKPRESSURE_SOFT` /
+/// `_CLEAR`. ICE is a NAT-traversal coordination layer —
+/// `IceSession::send` (in `session.cpp:151`) dispatches each
+/// chunk through the UDP carrier or TURN relay immediately, with
+/// no per-session send queue suitable for high / low watermarks.
+/// The UDP carrier underneath handles transport-level congestion;
+/// ICE itself has no queue to watermark. `pending_stun_probes_`
+/// in `session.cpp` is STUN connectivity-check state, not user-
+/// data queueing, so it does not feed the backpressure surface
+/// either.
 
 #include "link_ice.hpp"
 
