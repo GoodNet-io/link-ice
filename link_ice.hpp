@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
 /// @file   plugins/links/ice/link_ice.hpp
-/// @brief  ICE link plugin per `docs/contracts/link.md` — NAT
+/// @brief  ICE link plugin per `docs/contracts/link.en.md` — NAT
 ///         traversal via STUN/TURN with full RFC 8445 connectivity
 ///         checks.
 ///
@@ -116,7 +116,7 @@ public:
     [[nodiscard]] gn_result_t listen(std::string_view uri);
 
     /// Initiate ICE in controller role. URI form
-    /// `ice://<peer-pk-hex>` per `docs/contracts/uri.md`. Returns
+    /// `ice://<peer-pk-hex>` per `docs/contracts/uri.en.md`. Returns
     /// once the gather is posted; nomination completes asynchronously
     /// and surfaces through `notify_connect` once the first candidate
     /// pair succeeds.
@@ -221,7 +221,7 @@ public:
     [[nodiscard]] Stats stats() const noexcept;
 
     /// Static descriptor for the `gn.link.ice` extension. Snapshotted
-    /// once at plugin register time per `link.md` §8.
+    /// once at plugin register time per `link.en.md` §8.
     [[nodiscard]] static gn_link_caps_t capabilities() noexcept;
 
 private:

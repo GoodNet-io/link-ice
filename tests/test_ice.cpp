@@ -7,7 +7,7 @@
 /// a peer that responds with binding requests; that's outside the
 /// scope of an in-tree gtest. These cases exercise the kernel-facing
 /// surface (`gn_link_vtable_t` shape), the signaling extension entry
-/// points, and the teardown protocol from `link.md` §9.
+/// points, and the teardown protocol from `link.en.md` §9.
 
 #include <gtest/gtest.h>
 
