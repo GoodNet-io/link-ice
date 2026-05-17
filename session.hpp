@@ -84,9 +84,9 @@ struct IceConfig {
     std::vector<std::string> stun_servers{};
     /// Active TURN allocation parameters. When `turn_servers` carries
     /// more than one entry `turn` mirrors the first; session-side
-    /// iteration across the fallback list lands in a follow-up
-    /// commit. Kept as a top-level field for read-site compatibility
-    /// with the rest of the FSM.
+    /// iteration across the fallback list is not wired today. Kept
+    /// as a top-level field for read-site compatibility with the
+    /// rest of the FSM.
     TurnConfig turn;
     /// RFC 8445 §6.1.4 (TURN as fallback) — array of TURN
     /// allocations the operator wants to try. The first
