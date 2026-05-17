@@ -39,8 +39,8 @@ namespace {
 using namespace std::chrono_literals;
 using gn::link::ice::IceLink;
 
-/// Migrated 2026-05-12 from the local 50-LOC StubHost copy to the
-/// shared `gn::sdk::test::LinkStub`. See `sdk/cpp/test/stub_host.hpp`.
+/// Alias to the shared `gn::sdk::test::LinkStub`. See
+/// `sdk/cpp/test/stub_host.hpp` for the captured surface.
 using StubHost = ::gn::sdk::test::LinkStub;
 inline host_api_t make_stub_api(StubHost& h) noexcept {
     return ::gn::sdk::test::make_link_host_api(h);
