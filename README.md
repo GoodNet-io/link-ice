@@ -63,7 +63,7 @@ every bundled `.so` from there.
   end-of-candidates marker (OFFER_EOC / ANSWER_EOC)
 - RFC 8305 (Happy Eyeballs) — dual-family pre-fire in begin_checks
 - RFC 8085 (UDP usage) — path-MTU floor knob; RFC 8899 active
-  probe discovery is on the v1.1 roadmap
+  probe discovery is planned
 
 ## Contract
 
