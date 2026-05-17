@@ -13,8 +13,8 @@
 /// I/O routes through `carrier_` (a borrowed `gn::sdk::LinkCarrier*`
 /// resolved by the parent `IceLink`). Each remote endpoint we talk to
 /// gets its own carrier conn id via `ensure_remote_cid`; the per-cid
-/// `on_data` callback drives `on_carrier_data` which feeds the same
-/// STUN parsing path the inline socket recv loop used to.
+/// `on_data` callback drives `on_carrier_data` which feeds the STUN
+/// parsing path.
 
 #include "session.hpp"
 

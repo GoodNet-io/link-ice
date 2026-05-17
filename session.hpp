@@ -385,8 +385,7 @@ private:
 
     /// Dispatch entry for bytes arriving on a per-endpoint cid. Called
     /// from the per-conn `on_data` callback installed by
-    /// `ensure_remote_cid`. Drives the same STUN parsing / FSM the
-    /// inline socket recv loop used to.
+    /// `ensure_remote_cid`. Drives the STUN parsing / FSM.
     void on_carrier_data(gn_conn_id_t cid,
                           std::span<const std::uint8_t> bytes);
 
