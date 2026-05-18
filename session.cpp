@@ -1292,6 +1292,26 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
         }
 
         if (parsed->msg_type == STUN_BINDING_RESPONSE) {
+            /// DPLPMTUD probe correlation. A response whose txid
+            /// matches the most recent probe is the wire ACK for the
+            /// candidate MTU; cancel the timer and advance the
+            /// search. Probe responses also implicitly refresh
+            /// consent, so the keepalive counter resets alongside.
+            if (pmtu_inflight_ && parsed->txn_id == pmtu_inflight_txn_) {
+                pmtu_inflight_ = false;
+                pmtu_probe_timer_.cancel();
+                if (pmtu_probe_) {
+                    pmtu_probe_->on_probe_ack();
+                    effective_mtu_.store(
+                        static_cast<std::uint32_t>(pmtu_probe_->effective_mtu()),
+                        std::memory_order_release);
+                    if (!pmtu_probe_->is_complete()) {
+                        start_path_mtu_probe();
+                    }
+                }
+                consent_missed_.store(0, std::memory_order_release);
+                return;
+            }
             if (st == SessionState::Connected) {
                 consent_missed_.store(0, std::memory_order_release);
             } else {
