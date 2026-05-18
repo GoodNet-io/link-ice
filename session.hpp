@@ -99,6 +99,20 @@ struct IceConfig {
     int  session_timeout_s      = 10;
     int  keepalive_interval_s   = 20;
     int  consent_max_failures   = 3;
+    /// Per-attempt TURN ALLOCATE deadline. The multi-TURN fallback
+    /// path in `IceSession::gather_relay` walks `turn_servers` in
+    /// order and abandons each entry that does not surface a relay
+    /// address within this many seconds.
+    int  turn_allocate_timeout_s = 5;
+    /// Cadence of backup-TURN probing after a successful primary
+    /// allocation. Every tick the session attempts one ALLOCATE
+    /// against the next entry in `turn_servers` past the active
+    /// one; on success and an unhealthy primary the session fails
+    /// over. Zero disables backup probing.
+    int  turn_backup_interval_s = 30;
+    /// Minimum wall-clock gap between two consecutive failovers.
+    /// Bounds oscillation when both primary and backup are flapping.
+    int  turn_failover_min_interval_s = 60;
     /// RFC 7675 consent freshness: when `consent_max_failures`
     /// keepalive STUN binding requests in a row go unanswered the
     /// session restarts connectivity checks against the current

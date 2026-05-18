@@ -353,6 +353,27 @@ void IceLink::apply_config() noexcept {
         const bool b = (v != 0);
         apply_to_all_turns([&](TurnConfig& t) { t.tcp_transport = b; });
     }
+    /// Per-attempt deadline for TURN ALLOCATE during the sequential
+    /// walk of `turn_servers`. The session abandons an entry that
+    /// has not surfaced a relay address within this window and
+    /// advances to the next one.
+    if (gn_config_get_int64(api_, "ice.turn_allocate_timeout_s", &v) == GN_OK
+        && v > 0 && v < 600) {
+        cfg.turn_allocate_timeout_s = static_cast<int>(v);
+    }
+    /// Cadence at which the session probes the next backup TURN
+    /// after a primary has been allocated. Set to 0 to disable
+    /// backup probing entirely.
+    if (gn_config_get_int64(api_, "ice.turn_backup_interval_s", &v) == GN_OK
+        && v >= 0 && v < 3600) {
+        cfg.turn_backup_interval_s = static_cast<int>(v);
+    }
+    /// Minimum gap between two consecutive failover events. Bounds
+    /// oscillation when both primary and backup are flapping.
+    if (gn_config_get_int64(api_, "ice.turn_failover_min_interval_s", &v) == GN_OK
+        && v >= 0 && v < 3600) {
+        cfg.turn_failover_min_interval_s = static_cast<int>(v);
+    }
     /// draft-ietf-mmusic-mdns-ice-candidates host-candidate
     /// obfuscation. Off by default: browsers turning this on broke
     /// existing media-server integrations, so operators must opt
