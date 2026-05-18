@@ -940,13 +940,33 @@ gn_result_t IceLink::deliver_signal(
 
     IceSignalData hdr{};
     std::vector<Candidate> candidates;
-    if (!deserialize_signal(blob, hdr, candidates)) {
+    std::uint32_t signal_flags = 0;
+    if (!deserialize_signal(blob, hdr, candidates, &signal_flags)) {
         return GN_ERR_INVALID_ENVELOPE;
     }
     std::string ufrag(hdr.ufrag, ::strnlen(hdr.ufrag, sizeof(hdr.ufrag)));
     std::string pwd(hdr.pwd, ::strnlen(hdr.pwd, sizeof(hdr.pwd)));
 
     const auto peer_hex = pk_to_hex(peer_pk);
+    const bool peer_is_lite =
+        (signal_flags & ICE_SIGNAL_FLAG_LITE) != 0;
+    (void)signal_flags;
+
+    /// RFC 8445 §2.7: at least one side must run full ICE. If both
+    /// peers are lite there is no one to drive connectivity checks
+    /// and the FSM can never progress past `Checking`. Reject the
+    /// signal at the link layer so the operator sees the
+    /// misconfiguration before the session FSM starts.
+    {
+        std::lock_guard cfg_lk(cfg_mu_);
+        if (cfg_.lite_mode && peer_is_lite) {
+            gn_log_warn(api_,
+                "ice: reject signal — both sides are ICE-lite, no agent "
+                "can drive connectivity checks (peer=%s)",
+                peer_hex.c_str());
+            return GN_ERR_INVALID_STATE;
+        }
+    }
 
     if (is_offer) {
         if (!api_ || !api_->notify_connect) return GN_ERR_NOT_IMPLEMENTED;
@@ -995,6 +1015,7 @@ gn_result_t IceLink::deliver_signal(
             }
         }
         if (session) {
+            session->set_peer_signal_flags(signal_flags);
             /// Trickle ICE (RFC 8838): first OFFER allocates the session
             /// and kicks the local gather; subsequent OFFER blobs for
             /// the same peer just merge incremental candidates without
@@ -1029,6 +1050,7 @@ gn_result_t IceLink::deliver_signal(
         session = sit->second.session;
     }
     if (session) {
+        session->set_peer_signal_flags(signal_flags);
         /// Trickle-friendly: ANSWER blobs merge into the existing
         /// remote candidate set rather than overwriting. Subsequent
         /// trickle candidates from the responder ride the same path.

@@ -301,6 +301,21 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
     });
 }
 
+void IceSession::set_peer_signal_flags(std::uint32_t flags) {
+    asio::dispatch(strand_, [self = shared_from_this(), flags] {
+        self->peer_signal_flags_.store(flags, std::memory_order_release);
+    });
+}
+
+std::uint32_t IceSession::local_signal_flags() const noexcept {
+    std::uint32_t f = 0;
+    if (cfg_.lite_mode) f |= ICE_SIGNAL_FLAG_LITE;
+    if (symmetric_stride_.load(std::memory_order_acquire) != 0) {
+        f |= ICE_SIGNAL_FLAG_SYMMETRIC;
+    }
+    return f;
+}
+
 void IceSession::restart() {
     /// All state mutations are serialised on the strand; the call site
     /// usually arrives off-strand from the operator or kernel thread.
@@ -349,6 +364,10 @@ void IceSession::restart() {
         self->nominee_selected_ = false;
         self->remote_end_of_candidates_ = false;
         self->nominated_cid_.store(0, std::memory_order_release);
+        self->peer_signal_flags_.store(0, std::memory_order_release);
+        self->symmetric_stride_.store(0, std::memory_order_release);
+        self->first_observed_srflx_port_ = 0;
+        self->have_first_srflx_port_     = false;
         {
             std::lock_guard lk(self->nominated_mu_);
             self->nominated_ip_.clear();

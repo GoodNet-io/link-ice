@@ -333,6 +333,22 @@ public:
     /// Close the session.
     void close();
 
+    /// Wire-level flags advertised by the remote peer in the most
+    /// recent OFFER / ANSWER envelope (`ICE_SIGNAL_FLAG_*`). The
+    /// link plugin extracts them from `deserialize_signal` and
+    /// forwards them here so the FSM can adjust nomination (peer
+    /// lite → we drive checks) and port prediction (peer symmetric
+    /// → expand the check list with stride-predicted ports). Safe
+    /// to call from any thread; the strand re-entry is cheap.
+    void set_peer_signal_flags(std::uint32_t flags);
+
+    /// Local-side wire flags this session contributes to outgoing
+    /// signals. Currently surfaces `ICE_SIGNAL_FLAG_LITE` when the
+    /// agent is configured lite, and `ICE_SIGNAL_FLAG_SYMMETRIC`
+    /// when gather detected a symmetric NAT. Read by the link
+    /// plugin when assembling outbound trickle batches.
+    [[nodiscard]] std::uint32_t local_signal_flags() const noexcept;
+
     /// RFC 8445 §9 ICE restart. Regenerates ufrag/pwd, drops every
     /// check pair and remote candidate (peer must re-signal with the
     /// new credentials), and re-enters the Gathering state. Local
@@ -585,6 +601,25 @@ private:
     /// need to wait the `session_timeout_s` ceiling. Set by
     /// `add_remote_candidates` when invoked with `end_of_candidates`.
     bool remote_end_of_candidates_ = false;
+
+    /// Peer-advertised wire flags from the most recent signal envelope.
+    /// Atomic so `local_signal_flags()` style read sites stay
+    /// lock-free; writes happen on the strand.
+    std::atomic<std::uint32_t> peer_signal_flags_{0};
+
+    /// Symmetric NAT detection — observed external port stride during
+    /// gather. Non-zero stride enables port prediction in
+    /// `build_check_list` when the peer also advertises
+    /// `ICE_SIGNAL_FLAG_SYMMETRIC`. Recorded when multiple STUN
+    /// probes from the same local port report different external
+    /// ports.
+    std::atomic<std::uint16_t> symmetric_stride_{0};
+    /// First observed external port from a STUN binding response.
+    /// Used to compute the stride when a second response from a
+    /// different server arrives with a different port. Reset on
+    /// restart.
+    std::uint16_t              first_observed_srflx_port_ = 0;
+    bool                       have_first_srflx_port_     = false;
 
     void start_keepalive();
     void on_keepalive();

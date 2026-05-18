@@ -100,6 +100,27 @@ constexpr uint8_t ICE_SIGNAL_ANSWER = 1;
 constexpr uint8_t ICE_SIGNAL_OFFER_EOC  = 2;
 constexpr uint8_t ICE_SIGNAL_ANSWER_EOC = 3;
 
+/// Wire-level signal flag bits packed into the upper 16 bits of
+/// `IceSignalData::candidate_count`. The low 16 bits remain the
+/// candidate array length; with `MAX_ICE_CANDIDATES = 256` this is
+/// always representable. Older peers that never set flags emit
+/// `candidate_count` < 256, so a new receiver simply masks the
+/// upper bits and reads zero. New senders that set any flag emit
+/// `candidate_count > 65535` on the wire; older receivers reject
+/// the signal as malformed and the sender must downgrade (lite-mode
+/// and symmetric peers learn this through configuration, not
+/// through the wire).
+inline constexpr uint32_t ICE_SIGNAL_FLAG_MASK   = 0xFFFF0000u;
+inline constexpr uint32_t ICE_SIGNAL_COUNT_MASK  = 0x0000FFFFu;
+/// RFC 8445 §2.7 lite agent. The sender will never initiate
+/// connectivity checks; the receiver must take the controller role
+/// or the FSM cannot progress.
+inline constexpr uint32_t ICE_SIGNAL_FLAG_LITE      = 1u << 16;
+/// Sender's gather detected a symmetric NAT. Receiver may apply
+/// port prediction (try `peer.port + stride * k`) alongside the
+/// canonical pair when running connectivity checks.
+inline constexpr uint32_t ICE_SIGNAL_FLAG_SYMMETRIC = 1u << 17;
+
 /// Compute candidate priority per RFC 8445. HostMdns shares the
 /// host type-preference per draft-ietf-mmusic-mdns-ice-candidates
 /// §3.2: it IS a host candidate, just with the IP replaced by a
@@ -175,7 +196,8 @@ inline Candidate from_wire(const CandidateWire& w) {
 /// occupy the same `CandidateWire` slot they always did.
 inline std::vector<uint8_t> serialize_signal(
     const char* ufrag, const char* pwd,
-    const std::vector<Candidate>& candidates) {
+    const std::vector<Candidate>& candidates,
+    uint32_t flags = 0) {
     IceSignalData hdr{};
     std::memset(hdr.ufrag, 0, sizeof(hdr.ufrag));
     auto ufrag_len = std::min(std::strlen(ufrag), sizeof(hdr.ufrag));
@@ -183,7 +205,10 @@ inline std::vector<uint8_t> serialize_signal(
     std::memset(hdr.pwd, 0, sizeof(hdr.pwd));
     auto pwd_len = std::min(std::strlen(pwd), sizeof(hdr.pwd));
     std::memcpy(hdr.pwd, pwd, pwd_len);
-    hdr.candidate_count = htonl(static_cast<uint32_t>(candidates.size()));
+    const uint32_t packed =
+        (flags & ICE_SIGNAL_FLAG_MASK)
+        | (static_cast<uint32_t>(candidates.size()) & ICE_SIGNAL_COUNT_MASK);
+    hdr.candidate_count = htonl(packed);
 
     /// Count HostMdns candidates so we can size the trailer.
     uint32_t mdns_count = 0;
@@ -236,10 +261,14 @@ inline constexpr uint32_t MAX_ICE_CANDIDATES = 256;
 
 inline bool deserialize_signal(std::span<const uint8_t> data,
                                 IceSignalData& hdr,
-                                std::vector<Candidate>& candidates) {
+                                std::vector<Candidate>& candidates,
+                                uint32_t* out_flags = nullptr) {
     if (data.size() < sizeof(IceSignalData)) return false;
     std::memcpy(&hdr, data.data(), sizeof(hdr));
-    hdr.candidate_count = ntohl(hdr.candidate_count);
+    const uint32_t packed = ntohl(hdr.candidate_count);
+    const uint32_t flags = packed & ICE_SIGNAL_FLAG_MASK;
+    hdr.candidate_count = packed & ICE_SIGNAL_COUNT_MASK;
+    if (out_flags) *out_flags = flags;
 
     if (hdr.candidate_count > MAX_ICE_CANDIDATES) return false;
 
