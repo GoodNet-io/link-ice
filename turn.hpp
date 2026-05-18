@@ -133,6 +133,23 @@ public:
     MappedAddress relayed_address() const;
     bool is_allocated() const { return allocated_; }
 
+    /// Health gate for multi-TURN failover. Returns false when the
+    /// allocation never completed OR a subsequent refresh round-trip
+    /// failed (server stopped answering, 437 stale-allocation, etc).
+    /// The backup-probe path in IceSession compares against this
+    /// before promoting a backup; a healthy primary blocks failover.
+    bool is_healthy() const {
+        return allocated_ && refresh_healthy_.load(std::memory_order_acquire);
+    }
+
+    /// Test hook: force the health state. Production code never
+    /// calls this; mock servers use it to simulate "primary went
+    /// dead" in failover unit tests without waiting out the real
+    /// refresh timer.
+    void mark_unhealthy_for_test() {
+        refresh_healthy_.store(false, std::memory_order_release);
+    }
+
     /// Carrier conn id this client uses to talk to the TURN server.
     /// The owning `IceSession` routes inbound bytes from this cid
     /// here via `on_inbound`.
@@ -157,6 +174,13 @@ private:
 
     std::mutex mu_;
     bool allocated_ = false;
+    /// Refresh-loop health. Starts true on construction so the
+    /// pre-allocation period (when the client has never refreshed)
+    /// is not mis-reported as unhealthy via `is_healthy()` — the
+    /// `allocated_` gate covers that window first. Flipped to false
+    /// in the refresh path on a missing / 5xx response and reset
+    /// to true when a successful refresh round-trip lands.
+    std::atomic<bool> refresh_healthy_{true};
     MappedAddress relayed_{};
     std::string realm_;
     std::string nonce_;

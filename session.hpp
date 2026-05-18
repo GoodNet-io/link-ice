@@ -403,6 +403,19 @@ private:
     /// Per-attempt deadline; on expiry the in-flight TurnClient is
     /// torn down and `try_next_turn_attempt` advances.
     asio::steady_timer turn_allocate_timer_;
+    /// Entries in `cfg_.turn_servers` past the active primary —
+    /// these get periodic ALLOCATE probes via `turn_backup_timer_`
+    /// and stand by for failover when the primary degrades.
+    std::vector<TurnConfig> turn_backups_;
+    asio::steady_timer      turn_backup_timer_;
+    /// Most-recently-probed backup client; pinned across one probe
+    /// cycle so a successful ALLOCATE can be promoted to the active
+    /// relay. Reset between probes.
+    std::shared_ptr<TurnClient> turn_backup_probe_;
+    std::size_t                  turn_backup_probe_idx_ = 0;
+    /// Wall-clock of the last failover commit. Compared against
+    /// `cfg_.turn_failover_min_interval_s` to rate-limit oscillation.
+    std::chrono::steady_clock::time_point turn_last_failover_{};
 
     // mDNS responder + resolver. Borrowed from the parent `IceLink`
     // (one instance per plugin), so multiple sessions share the
@@ -434,6 +447,16 @@ private:
     /// On exhaustion of the list the relay slot stays empty and the
     /// FSM proceeds without a relay candidate.
     void try_next_turn_attempt();
+    /// Periodic backup-probe tick — fires ALLOCATE against the next
+    /// entry in `turn_backups_`. On success and an unhealthy primary
+    /// the session fails over.
+    void on_turn_backup_tick();
+    /// Tear down the active TURN allocation and bring up @p client as
+    /// the new primary. Drops the old relay candidate and pushes the
+    /// new one into `local_candidates_`. Rate-limited by
+    /// `turn_last_failover_` + `cfg_.turn_failover_min_interval_s`.
+    void promote_turn_backup(std::shared_ptr<TurnClient> client,
+                              TurnConfig new_cfg);
     /// Build a `TurnClient` against @p cfg. Resolves the carrier per
     /// the cfg's transport flags (TLS / TCP / UDP), allocates a cid,
     /// and returns the client without calling `allocate()` on it

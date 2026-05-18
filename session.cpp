@@ -83,6 +83,7 @@ IceSession::IceSession(asio::io_context& io,
       gather_timer_(strand_),
       keepalive_timer_(strand_),
       turn_allocate_timer_(strand_),
+      turn_backup_timer_(strand_),
       mdns_(std::move(mdns)),
       last_activity_(std::chrono::steady_clock::now()) {
     local_ufrag_ = generate_ufrag();
@@ -104,7 +105,9 @@ IceSession::~IceSession() {
     keepalive_timer_.cancel();
     gather_timer_.cancel();
     turn_allocate_timer_.cancel();
+    turn_backup_timer_.cancel();
     if (turn_) turn_->close();
+    if (turn_backup_probe_) turn_backup_probe_->close();
     if (mdns_ && !mdns_local_hostname_.empty()) {
         mdns_->unregister_name(mdns_local_hostname_);
         mdns_local_hostname_.clear();
@@ -303,9 +306,15 @@ void IceSession::restart() {
         self->keepalive_timer_.cancel();
         self->gather_timer_.cancel();
         self->turn_allocate_timer_.cancel();
+        self->turn_backup_timer_.cancel();
         if (self->turn_) self->turn_->close();
+        if (self->turn_backup_probe_) self->turn_backup_probe_->close();
         self->turn_.reset();
+        self->turn_backup_probe_.reset();
+        self->turn_backups_.clear();
         self->turn_attempt_idx_ = 0;
+        self->turn_backup_probe_idx_ = 0;
+        self->turn_last_failover_ = std::chrono::steady_clock::time_point{};
 
         self->local_ufrag_ = IceSession::generate_ufrag();
         self->local_pwd_   = IceSession::generate_pwd();
@@ -370,7 +379,9 @@ void IceSession::close() {
         self->keepalive_timer_.cancel();
         self->gather_timer_.cancel();
         self->turn_allocate_timer_.cancel();
+        self->turn_backup_timer_.cancel();
         if (self->turn_) self->turn_->close();
+        if (self->turn_backup_probe_) self->turn_backup_probe_->close();
         if (self->mdns_ && !self->mdns_local_hostname_.empty()) {
             self->mdns_->unregister_name(self->mdns_local_hostname_);
             self->mdns_local_hostname_.clear();
@@ -859,6 +870,25 @@ void IceSession::try_next_turn_attempt() {
                 return;
             }
             self->local_candidates_.push_back(std::move(c));
+            /// Successful attempt — stash the remaining entries as
+            /// backups and arm the periodic probe.
+            self->turn_backups_.clear();
+            for (std::size_t i = self->turn_attempt_idx_ + 1;
+                 i < self->cfg_.turn_servers.size(); ++i) {
+                self->turn_backups_.push_back(self->cfg_.turn_servers[i]);
+            }
+            if (!self->turn_backups_.empty()
+                && self->cfg_.turn_backup_interval_s > 0) {
+                self->turn_backup_probe_idx_ = 0;
+                self->turn_backup_timer_.expires_after(
+                    std::chrono::seconds(self->cfg_.turn_backup_interval_s));
+                self->turn_backup_timer_.async_wait(
+                    asio::bind_executor(self->strand_,
+                        [self](const std::error_code& ec) {
+                            if (ec) return;
+                            self->on_turn_backup_tick();
+                        }));
+            }
 
             /// If remote candidates already arrived and we are
             /// already in the checking phase, fold the freshly-
@@ -911,6 +941,139 @@ void IceSession::try_next_turn_attempt() {
             ++self->turn_attempt_idx_;
             self->try_next_turn_attempt();
         }));
+}
+
+void IceSession::on_turn_backup_tick() {
+    /// Pick the next backup index, wrapping around so a long-lived
+    /// session repeatedly samples every backup. Probing one server
+    /// per tick (instead of all-in-parallel) keeps memory + cid
+    /// pressure flat and matches libnice's behaviour.
+    if (turn_backups_.empty()
+        || cfg_.turn_backup_interval_s <= 0) {
+        return;
+    }
+    if (state_.load(std::memory_order_acquire) == SessionState::Failed) {
+        return;
+    }
+    if (turn_backup_probe_) {
+        turn_backup_probe_->close();
+        turn_backup_probe_.reset();
+    }
+    if (turn_backup_probe_idx_ >= turn_backups_.size()) {
+        turn_backup_probe_idx_ = 0;
+    }
+    const auto idx = turn_backup_probe_idx_;
+    const auto probe_cfg = turn_backups_[idx];
+    ++turn_backup_probe_idx_;
+
+    /// Re-arm the periodic timer up front so a slow ALLOCATE doesn't
+    /// stretch the gap between ticks.
+    turn_backup_timer_.expires_after(
+        std::chrono::seconds(cfg_.turn_backup_interval_s));
+    turn_backup_timer_.async_wait(asio::bind_executor(strand_,
+        [self = shared_from_this()](const std::error_code& ec) {
+            if (ec) return;
+            self->on_turn_backup_tick();
+        }));
+
+    auto weak_self = std::weak_ptr<IceSession>(shared_from_this());
+    auto on_alloc = [weak_self, idx, probe_cfg](
+                        const std::string& /*relay_ip*/,
+                        uint16_t /*relay_port*/) {
+        auto self = weak_self.lock();
+        if (!self) return;
+        asio::post(self->strand_, [self, idx, probe_cfg] {
+            (void)idx;
+            /// Promotion gate: only fail over if the primary is
+            /// unhealthy AND the rate-limit interval has elapsed.
+            if (!self->turn_backup_probe_) return;
+            const bool primary_healthy =
+                self->turn_ && self->turn_->is_healthy();
+            const auto now = std::chrono::steady_clock::now();
+            const auto since = self->turn_last_failover_
+                == std::chrono::steady_clock::time_point{}
+                ? std::chrono::seconds(self->cfg_.turn_failover_min_interval_s)
+                : std::chrono::duration_cast<std::chrono::seconds>(
+                    now - self->turn_last_failover_);
+            const bool interval_ok =
+                since >= std::chrono::seconds(
+                    self->cfg_.turn_failover_min_interval_s);
+            if (primary_healthy || !interval_ok) {
+                /// Healthy primary or too soon — close the probe and
+                /// keep the backup queued for the next tick.
+                if (self->turn_backup_probe_) {
+                    self->turn_backup_probe_->close();
+                    self->turn_backup_probe_.reset();
+                }
+                return;
+            }
+            auto promoted = std::move(self->turn_backup_probe_);
+            self->turn_backup_probe_.reset();
+            self->promote_turn_backup(std::move(promoted), probe_cfg);
+        });
+    };
+
+    auto on_data = [](const std::string& /*ip*/,
+                      uint16_t /*port*/,
+                      std::span<const uint8_t> /*data*/) {
+        /// Pre-promotion data on a backup is dropped; the peer
+        /// shouldn't be sending here until we publish the candidate.
+    };
+
+    gn_conn_id_t cid = 0;
+    turn_backup_probe_ = build_turn_client(
+        probe_cfg, std::move(on_alloc), std::move(on_data), cid);
+    if (turn_backup_probe_) {
+        turn_backup_probe_->allocate();
+    }
+}
+
+void IceSession::promote_turn_backup(std::shared_ptr<TurnClient> client,
+                                       TurnConfig new_cfg) {
+    if (!client) return;
+    turn_last_failover_ = std::chrono::steady_clock::now();
+
+    /// Drop the failed primary's relay candidate from the local set
+    /// and tear it down. Subsequent sends fall back to host / srflx
+    /// pairs until the new relay candidate trickles in.
+    if (turn_) {
+        turn_->close();
+    }
+    std::erase_if(local_candidates_, [](const Candidate& c) {
+        return c.type == CandidateType::Relay;
+    });
+
+    turn_ = std::move(client);
+    cfg_.turn = new_cfg;
+    const auto relay = turn_->relayed_address();
+
+    Candidate c{};
+    c.type = CandidateType::Relay;
+    c.port = relay.port;
+    c.set_address(relay.ip);
+    c.priority = compute_priority(CandidateType::Relay, 65535, 1);
+    if (candidate_allowed(c.type, c.family, cfg_.candidate_filter_flags)) {
+        local_candidates_.push_back(c);
+    }
+
+    /// Fold the fresh relay candidate into checks. Trickle-side
+    /// integration with `OFFER_EOC`-style candidate emit lives on
+    /// the IceLink — sessions expose the new candidate via
+    /// `local_candidates()`.
+    if (!remote_candidates_.empty()
+        && state_.load(std::memory_order_acquire) == SessionState::Checking) {
+        build_check_list();
+        current_check_ = 0;
+        run_next_check();
+    } else if (state_.load(std::memory_order_acquire) == SessionState::Connected) {
+        /// Active session degradation: drop into Checking against the
+        /// refreshed candidate set so the new relay path becomes
+        /// nominatable.
+        state_.store(SessionState::Checking, std::memory_order_release);
+        build_check_list();
+        current_check_ = 0;
+        run_next_check();
+    }
 }
 
 void IceSession::on_gathering_complete() {
@@ -1080,6 +1243,16 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
     /// through the `TurnDataCallback` we installed in `gather_relay`.
     if (turn_ && turn_->server_cid() != 0 && cid == turn_->server_cid()) {
         turn_->on_inbound(data);
+        return;
+    }
+    /// Same routing for the in-flight backup probe — the carrier
+    /// uses one cid per remote endpoint, so a backup against a
+    /// different TURN host lands here on its own cid. STUN-mode
+    /// (UDP carrier) shares this dispatcher; stream-mode clients
+    /// install their own per-cid subscriber in `build_turn_client`.
+    if (turn_backup_probe_ && turn_backup_probe_->server_cid() != 0
+        && cid == turn_backup_probe_->server_cid()) {
+        turn_backup_probe_->on_inbound(data);
         return;
     }
 
