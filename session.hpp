@@ -83,18 +83,16 @@ inline constexpr std::uint32_t kCandidateFilterHostOnly    = 1u << 3;
 /// @brief ICE session configuration: STUN/TURN servers, timeouts, keepalive.
 struct IceConfig {
     std::vector<std::string> stun_servers{};
-    /// Active TURN allocation parameters. When `turn_servers` carries
-    /// more than one entry `turn` mirrors the first; session-side
-    /// iteration across the fallback list is not wired today. Kept
-    /// as a top-level field for read-site compatibility with the
-    /// rest of the FSM.
+    /// Active TURN allocation parameters. Mirrors the first entry of
+    /// `turn_servers` for read-site compatibility (single-server hot
+    /// path). The session FSM walks `turn_servers` in priority order
+    /// (RFC 8445 §6.1.4 fallback); see `turn_allocate_timeout_s`.
     TurnConfig turn;
-    /// RFC 8445 §6.1.4 (TURN as fallback) — array of TURN
-    /// allocations the operator wants to try. The first
-    /// non-empty entry populates `turn` above so existing
-    /// allocation paths keep working; the rest are reserved
-    /// for follow-up multi-TURN fallover. Empty array means
-    /// no relay candidate is generated.
+    /// RFC 8445 §6.1.4 TURN-as-fallback list. Iterated sequentially
+    /// during gather: each entry is allocated against in turn, the
+    /// first ALLOCATE success becomes the relay candidate, the
+    /// remainder stay queued for failover. Empty array means no
+    /// relay candidate is emitted.
     std::vector<TurnConfig> turn_servers{};
     int  session_timeout_s      = 10;
     int  keepalive_interval_s   = 20;
@@ -399,6 +397,13 @@ private:
     // TURN
     std::shared_ptr<TurnClient> turn_;
 
+    /// Current attempt index into `cfg_.turn_servers` during the
+    /// sequential ALLOCATE walk. Reset to 0 on `restart_session`.
+    std::size_t turn_attempt_idx_ = 0;
+    /// Per-attempt deadline; on expiry the in-flight TurnClient is
+    /// torn down and `try_next_turn_attempt` advances.
+    asio::steady_timer turn_allocate_timer_;
+
     // mDNS responder + resolver. Borrowed from the parent `IceLink`
     // (one instance per plugin), so multiple sessions share the
     // same multicast socket and registered-name table. nullptr
@@ -423,6 +428,22 @@ private:
     void start_multi_stun_probes();
     void handle_gather_response(const StunMessage& msg);
     void gather_relay();
+    /// Start the next ALLOCATE attempt against
+    /// `cfg_.turn_servers[turn_attempt_idx_]`. Arms
+    /// `turn_allocate_timer_` for `cfg_.turn_allocate_timeout_s`.
+    /// On exhaustion of the list the relay slot stays empty and the
+    /// FSM proceeds without a relay candidate.
+    void try_next_turn_attempt();
+    /// Build a `TurnClient` against @p cfg. Resolves the carrier per
+    /// the cfg's transport flags (TLS / TCP / UDP), allocates a cid,
+    /// and returns the client without calling `allocate()` on it
+    /// (caller decides when to start the round-trip). Returns
+    /// nullptr if no suitable carrier exists.
+    std::shared_ptr<TurnClient> build_turn_client(
+        const TurnConfig& cfg,
+        TurnAllocatedCallback on_alloc,
+        TurnDataCallback on_data,
+        gn_conn_id_t& out_cid);
     void on_gathering_complete();
     void begin_checks();
     void run_next_check();

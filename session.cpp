@@ -82,6 +82,7 @@ IceSession::IceSession(asio::io_context& io,
       check_timer_(strand_),
       gather_timer_(strand_),
       keepalive_timer_(strand_),
+      turn_allocate_timer_(strand_),
       mdns_(std::move(mdns)),
       last_activity_(std::chrono::steady_clock::now()) {
     local_ufrag_ = generate_ufrag();
@@ -102,6 +103,7 @@ IceSession::~IceSession() {
     check_timer_.cancel();
     keepalive_timer_.cancel();
     gather_timer_.cancel();
+    turn_allocate_timer_.cancel();
     if (turn_) turn_->close();
     if (mdns_ && !mdns_local_hostname_.empty()) {
         mdns_->unregister_name(mdns_local_hostname_);
@@ -300,6 +302,10 @@ void IceSession::restart() {
         self->check_timer_.cancel();
         self->keepalive_timer_.cancel();
         self->gather_timer_.cancel();
+        self->turn_allocate_timer_.cancel();
+        if (self->turn_) self->turn_->close();
+        self->turn_.reset();
+        self->turn_attempt_idx_ = 0;
 
         self->local_ufrag_ = IceSession::generate_ufrag();
         self->local_pwd_   = IceSession::generate_pwd();
@@ -363,6 +369,7 @@ void IceSession::close() {
         self->check_timer_.cancel();
         self->keepalive_timer_.cancel();
         self->gather_timer_.cancel();
+        self->turn_allocate_timer_.cancel();
         if (self->turn_) self->turn_->close();
         if (self->mdns_ && !self->mdns_local_hostname_.empty()) {
             self->mdns_->unregister_name(self->mdns_local_hostname_);
@@ -717,7 +724,6 @@ void IceSession::handle_gather_response(const StunMessage& msg) {
 }
 
 void IceSession::gather_relay() {
-    if (cfg_.turn.server.empty()) return;
     /// Operator may have disabled relay candidates via
     /// `ice.candidate_filters = ["host-only"]` etc. Short-circuit
     /// the entire TURN allocation in that case — saves a STUN
@@ -725,101 +731,186 @@ void IceSession::gather_relay() {
     /// for a candidate we'd just drop.
     if ((cfg_.candidate_filter_flags & kCandidateFilterHostOnly) != 0) return;
 
+    /// Single-server callers (legacy config that set only `turn`
+    /// without expanding it into the array) get folded into
+    /// `turn_servers` here so the iteration walk has a uniform input
+    /// shape. The link-side `apply_config` already mirrors entries
+    /// into both fields; this branch covers in-tree fixtures that
+    /// construct an `IceConfig` directly.
+    if (cfg_.turn_servers.empty() && !cfg_.turn.server.empty()) {
+        cfg_.turn_servers.push_back(cfg_.turn);
+    }
+    if (cfg_.turn_servers.empty()) return;
+
+    turn_attempt_idx_ = 0;
+    try_next_turn_attempt();
+}
+
+std::shared_ptr<TurnClient> IceSession::build_turn_client(
+    const TurnConfig& cfg,
+    TurnAllocatedCallback on_alloc,
+    TurnDataCallback on_data,
+    gn_conn_id_t& out_cid) {
+    out_cid = 0;
     /// Pick the carrier scheme for the TURN server endpoint. Order
     /// of precedence: TLS > TCP > UDP. Each higher tier requires its
     /// own carrier resolved by IceLink; if missing, we silently fall
     /// back so a misconfigured operator still gets a working relay
     /// path instead of a hard failure.
-    const bool want_tls = cfg_.turn.tls_transport
+    const bool want_tls = cfg.tls_transport
                             && carrier_tls_ != nullptr;
     const bool want_tcp = !want_tls
-                            && cfg_.turn.tcp_transport
+                            && cfg.tcp_transport
                             && carrier_tcp_ != nullptr;
     const bool want_stream = want_tls || want_tcp;
     auto* turn_carrier = want_tls ? carrier_tls_
                           : want_tcp ? carrier_tcp_
                           : carrier_;
-    if (!turn_carrier) return;
+    if (!turn_carrier) return nullptr;
 
     gn_conn_id_t turn_cid = 0;
     if (!want_stream) {
         /// UDP path: share the session's cid maps so on_carrier_data
         /// routes inbound bytes through the same dispatcher that
         /// serves STUN / check traffic.
-        turn_cid = ensure_remote_cid(cfg_.turn.server, cfg_.turn.port);
-        if (turn_cid == 0) return;
+        turn_cid = ensure_remote_cid(cfg.server, cfg.port);
+        if (turn_cid == 0) return nullptr;
     } else {
         /// TCP path: bypass the dispatcher and route bytes directly
-        /// to `turn_->on_inbound`. Cid namespaces differ between
-        /// carriers (each composer allocates from its own counter),
-        /// so a shared dispatcher would risk collision with UDP
-        /// cids. Direct routing also keeps the TCP carrier's
-        /// subscribe_data lifetime scoped to TURN's needs.
-        const auto uri = endpoint_uri(cfg_.turn.server, cfg_.turn.port);
+        /// to the per-client `on_inbound`. Cid namespaces differ
+        /// between carriers (each composer allocates from its own
+        /// counter), so a shared dispatcher would risk collision
+        /// with UDP cids.
+        const auto uri = endpoint_uri(cfg.server, cfg.port);
         if (turn_carrier->connect(uri, &turn_cid) != GN_OK
             || turn_cid == GN_INVALID_ID) {
-            return;
+            return nullptr;
         }
+    }
+    out_cid = turn_cid;
+
+    auto client = std::make_shared<TurnClient>(
+        io_, turn_carrier, turn_cid, cfg,
+        std::move(on_data), std::move(on_alloc));
+
+    if (want_stream) {
+        auto weak_client = std::weak_ptr<TurnClient>(client);
         auto weak_self = std::weak_ptr<IceSession>(shared_from_this());
         (void)turn_carrier->on_data(
             turn_cid,
-            [weak_self](gn_conn_id_t /*c*/,
-                         std::span<const std::uint8_t> bytes) {
+            [weak_self, weak_client](gn_conn_id_t /*c*/,
+                                       std::span<const std::uint8_t> bytes) {
                 auto self = weak_self.lock();
                 if (!self) return;
+                auto client = weak_client.lock();
+                if (!client) return;
                 std::vector<std::uint8_t> copy(bytes.begin(), bytes.end());
                 asio::post(self->strand_,
-                    [self, copy = std::move(copy)] {
-                        if (self->turn_) self->turn_->on_inbound(copy);
+                    [client, copy = std::move(copy)] {
+                        client->on_inbound(copy);
                     });
             });
     }
+    return client;
+}
+
+void IceSession::try_next_turn_attempt() {
+    /// Sequential walk through `cfg_.turn_servers`. Each entry gets
+    /// a deadline-bounded ALLOCATE; on timeout / construction
+    /// failure the FSM advances to the next entry. List exhaustion
+    /// leaves `turn_` null — the session proceeds with host + srflx
+    /// candidates only.
+    turn_allocate_timer_.cancel();
+    if (turn_) {
+        turn_->close();
+        turn_.reset();
+    }
+    if (turn_attempt_idx_ >= cfg_.turn_servers.size()) {
+        /// Last attempt failed and there are no more servers. The
+        /// gather phase has already moved on (host + STUN paths run
+        /// concurrently with TURN) so no further action needed beyond
+        /// surfacing the empty relay slot.
+        return;
+    }
+
+    const auto& attempt_cfg = cfg_.turn_servers[turn_attempt_idx_];
+    if (attempt_cfg.server.empty()) {
+        ++turn_attempt_idx_;
+        asio::post(strand_, [self = shared_from_this()] {
+            self->try_next_turn_attempt();
+        });
+        return;
+    }
 
     auto weak_self = std::weak_ptr<IceSession>(shared_from_this());
-    turn_ = std::make_shared<TurnClient>(
-        io_, turn_carrier, turn_cid, cfg_.turn,
-        // Data callback — relay'd data from peer.
-        [weak_self](const std::string& /*ip*/,
-                     uint16_t /*port*/,
-                     std::span<const uint8_t> data) {
-            auto self = weak_self.lock();
-            if (!self) return;
-            self->last_activity_.store(std::chrono::steady_clock::now(),
-                                         std::memory_order_release);
-            if (self->callbacks_.on_data)
-                self->callbacks_.on_data(self->peer_id_, data);
-        },
-        // Allocate callback — relay address available, add as candidate.
-        [weak_self](const std::string& relay_ip, uint16_t relay_port) {
-            auto self = weak_self.lock();
-            if (!self) return;
-            Candidate c{};
-            c.type = CandidateType::Relay;
-            c.port = relay_port;
-            c.set_address(relay_ip);
-            c.priority = compute_priority(CandidateType::Relay, 65535, 1);
+    auto on_alloc = [weak_self](const std::string& relay_ip, uint16_t relay_port) {
+        auto self = weak_self.lock();
+        if (!self) return;
+        Candidate c{};
+        c.type = CandidateType::Relay;
+        c.port = relay_port;
+        c.set_address(relay_ip);
+        c.priority = compute_priority(CandidateType::Relay, 65535, 1);
 
-            asio::post(self->strand_, [self, c = std::move(c)]() mutable {
-                if (!candidate_allowed(c.type, c.family,
-                                        self->cfg_.candidate_filter_flags)) {
-                    return;
-                }
-                self->local_candidates_.push_back(std::move(c));
+        asio::post(self->strand_, [self, c = std::move(c)]() mutable {
+            self->turn_allocate_timer_.cancel();
+            if (!candidate_allowed(c.type, c.family,
+                                    self->cfg_.candidate_filter_flags)) {
+                return;
+            }
+            self->local_candidates_.push_back(std::move(c));
 
-                /// If remote candidates already arrived and we are
-                /// already in the checking phase, fold the freshly-
-                /// minted relay candidate into the check list and
-                /// restart from the highest-priority pair.
-                if (!self->remote_candidates_.empty() &&
-                    self->state_.load(std::memory_order_acquire) ==
-                        SessionState::Checking) {
-                    self->build_check_list();
-                    self->current_check_ = 0;
-                    self->run_next_check();
-                }
-            });
+            /// If remote candidates already arrived and we are
+            /// already in the checking phase, fold the freshly-
+            /// minted relay candidate into the check list and
+            /// restart from the highest-priority pair.
+            if (!self->remote_candidates_.empty() &&
+                self->state_.load(std::memory_order_acquire) ==
+                    SessionState::Checking) {
+                self->build_check_list();
+                self->current_check_ = 0;
+                self->run_next_check();
+            }
         });
+    };
+
+    auto on_data = [weak_self](const std::string& /*ip*/,
+                                uint16_t /*port*/,
+                                std::span<const uint8_t> data) {
+        auto self = weak_self.lock();
+        if (!self) return;
+        self->last_activity_.store(std::chrono::steady_clock::now(),
+                                     std::memory_order_release);
+        if (self->callbacks_.on_data)
+            self->callbacks_.on_data(self->peer_id_, data);
+    };
+
+    gn_conn_id_t cid = 0;
+    auto client = build_turn_client(attempt_cfg, std::move(on_alloc),
+                                      std::move(on_data), cid);
+    if (!client) {
+        ++turn_attempt_idx_;
+        asio::post(strand_, [self = shared_from_this()] {
+            self->try_next_turn_attempt();
+        });
+        return;
+    }
+
+    turn_ = std::move(client);
     turn_->allocate();
+
+    const int timeout_s = cfg_.turn_allocate_timeout_s > 0
+                            ? cfg_.turn_allocate_timeout_s : 5;
+    turn_allocate_timer_.expires_after(std::chrono::seconds(timeout_s));
+    turn_allocate_timer_.async_wait(asio::bind_executor(strand_,
+        [self = shared_from_this()](const std::error_code& ec) {
+            if (ec) return;
+            /// Deadline elapsed without an alloc callback firing.
+            /// Discard this attempt and advance.
+            if (self->turn_ && self->turn_->is_allocated()) return;
+            ++self->turn_attempt_idx_;
+            self->try_next_turn_attempt();
+        }));
 }
 
 void IceSession::on_gathering_complete() {

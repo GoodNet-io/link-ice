@@ -186,9 +186,9 @@ void IceLink::apply_config() noexcept {
 
     /// `ice.turn_servers` accepts BOTH a single-string form AND a
     /// string-array. First entry populates `cfg.turn` for session-
-    /// side compatibility; every entry lands in
-    /// `cfg.turn_servers` ready for allocation-fallover iteration
-    /// (RFC 8445 §6.1.4) once the session side picks it up.
+    /// side read-site compatibility; every entry lands in
+    /// `cfg.turn_servers` and the session FSM walks the list
+    /// sequentially per RFC 8445 §6.1.4 fallback semantics.
     {
         std::size_t turn_arr_size = 0;
         if (gn_config_get_array_size(api_, "ice.turn_servers",
@@ -226,9 +226,9 @@ void IceLink::apply_config() noexcept {
         }
 
         /// Mirror the first entry into `cfg.turn` for session-side
-        /// reads. The session FSM consumes the singleton field
-        /// today; iteration across `turn_servers` for fallover
-        /// is not wired yet.
+        /// reads — the session FSM walks `turn_servers` in order
+        /// and `turn` is only used by callers that expect the
+        /// singleton field shape.
         if (!cfg.turn_servers.empty()) {
             cfg.turn = cfg.turn_servers.front();
         }
