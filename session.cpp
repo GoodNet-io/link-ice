@@ -211,7 +211,22 @@ void IceSession::send(std::span<const uint8_t> data) {
             if (cid == 0) return;
             nominated_cid_.store(cid, std::memory_order_release);
         }
-        if (carrier_) (void)carrier_->send(cid, *buf);
+        const auto tx = nominated_transport_.load(std::memory_order_acquire);
+        if (transport_is_tcp(tx)) {
+            /// RFC 6544 §3 application data on a nominated TCP pair
+            /// rides the same 16-bit length-prefix framing as the
+            /// connectivity-check STUN traffic so the peer's
+            /// `on_tcp_carrier_data` can reassemble frames out of the
+            /// byte stream. Without the prefix two consecutive
+            /// `send()` calls would coalesce on the wire and the
+            /// receiver would have no boundary to slice on.
+            if (carrier_tcp_) {
+                const auto framed = frame_tcp_stun(*buf);
+                (void)carrier_tcp_->send(cid, framed);
+            }
+        } else {
+            if (carrier_) (void)carrier_->send(cid, *buf);
+        }
     });
 }
 
@@ -1892,6 +1907,16 @@ void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
     consent_missed_.store(0, std::memory_order_release);
     consent_recovery_attempts_ = 0;
     nominated_cid_.store(cid, std::memory_order_release);
+    /// Look up the cid's transport so subsequent `send()` /
+    /// `on_keepalive` drives the correct carrier. The cid was opened
+    /// by `ensure_remote_cid` or `ensure_remote_tcp_cid` during
+    /// gather / checks; both stamp the transport into
+    /// `cid_to_endpoint_`.
+    TransportType nominated_tx = TransportType::Udp;
+    if (auto eit = cid_to_endpoint_.find(cid); eit != cid_to_endpoint_.end()) {
+        nominated_tx = eit->second.transport;
+    }
+    nominated_transport_.store(nominated_tx, std::memory_order_release);
     {
         std::lock_guard lk(nominated_mu_);
         nominated_ip_ = ip;
@@ -2015,12 +2040,20 @@ void IceSession::on_keepalive() {
     }
 
     auto cid = nominated_cid_.load(std::memory_order_acquire);
-    if (cid != 0 && carrier_) {
+    if (cid != 0) {
         auto txn = generate_txn_id();
         auto msg = StunBuilder(STUN_BINDING_REQUEST)
             .set_txn_id(txn)
             .build();
-        (void)carrier_->send(cid, msg);
+        const auto tx = nominated_transport_.load(std::memory_order_acquire);
+        if (transport_is_tcp(tx)) {
+            if (carrier_tcp_) {
+                const auto framed = frame_tcp_stun(msg);
+                (void)carrier_tcp_->send(cid, framed);
+            }
+        } else if (carrier_) {
+            (void)carrier_->send(cid, msg);
+        }
     }
 
     keepalive_timer_.expires_after(std::chrono::seconds(cfg_.keepalive_interval_s));

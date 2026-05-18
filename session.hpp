@@ -492,6 +492,11 @@ private:
     /// Used by `send()` for application data and `on_keepalive`. Zero
     /// before nomination.
     std::atomic<gn_conn_id_t> nominated_cid_{0};
+    /// Transport flavour of the nominated cid. UDP (default) routes
+    /// outbound bytes through `carrier_`; TCP variants go through
+    /// `carrier_tcp_`. Read-mostly: written once by `on_nominated`
+    /// and sampled by `send` / `on_keepalive`.
+    std::atomic<TransportType> nominated_transport_{TransportType::Udp};
 
     /// Multi-STUN parallel fallback (RFC 8445 §5.1.1.2). Instead of
     /// probing STUN servers sequentially with exponential backoff,
