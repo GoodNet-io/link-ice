@@ -569,9 +569,11 @@ void IceSession::gather_tcp_host_candidates() {
     if (carrier_tcp_ == nullptr) return;
     if (local_port_ == 0) return;
 
-    /// Walk the freshly-emitted UDP host candidates, mirroring each as
-    /// TCP active / passive / simultaneous-open. Iteration uses an
-    /// index snapshot because the loop body grows the same vector.
+    /// Walk the freshly-emitted UDP host candidates, mirroring each
+    /// as TCP active / passive / simultaneous-open. `push_back` on
+    /// `local_candidates_` may reallocate and invalidate references
+    /// — so the iteration copies the source candidate by value
+    /// before pushing into the same vector.
     const std::size_t udp_end = local_candidates_.size();
     static constexpr std::array<TransportType, 3> kTcpVariants = {
         TransportType::TcpActive,
@@ -579,7 +581,7 @@ void IceSession::gather_tcp_host_candidates() {
         TransportType::TcpSimultaneousOpen,
     };
     for (std::size_t i = 0; i < udp_end; ++i) {
-        const auto& src = local_candidates_[i];
+        Candidate src = local_candidates_[i];
         if (src.type != CandidateType::Host) continue;
         if (src.transport != TransportType::Udp) continue;
         for (auto variant : kTcpVariants) {
