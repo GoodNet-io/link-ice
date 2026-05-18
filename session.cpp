@@ -77,7 +77,8 @@ IceSession::IceSession(asio::io_context& io,
     : io_(io), strand_(asio::make_strand(io.get_executor())),
       carrier_(carrier), carrier_tcp_(carrier_tcp),
       carrier_tls_(carrier_tls), cfg_(cfg),
-      peer_id_(peer_id), controlling_(controlling),
+      peer_id_(peer_id),
+      controlling_(cfg.lite_mode ? false : controlling),
       callbacks_(std::move(callbacks)),
       check_timer_(strand_),
       gather_timer_(strand_),
@@ -1143,6 +1144,12 @@ void IceSession::build_check_list() {
 }
 
 void IceSession::begin_checks() {
+    /// RFC 8445 §2.7 lite agents never initiate connectivity checks.
+    /// Stay in Checking so inbound BINDING_REQUEST traffic can still
+    /// drive `on_carrier_data` → `on_nominated` once the controller
+    /// commits a pair with USE-CANDIDATE.
+    if (cfg_.lite_mode) return;
+
     /// Per-cid data subscriptions are already in place from
     /// `gather_relay` and `start_multi_stun_probes`. New peer
     /// endpoints get their subscriptions installed lazily by
@@ -1451,6 +1458,11 @@ void IceSession::handle_check_response(const StunMessage& msg) {
 void IceSession::maybe_trigger_check_from_peer(
     const std::string& peer_ip, std::uint16_t peer_port) {
     if (peer_ip.empty() || local_candidates_.empty()) return;
+    /// Lite agents per RFC 8445 §2.7 never send connectivity checks.
+    /// The reply to the inbound BINDING_REQUEST has already gone out
+    /// through `on_carrier_data`; that is the lite agent's only
+    /// active role on the wire.
+    if (cfg_.lite_mode) return;
 
     /// Already covered by an existing check pair — nothing to do.
     for (const auto& p : check_list_) {
@@ -1617,6 +1629,10 @@ void IceSession::start_keepalive() {
 
 void IceSession::on_keepalive() {
     if (state_.load(std::memory_order_acquire) != SessionState::Connected) return;
+    /// Lite agents per RFC 8445 §2.7 do not run consent freshness
+    /// (RFC 7675 §5.1 exempts them). Skip the probe + counter advance;
+    /// the controller drives liveness from its side.
+    if (cfg_.lite_mode) return;
 
     auto missed = consent_missed_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (missed >= static_cast<uint32_t>(cfg_.consent_max_failures)) {

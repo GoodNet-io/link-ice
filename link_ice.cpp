@@ -319,6 +319,24 @@ void IceLink::apply_config() noexcept {
     if (gn_config_get_int64(api_, "ice.aggressive_nomination", &v) == GN_OK) {
         cfg.aggressive_nomination = (v != 0);
     }
+    /// RFC 8445 §2.7 ICE-lite. Media gateways and IoT endpoints with a
+    /// fixed public address opt in so they only respond to checks
+    /// (never initiate). The peer side must run full ICE — two lite
+    /// peers cannot complete the FSM since no one drives nomination.
+    if (gn_config_get_int64(api_, "ice.lite_mode", &v) == GN_OK) {
+        cfg.lite_mode = (v != 0);
+    }
+    if (gn_config_get_int64(api_, "ice.reactive_interface_change", &v) == GN_OK) {
+        cfg.reactive_interface_change = (v != 0);
+    }
+    if (gn_config_get_int64(api_, "ice.symmetric_port_prediction_enabled",
+                              &v) == GN_OK) {
+        cfg.symmetric_port_prediction_enabled = (v != 0);
+    }
+    if (gn_config_get_int64(api_, "ice.symmetric_port_prediction_attempts",
+                              &v) == GN_OK && v >= 0 && v <= 64) {
+        cfg.symmetric_port_prediction_attempts = static_cast<int>(v);
+    }
     /// Operator-side candidate filter tokens (C.6). Array of
     /// string tokens — each token sets one bit in
     /// `cfg.candidate_filter_flags`. Unknown tokens are ignored

@@ -187,6 +187,35 @@ struct IceConfig {
     /// Maximum number of in-flight probes. 1 is conservative and
     /// matches RFC 8899 §5.1.4 reference recommendation.
     int  pmtu_probe_concurrency = 1;
+
+    /// RFC 8445 §2.7 ICE-lite agent. A lite agent never initiates
+    /// connectivity checks; it only responds to incoming checks and
+    /// accepts the controller's nomination. Used by media gateways
+    /// and IoT endpoints with a single well-known public address
+    /// where running full ICE would be redundant. A lite agent is
+    /// always controlled — when set, `controlling_` is forced false
+    /// regardless of how the session was constructed.
+    bool lite_mode = false;
+
+    /// Linux netlink (RTM_NEWLINK / RTM_NEWADDR / RTM_DELADDR /
+    /// RTM_DELLINK) subscription. When true, the session opens an
+    /// `AF_NETLINK / NETLINK_ROUTE` socket and re-gathers host
+    /// candidates after a debounced interface state change. Off
+    /// silently on non-Linux platforms.
+    bool reactive_interface_change = true;
+
+    /// Symmetric-NAT port prediction. When ICE gather detects that
+    /// the local NAT assigns different external ports for STUN
+    /// requests to different destinations from the same internal
+    /// port, the FSM records the stride and tries
+    /// `(peer.ip, peer.port + stride * k)` for k in 1..N alongside
+    /// the canonical peer endpoint. Purely additive — every standard
+    /// ICE check still runs.
+    bool symmetric_port_prediction_enabled = true;
+    /// Max consecutive predicted ports to probe past the advertised
+    /// `peer.port` when the peer is marked symmetric. Capped to keep
+    /// the check list from blowing up against a wide NAT pool.
+    int  symmetric_port_prediction_attempts = 8;
 };
 
 /// Decide whether a candidate of `(type, family)` survives the

@@ -52,6 +52,10 @@ every bundled `.so` from there.
 | `ice.path_mtu` | int64 | `1200` | RFC 8085 datagram size budget; bypass discovery when set |
 | `ice.mdns_obfuscate_host_candidates` | bool | `false` | draft-ietf-mmusic-mdns-ice-candidates — replace raw host IPs with `<uuid>.local` registered on multicast 224.0.0.251 / FF02::FB |
 | `ice.mdns_resolve_timeout_ms` | int64 | `5000` | how long to wait for a peer's `.local` candidate to resolve before dropping the pair |
+| `ice.lite_mode` | bool | `false` | RFC 8445 §2.7 ICE-lite — responds to checks only, never initiates |
+| `ice.reactive_interface_change` | bool | `true` | Linux only: re-gather host candidates on `RTM_NEWLINK` / `RTM_NEWADDR` / `RTM_DELADDR` events |
+| `ice.symmetric_port_prediction_enabled` | bool | `true` | Probe predicted ports past the peer's advertised srflx when symmetric NAT is detected |
+| `ice.symmetric_port_prediction_attempts` | int64 | `8` | Max consecutive predicted ports to try (`peer.port + stride * k` for k in 1..N) |
 
 ## RFC coverage
 
@@ -70,6 +74,17 @@ every bundled `.so` from there.
   used by mDNS host-candidate obfuscation
 - draft-ietf-mmusic-mdns-ice-candidates — `<uuid>.local` host
   candidate variant; gated on `ice.mdns_obfuscate_host_candidates`
+
+## ICE-lite mode
+
+`ice.lite_mode = true` switches the agent to the lightweight variant
+defined in RFC 8445 §2.7. A lite agent only responds to incoming
+connectivity checks — it never sends checks itself, never runs
+consent freshness, and never drives nomination. Typical use-cases:
+media gateways, SFUs, and IoT endpoints that already sit at a fixed
+public address where running full ICE would be redundant. The peer
+side must always be a full ICE agent; two lite agents cannot
+complete the handshake because no one drives the checks.
 
 ## Contract
 
