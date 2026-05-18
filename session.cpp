@@ -52,6 +52,10 @@ std::string endpoint_uri(const std::string& ip, uint16_t port) {
     return "udp://" + ip + ":" + std::to_string(port);
 }
 
+std::string endpoint_uri_tcp(const std::string& ip, uint16_t port) {
+    return "tcp://" + ip + ":" + std::to_string(port);
+}
+
 }  // namespace
 
 static std::string random_string(size_t len) {
@@ -146,6 +150,11 @@ void IceSession::gather() {
     } else {
         asio::post(strand_, [this, self = shared_from_this()] {
             start_multi_stun_probes();
+            /// RFC 6544 §4.4 TCP srflx probes ride the same pending
+            /// transaction set as UDP probes so a single gather
+            /// timeout covers both. No-op when no TCP carrier is
+            /// wired or `tcp_candidates_enabled` is false.
+            gather_tcp_server_reflexive();
         });
     }
 }
@@ -524,6 +533,42 @@ void IceSession::gather_host_candidates() {
         }
     }
     freeifaddrs(iflist);
+
+    gather_tcp_host_candidates();
+}
+
+void IceSession::gather_tcp_host_candidates() {
+    /// RFC 6544 emits one TCP candidate per interface IP per transport
+    /// flavour (active / passive / simultaneous-open). The TCP carrier
+    /// is wired separately from UDP; absent carrier means no usable
+    /// TCP fallback, so the gather skips the TCP slot entirely. The
+    /// candidate filter flags (host-only / relay-only / exclude-ipv4
+    /// / exclude-ipv6) reuse the same gate as UDP candidates so an
+    /// operator that excludes host candidates also drops the TCP
+    /// host slot.
+    if (!cfg_.tcp_candidates_enabled) return;
+    if (carrier_tcp_ == nullptr) return;
+    if (local_port_ == 0) return;
+
+    /// Walk the freshly-emitted UDP host candidates, mirroring each as
+    /// TCP active / passive / simultaneous-open. Iteration uses an
+    /// index snapshot because the loop body grows the same vector.
+    const std::size_t udp_end = local_candidates_.size();
+    static constexpr std::array<TransportType, 3> kTcpVariants = {
+        TransportType::TcpActive,
+        TransportType::TcpPassive,
+        TransportType::TcpSimultaneousOpen,
+    };
+    for (std::size_t i = 0; i < udp_end; ++i) {
+        const auto& src = local_candidates_[i];
+        if (src.type != CandidateType::Host) continue;
+        if (src.transport != TransportType::Udp) continue;
+        for (auto variant : kTcpVariants) {
+            Candidate c = src;
+            c.transport = variant;
+            local_candidates_.push_back(std::move(c));
+        }
+    }
 }
 
 void IceSession::resolve_remote_mdns_candidates() {
@@ -674,8 +719,112 @@ gn_conn_id_t IceSession::ensure_remote_cid(const std::string& ip,
                 });
         });
     endpoint_to_cid_[key] = cid;
-    cid_to_endpoint_[cid] = EndpointInfo{ip, port};
+    cid_to_endpoint_[cid] = EndpointInfo{ip, port, TransportType::Udp};
     return cid;
+}
+
+gn_conn_id_t IceSession::ensure_remote_tcp_cid(const std::string& ip,
+                                                  uint16_t port) {
+    if (!carrier_tcp_) return 0;
+    /// TCP cids are not deduplicated by endpoint key: each check pair
+    /// needs an independent socket because the framing reassembly
+    /// buffer + connection state is per-cid. Repeated calls open
+    /// repeated sockets — caller owns the lifetime via
+    /// `endpoint_to_cid_`'s map of (ip,port) → cid for the latest
+    /// attempt only.
+    gn_conn_id_t cid = GN_INVALID_ID;
+    const auto uri = endpoint_uri_tcp(ip, port);
+    if (carrier_tcp_->connect(uri, &cid) != GN_OK || cid == GN_INVALID_ID) {
+        return 0;
+    }
+    auto weak_self = std::weak_ptr<IceSession>(shared_from_this());
+    (void)carrier_tcp_->on_data(
+        cid,
+        [weak_self](gn_conn_id_t c, std::span<const std::uint8_t> bytes) {
+            auto self = weak_self.lock();
+            if (!self) return;
+            std::vector<std::uint8_t> copy(bytes.begin(), bytes.end());
+            asio::post(self->strand_,
+                [self, c, copy = std::move(copy)] {
+                    self->on_tcp_carrier_data(c, copy);
+                });
+        });
+    cid_to_endpoint_[cid] = EndpointInfo{ip, port, TransportType::TcpActive};
+    return cid;
+}
+
+std::vector<std::uint8_t> IceSession::frame_tcp_stun(
+    std::span<const std::uint8_t> msg) {
+    /// RFC 5389 §7.2.2: 16-bit big-endian length prefix in front of
+    /// the STUN message. Padding the length field with anything other
+    /// than the message body size breaks the framing on the peer side.
+    std::vector<std::uint8_t> out;
+    out.reserve(msg.size() + 2);
+    const auto len = static_cast<std::uint16_t>(msg.size());
+    out.push_back(static_cast<std::uint8_t>((len >> 8) & 0xFFu));
+    out.push_back(static_cast<std::uint8_t>(len & 0xFFu));
+    out.insert(out.end(), msg.begin(), msg.end());
+    return out;
+}
+
+void IceSession::on_tcp_carrier_data(gn_conn_id_t cid,
+                                         std::span<const std::uint8_t> bytes) {
+    /// TCP carriers deliver arbitrary byte chunks. The reassembly
+    /// buffer holds the in-progress STUN frame across delivery
+    /// boundaries; the inner loop drains every complete frame the
+    /// buffer currently holds before returning. Underflow on the
+    /// length prefix or the body simply leaves the bytes in place
+    /// for the next callback.
+    auto& buf = tcp_rx_buffers_[cid];
+    buf.insert(buf.end(), bytes.begin(), bytes.end());
+    while (buf.size() >= 2) {
+        const std::uint16_t len =
+            (static_cast<std::uint16_t>(buf[0]) << 8)
+            | static_cast<std::uint16_t>(buf[1]);
+        if (buf.size() < static_cast<std::size_t>(2) + len) break;
+        std::vector<std::uint8_t> frame(buf.begin() + 2,
+                                          buf.begin() + 2 + len);
+        buf.erase(buf.begin(), buf.begin() + 2 + len);
+        on_carrier_data(cid, frame);
+    }
+}
+
+void IceSession::gather_tcp_server_reflexive() {
+    /// RFC 6544 §4.4 TCP server-reflexive gather. Fires one STUN
+    /// binding request per configured STUN server through the TCP
+    /// carrier; the response's XOR-MAPPED-ADDRESS surfaces a TCP
+    /// srflx candidate. Reuses the same `pending_stun_probes_`
+    /// transaction-id set as the UDP path so a UDP and a TCP probe
+    /// to the same server don't collide on the txid.
+    ///
+    /// TCP-TURN per RFC 6062 is roadmap; this commit covers host +
+    /// srflx TCP only.
+    if (!cfg_.tcp_candidates_enabled) return;
+    if (carrier_tcp_ == nullptr) return;
+    if (cfg_.stun_servers.empty()) return;
+
+    for (auto& server : cfg_.stun_servers) {
+        std::string host = server;
+        std::uint16_t port = 3478;
+        auto colon = server.rfind(':');
+        if (colon != std::string::npos) {
+            host = server.substr(0, colon);
+            try {
+                auto port_val = std::stoul(server.substr(colon + 1));
+                if (port_val > 65535) continue;
+                port = static_cast<std::uint16_t>(port_val);
+            } catch (...) {
+                continue;
+            }
+        }
+        auto cid = ensure_remote_tcp_cid(host, port);
+        if (cid == 0) continue;
+        auto txn = generate_txn_id();
+        auto msg = StunBuilder(STUN_BINDING_REQUEST).set_txn_id(txn).build();
+        pending_stun_probes_.push_back(txn);
+        const auto framed = frame_tcp_stun(msg);
+        if (carrier_tcp_) (void)carrier_tcp_->send(cid, framed);
+    }
 }
 
 void IceSession::start_multi_stun_probes() {
@@ -741,7 +890,8 @@ void IceSession::start_multi_stun_probes() {
         }));
 }
 
-void IceSession::handle_gather_response(const StunMessage& msg) {
+void IceSession::handle_gather_response(const StunMessage& msg,
+                                            TransportType src_transport) {
     /// Match by transaction id. Linear scan is fine — `cfg_.stun_servers`
     /// is operator-bounded (single-digit).
     auto it = std::find(pending_stun_probes_.begin(),
@@ -759,6 +909,8 @@ void IceSession::handle_gather_response(const StunMessage& msg) {
     Candidate c{};
     c.type     = CandidateType::Srflx;
     c.priority = compute_priority(CandidateType::Srflx, 65535, 1);
+    c.transport = transport_is_tcp(src_transport)
+        ? TransportType::TcpActive : TransportType::Udp;
 
     struct in_addr addr4;
     if (inet_pton(AF_INET, msg.xor_mapped->ip.c_str(), &addr4) == 1) {
@@ -796,10 +948,15 @@ void IceSession::handle_gather_response(const StunMessage& msg) {
     /// First response wins the srflx slot; subsequent responses still
     /// contribute to stride detection (above) but don't add another
     /// srflx candidate — the IP is the same per local port, the wire
-    /// difference is purely on the destination side.
+    /// difference is purely on the destination side. UDP and TCP
+    /// srflx slots are tracked independently so a TCP probe response
+    /// doesn't shadow a pre-existing UDP srflx candidate (and vice
+    /// versa).
+    const bool want_tcp_slot = transport_is_tcp(c.transport);
     bool already_have_srflx = false;
     for (const auto& existing : local_candidates_) {
-        if (existing.type == CandidateType::Srflx) {
+        if (existing.type != CandidateType::Srflx) continue;
+        if (transport_is_tcp(existing.transport) == want_tcp_slot) {
             already_have_srflx = true;
             break;
         }
@@ -1402,7 +1559,12 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
         /// nomination — still pass through the integrity gate below.
         if (st == SessionState::Gathering &&
             parsed->msg_type == STUN_BINDING_RESPONSE) {
-            handle_gather_response(*parsed);
+            TransportType src_tx = TransportType::Udp;
+            if (auto eit = cid_to_endpoint_.find(cid);
+                eit != cid_to_endpoint_.end()) {
+                src_tx = eit->second.transport;
+            }
+            handle_gather_response(*parsed, src_tx);
             return;
         }
 

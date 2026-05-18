@@ -216,6 +216,23 @@ struct IceConfig {
     /// `peer.port` when the peer is marked symmetric. Capped to keep
     /// the check list from blowing up against a wide NAT pool.
     int  symmetric_port_prediction_attempts = 8;
+
+    /// RFC 6544 TCP candidate emission. When `true` and a TCP carrier
+    /// is wired, `gather_host` emits one TCP host candidate per
+    /// interface IP per transport variant (active / passive /
+    /// simultaneous-open), and `gather_server_reflexive` fires a STUN
+    /// binding request over TCP to surface a TCP srflx candidate.
+    /// Defaults to `true` so deployments behind UDP-blocked
+    /// firewalls get TCP fallback without a config toggle; operators
+    /// in pure-UDP environments can flip it off to shrink the
+    /// candidate set.
+    bool tcp_candidates_enabled = true;
+    /// Coordination window (milliseconds) for RFC 6544
+    /// simultaneous-open: both peers must fire `connect()` toward
+    /// each other's TCP-SO candidate inside this window for the
+    /// kernel's SYN-SYN exchange to land. Outside the window the
+    /// check is abandoned and the next pair in the list runs.
+    int  tcp_so_timeout_ms = 5000;
 };
 
 /// Decide whether a candidate of `(type, family)` survives the
@@ -265,6 +282,12 @@ struct CheckPair {
     /// to derive per-check RTT when the matching response arrives.
     /// Zero means "no send yet" or the pair never reached Checking.
     uint64_t  txn_send_us = 0;
+    /// RFC 6544 transport flavour for this pair. Mirrors
+    /// `local.transport` so the check driver does not need to walk
+    /// the candidate field on every dispatch. UDP pairs ride the
+    /// existing UDP carrier; TCP variants route through `carrier_tcp_`
+    /// with 16-bit length-prefix framing per RFC 5389 §7.2.2.
+    TransportType transport_type = TransportType::Udp;
 };
 
 /// Nomination snapshot exposed to strategy plugins (`gn.link.ice`
@@ -450,9 +473,21 @@ private:
     struct EndpointInfo {
         std::string ip;
         std::uint16_t port = 0;
+        /// Carrier flavour the cid was opened on. UDP cids dispatch
+        /// through the existing per-cid path; TCP cids carry STUN
+        /// inside the 16-bit length-prefix framing per RFC 5389
+        /// §7.2.2 and route through `on_tcp_carrier_data` which
+        /// deframes before handing bytes to `on_carrier_data`.
+        TransportType transport = TransportType::Udp;
     };
     std::unordered_map<std::string, gn_conn_id_t> endpoint_to_cid_;
     std::unordered_map<gn_conn_id_t, EndpointInfo> cid_to_endpoint_;
+    /// Reassembly buffer for inbound STUN-over-TCP bytes per cid.
+    /// TCP carriers deliver arbitrary chunks; the 16-bit length
+    /// prefix lets us slice them back into STUN messages without
+    /// assuming one carrier read == one frame.
+    std::unordered_map<gn_conn_id_t, std::vector<std::uint8_t>>
+        tcp_rx_buffers_;
     /// The cid currently selected as the nominated outbound path.
     /// Used by `send()` for application data and `on_keepalive`. Zero
     /// before nomination.
@@ -518,8 +553,23 @@ private:
 
     // ── State machine (all run on strand or during synchronous gather) ────
     void gather_host_candidates();
+    /// RFC 6544 TCP host gather. For each interface IP already
+    /// emitted as a UDP host candidate, push three TCP host
+    /// candidates — one per transport variant (active / passive /
+    /// simultaneous-open). The same `local_port_` is reused; ICE
+    /// peers distinguish UDP vs TCP entries via the wire-encoded
+    /// transport nibble. No-op when the TCP carrier is missing or
+    /// `cfg_.tcp_candidates_enabled` is false.
+    void gather_tcp_host_candidates();
+    /// RFC 6544 TCP srflx gather. Fires one STUN binding request per
+    /// configured STUN server over the TCP carrier and emits a
+    /// `Srflx` candidate with `TcpActive` transport on the first
+    /// XOR-MAPPED-ADDRESS response. TCP-TURN per RFC 6062 is
+    /// roadmap; this commit covers host + srflx TCP only.
+    void gather_tcp_server_reflexive();
     void start_multi_stun_probes();
-    void handle_gather_response(const StunMessage& msg);
+    void handle_gather_response(const StunMessage& msg,
+                                  TransportType src_transport);
     void gather_relay();
     /// Start the next ALLOCATE attempt against
     /// `cfg_.turn_servers[turn_attempt_idx_]`. Arms
@@ -552,6 +602,17 @@ private:
     void run_next_check();
     void build_check_list();
     void send_check(CheckPair& pair);
+    /// RFC 6544 §6 simultaneous-open: when checking a TCP-SO pair,
+    /// both peers fire `connect()` toward the peer's TCP-SO
+    /// candidate within `cfg_.tcp_so_timeout_ms`. The kernel TCP
+    /// stack performs the SYN-SYN exchange; on success the resulting
+    /// socket becomes the carrier for STUN-framed checks. This
+    /// helper allocates the TCP cid (the connect alone counts as the
+    /// SO contribution from our side), arms a timeout, and falls
+    /// back to UDP-style framing once the cid is up. Returns the
+    /// cid or 0 on failure.
+    gn_conn_id_t arm_tcp_so_connect(const std::string& ip,
+                                      std::uint16_t port);
     void handle_check_response(const StunMessage& msg);
     void on_nominated(const std::string& ip, uint16_t port, bool relay,
                        gn_conn_id_t cid);
@@ -565,6 +626,29 @@ private:
     /// composer_connect → cid mapping; reuses an existing cid if the
     /// endpoint has been seen before. Returns 0 on failure. Strand-only.
     gn_conn_id_t ensure_remote_cid(const std::string& ip, uint16_t port);
+
+    /// TCP variant of `ensure_remote_cid` — opens the endpoint on the
+    /// `gn.link.tcp` carrier (`carrier_tcp_`). Each invocation
+    /// allocates a fresh cid; TCP sockets are not reused across
+    /// pairs because the framing state is per-connection. Returns 0
+    /// when no TCP carrier is wired or `connect` fails. Strand-only.
+    gn_conn_id_t ensure_remote_tcp_cid(const std::string& ip,
+                                          uint16_t port);
+
+    /// RFC 5389 §7.2.2 STUN-over-TCP framing. Prepends a 16-bit
+    /// big-endian length prefix to @p msg so the peer can split STUN
+    /// messages out of the byte stream. The wire form is
+    /// `<2 bytes length><STUN message>`.
+    static std::vector<std::uint8_t> frame_tcp_stun(
+        std::span<const std::uint8_t> msg);
+
+    /// Drains as many complete STUN messages as the reassembly buffer
+    /// for @p cid contains, dispatching each through
+    /// `on_carrier_data`. Strand-only. TCP carriers may chunk bytes
+    /// arbitrarily; this routine handles short reads and split-frame
+    /// boundaries without losing alignment.
+    void on_tcp_carrier_data(gn_conn_id_t cid,
+                              std::span<const std::uint8_t> bytes);
 
     /// Replace HostMdns entries in `remote_candidates_` with their
     /// resolved IP equivalents. For each `<uuid>.local` candidate,
