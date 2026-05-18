@@ -303,7 +303,22 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
 
 void IceSession::set_peer_signal_flags(std::uint32_t flags) {
     asio::dispatch(strand_, [self = shared_from_this(), flags] {
-        self->peer_signal_flags_.store(flags, std::memory_order_release);
+        const auto prev = self->peer_signal_flags_.exchange(
+            flags, std::memory_order_acq_rel);
+        const bool symmetric_changed =
+            ((prev ^ flags) & ICE_SIGNAL_FLAG_SYMMETRIC) != 0;
+        if (symmetric_changed
+            && self->state_.load(std::memory_order_acquire)
+                 == SessionState::Checking
+            && !self->remote_candidates_.empty()
+            && !self->local_candidates_.empty()) {
+            /// Predicted-port pairs depend on the peer flag; rebuild
+            /// the list so the freshly-known stride lands in the
+            /// queue.
+            self->build_check_list();
+            self->current_check_ = 0;
+            self->run_next_check();
+        }
     });
 }
 
