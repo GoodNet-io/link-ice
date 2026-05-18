@@ -11,7 +11,8 @@ add_executable(test_ice
     test_ice_dns.cpp
     test_ice_mdns.cpp
     test_ice_lite_and_pred.cpp
-    test_ice_tcp.cpp)
+    test_ice_tcp.cpp
+    test_ice_auto_restart.cpp)
 target_link_libraries(test_ice PRIVATE
     GoodNet::sdk
     goodnet_ice_objects
