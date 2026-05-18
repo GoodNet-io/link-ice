@@ -50,7 +50,11 @@ private:
 
     std::atomic<bool>                running_{false};
     std::atomic<bool>                started_{false};
-    int                               sock_ = -1;
+    /// Netlink fd is touched from two threads: `start` / `stop` on the
+    /// owner's thread, `run_loop` on the reader thread. Atomic so the
+    /// `sock_ = -1` reset in `stop` does not race with the reader's
+    /// `pfd.fd = sock_` snapshot.
+    std::atomic<int>                  sock_{-1};
     std::thread                       reader_;
 };
 

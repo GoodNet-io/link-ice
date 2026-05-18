@@ -36,8 +36,8 @@ InterfaceWatcher::~InterfaceWatcher() {
 bool InterfaceWatcher::start() {
 #ifdef __linux__
     if (started_.exchange(true)) return true;
-    sock_ = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-    if (sock_ < 0) {
+    const int fd = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0) {
         started_.store(false);
         return false;
     }
@@ -47,13 +47,14 @@ bool InterfaceWatcher::start() {
     addr.nl_groups = RTMGRP_LINK
                        | RTMGRP_IPV4_IFADDR
                        | RTMGRP_IPV6_IFADDR;
-    if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(sock_);
-        sock_ = -1;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        sock_.store(-1, std::memory_order_release);
         started_.store(false);
         return false;
     }
 
+    sock_.store(fd, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     reader_ = std::thread([this] { run_loop(); });
     return true;
@@ -67,10 +68,13 @@ void InterfaceWatcher::stop() {
 #ifdef __linux__
     if (!started_.load()) return;
     running_.store(false, std::memory_order_release);
-    if (sock_ >= 0) {
-        ::shutdown(sock_, SHUT_RDWR);
-        ::close(sock_);
-        sock_ = -1;
+    /// Swap the fd out atomically so the reader thread's next
+    /// `pfd.fd = sock_.load(...)` snapshot sees -1, and `::shutdown` /
+    /// `::close` only run once even if `stop` is invoked concurrently.
+    const int fd = sock_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
     }
     if (reader_.joinable()) reader_.join();
     debounce_timer_.cancel();
@@ -88,14 +92,16 @@ void InterfaceWatcher::run_loop() {
     std::vector<std::uint8_t> buf(kBufSize);
 
     while (running_.load(std::memory_order_acquire)) {
+        const int fd = sock_.load(std::memory_order_acquire);
+        if (fd < 0) break;
         struct pollfd pfd{};
-        pfd.fd = sock_;
+        pfd.fd = fd;
         pfd.events = POLLIN;
         const int pr = ::poll(&pfd, 1, 500);
         if (pr <= 0) continue;
         if (!(pfd.revents & POLLIN)) continue;
 
-        const ssize_t got = ::recv(sock_, buf.data(), buf.size(), 0);
+        const ssize_t got = ::recv(fd, buf.data(), buf.size(), 0);
         if (got <= 0) continue;
 
         bool relevant = false;
