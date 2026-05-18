@@ -1,0 +1,116 @@
+# Changelog — goodnet-link-ice
+
+All notable changes to this plugin are listed here. The format
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+versions track the kernel ABI through `gn_link_vtable_t` /
+`gn.link.ice.signal` / `gn.link.ice.path_mtu`.
+
+## [Unreleased]
+
+### DPLPMTUD path-MTU discovery
+
+Active path-MTU discovery per RFC 8899 runs on every nominated
+pair. A probe state machine in the session FSM emits padded
+STUN binding requests at the candidate MTU step (1200 → 1280 →
+1380 → 1492 → 1500); responses are correlated by transaction
+id and feed the binary search up to the wire ceiling.
+
+The discovered MTU is published through the new
+`gn.link.ice.path_mtu` extension so upper layers (notably the
+QUIC link consuming an ICE carrier) size their datagrams to the
+actual path rather than the static `ice.path_mtu` fallback. The
+fallback config knob still applies when discovery is disabled
+or before the first successful probe.
+
+### mDNS host-candidate obfuscation
+
+Host candidates can be replaced with `<uuid>.local` names per
+draft-ietf-mmusic-mdns-ice-candidates so that raw RFC 1918
+addresses do not leak across the signaling channel. The mDNS
+responder binds dual-stack 224.0.0.251 / FF02::FB, registers
+the local UUID on inbound queries, and answers per qtype. Peer
+candidates carrying `.local` names are resolved through the
+same responder; pairs that fail to resolve within
+`ice.mdns_resolve_timeout_ms` are dropped before connectivity
+checks.
+
+### Multi-TURN fallback
+
+`gather_relay` walks `IceConfig::turn_servers` sequentially and
+keeps the unused entries as backups. A background timer probes
+one backup every `ice.turn_backup_interval_s`; when the primary
+relay degrades (per `TurnClient::is_healthy()`) and a backup
+ALLOCATE has succeeded recently, the link swaps the relay
+candidate. Rate-limited to one swap per
+`ice.turn_failover_min_interval_s` to avoid oscillation under
+flapping conditions.
+
+## [1.0.2-rc1] — 2026-05-13
+
+Operator-facing knobs for production deployments. The
+`ice.consent_recovery_cap_s` knob bounds the consent-freshness
+recovery window — peers that drop probes for longer than the cap
+are abandoned rather than churning through indefinite recovery.
+`ice.candidate_filters` lets the operator strip whole candidate
+families (`host`, `srflx`, `relay`) before gathering — useful for
+NAT-only fleets or relay-only deployments.
+
+`ice.turn_servers` is accepted as either a single `host:port`
+string or an array of strings; the array form feeds the
+multi-TURN fallback machinery introduced under Unreleased.
+
+## [1.0.1-rc1] — 2026-05-13
+
+STUN / TURN configuration entries learn to talk to `gn.dns`:
+operators can configure `stun:host` / `turn:host` URIs and the
+link expands them via the SRV record for the configured `_stun.
+_udp` / `_turn._udp` services before gathering. Falls back to
+the literal `host:port` parse when the extension is not loaded
+or the SRV record is absent. Closes the C.1 cross-plugin
+integration with `goodnet-handler-dns`.
+
+## [1.0.0-rc1] — 2026-05-12
+
+Initial release. Brings the legacy in-tree `links/ice` link
+forward as a v1 GoodNet link plugin.
+
+### Added
+
+- Full controlled / controlling FSM per RFC 8445, with
+  triggered checks (§7.3.1.4), regular nomination by default
+  and aggressive nomination (§8.1.1) opt-in via
+  `ice.aggressive_nomination`.
+- STUN binding + integrity attributes per RFC 5389; long-term
+  credential mechanism for TURN.
+- TURN allocation slice per RFC 5766 over UDP, TCP (§7.2.2)
+  and TLS (`turns://`). TCP path layered on the `gn.link.tcp`
+  carrier; TLS path on `gn.link.tls`. Stream framing is
+  extracted to a standalone helper with unit tests covering
+  reassembly under partial reads.
+- Candidate gathering across host, server-reflexive and relay
+  families. Server-reflexive uses the configured STUN list;
+  relay walks the TURN list (multi-TURN fallback added later).
+- `gn.link.ice.signal` extension for the offer / answer
+  side-channel. The link has no listening port; a signaling
+  handler (heartbeat, a future signaling channel, or a bridge)
+  hands serialized candidate sets to the link, which maps
+  `peer_pk` onto an `IceSession`.
+- Kernel-facing adapter wired through the SDK link teardown
+  conformance plus the smoke-test suite.
+- Composer surface for cross-link nesting — ICE can run as a
+  carrier under a higher-level link (notably QUIC) by handing
+  its post-nomination socket back through
+  `host_api->notify_inbound_bytes`.
+- Operator knobs for the timeouts that matter:
+  `ice.session_timeout_s`, `ice.keepalive_interval_s`,
+  `ice.consent_max_failures`, `ice.check_interval_ms`,
+  `ice.path_mtu`.
+- RFC coverage table in `README.md`, listing each RFC slice
+  and whether it lands in the v1.0.0-rc1 surface or a later
+  cut.
+
+### Removed
+
+- The in-tree copy under `links/ice` in the kernel monorepo.
+  Source-of-truth moved to this sub-repo; the kernel consumes
+  the built `.so` via the plugin loader.
