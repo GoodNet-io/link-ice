@@ -76,6 +76,11 @@ struct TurnConfig {
     /// restrictive corporate firewalls that allow only outbound
     /// 443/TCP.
     bool        tls_transport = false;
+    /// Relay-side transport (RFC 6062). Default = UDP (17); set to
+    /// TCP (6) to request a TCP-allocated relay. The TCP-allocation
+    /// flow uses CONNECT / CONNECTIONBIND in place of CHANNEL-BIND
+    /// and is implemented in subsequent commits.
+    std::uint8_t requested_transport = REQUESTED_TRANSPORT_UDP;
 };
 
 /// Callback when data arrives via TURN relay.

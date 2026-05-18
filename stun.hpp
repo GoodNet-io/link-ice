@@ -55,6 +55,12 @@ constexpr uint16_t TURN_CHANNEL_BIND_REQUEST  = 0x0009;
 constexpr uint16_t TURN_CHANNEL_BIND_RESPONSE = 0x0109;
 constexpr uint16_t TURN_CHANNEL_BIND_ERROR    = 0x0119;
 
+/// IANA transport-protocol numbers carried in REQUESTED-TRANSPORT
+/// (RFC 5766 §14.7). UDP is the RFC 5766 default; TCP unlocks the
+/// RFC 6062 TCP-allocation flow.
+constexpr uint8_t  REQUESTED_TRANSPORT_UDP = 17;
+constexpr uint8_t  REQUESTED_TRANSPORT_TCP = 6;
+
 /// ChannelData per RFC 5766 §11.4 — efficient binary framing for
 /// data sent over a TURN-bound channel. First 2 bytes are the
 /// channel number (0x4000-0x7FFF); next 2 bytes are payload length;

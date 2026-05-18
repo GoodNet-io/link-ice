@@ -418,6 +418,38 @@ void IceLink::apply_config() noexcept {
         const bool b = (v != 0);
         apply_to_all_turns([&](TurnConfig& t) { t.tls_transport = b; });
     }
+    /// RFC 6062 relay-side transport. Accepts a string ("udp" /
+    /// "tcp") or the IANA integer (17 / 6). When set to TCP, the
+    /// TURN ALLOCATE carries REQUESTED-TRANSPORT=6 and the relay
+    /// uses CONNECT / CONNECTIONBIND for data connections rather
+    /// than CHANNEL-BIND / Send-Indication.
+    {
+        const char* value = nullptr;
+        void* user_data = nullptr;
+        void (*free_fn)(void*, void*) = nullptr;
+        if (gn_config_get_string(api_, "ice.turn_requested_transport",
+                                  &value, &user_data, &free_fn) == GN_OK
+            && value != nullptr) {
+            std::string_view s(value);
+            std::uint8_t proto = REQUESTED_TRANSPORT_UDP;
+            if (s == "tcp" || s == "TCP" || s == "6") {
+                proto = REQUESTED_TRANSPORT_TCP;
+            } else if (s == "udp" || s == "UDP" || s == "17") {
+                proto = REQUESTED_TRANSPORT_UDP;
+            }
+            apply_to_all_turns(
+                [&](TurnConfig& t) { t.requested_transport = proto; });
+            if (free_fn != nullptr) {
+                free_fn(user_data, const_cast<char*>(value));
+            }
+        } else if (gn_config_get_int64(
+                       api_, "ice.turn_requested_transport", &v) == GN_OK) {
+            const std::uint8_t proto = (v == REQUESTED_TRANSPORT_TCP)
+                ? REQUESTED_TRANSPORT_TCP : REQUESTED_TRANSPORT_UDP;
+            apply_to_all_turns(
+                [&](TurnConfig& t) { t.requested_transport = proto; });
+        }
+    }
     /// RFC 6544 TCP candidate emission. Defaults to enabled so
     /// operators in UDP-blocked environments get TCP fallback
     /// without a config toggle; the gather is still a no-op when

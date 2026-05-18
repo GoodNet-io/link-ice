@@ -106,9 +106,11 @@ bool TurnClient::allocate() {
 
     /// Speculative unauthenticated request. RFC 5766 §6.2 says the
     /// server replies with 401 carrying realm/nonce; we then retry
-    /// with `MESSAGE-INTEGRITY` from `compute_auth_key`.
+    /// with `MESSAGE-INTEGRITY` from `compute_auth_key`. The
+    /// REQUESTED-TRANSPORT attribute carries the IANA transport
+    /// number — UDP (17) per RFC 5766, TCP (6) per RFC 6062.
     auto msg = StunBuilder(TURN_ALLOCATE_REQUEST)
-        .add_requested_transport(17)  // UDP
+        .add_requested_transport(cfg_.requested_transport)
         .build();
     send_to_server(msg);
     return true;
@@ -154,7 +156,7 @@ void TurnClient::dispatch_inbound_message(std::span<const std::uint8_t> bytes) {
 
             // Retry with credentials
             auto msg = StunBuilder(TURN_ALLOCATE_REQUEST)
-                .add_requested_transport(17)
+                .add_requested_transport(cfg_.requested_transport)
                 .add_username(cfg_.username)
                 .add_realm(realm_)
                 .add_nonce(nonce_)
