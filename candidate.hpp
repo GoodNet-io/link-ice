@@ -37,6 +37,32 @@ enum class AddressFamily : uint8_t {
     IPv6 = 2
 };
 
+/// Transport flavour for an ICE candidate per RFC 6544. UDP is the
+/// historical default; the three TCP variants govern who opens the
+/// underlying TCP socket:
+///   - `TcpActive`           — local end only initiates `connect()`,
+///                              never accepts.
+///   - `TcpPassive`          — local end only accepts, never connects.
+///   - `TcpSimultaneousOpen` — both ends fire `connect()` toward each
+///                              other inside a coordinated window so
+///                              NAT/firewall state permits the
+///                              simultaneous SYN exchange.
+/// Encoded on the wire in the previously-reserved high nibble of the
+/// `CandidateWire::type` byte so older peers that read only the low
+/// nibble see the candidate as a vanilla UDP host / srflx / relay.
+enum class TransportType : uint8_t {
+    Udp                 = 0,
+    TcpActive           = 1,
+    TcpPassive          = 2,
+    TcpSimultaneousOpen = 3
+};
+
+[[nodiscard]] constexpr bool transport_is_tcp(TransportType t) noexcept {
+    return t == TransportType::TcpActive
+        || t == TransportType::TcpPassive
+        || t == TransportType::TcpSimultaneousOpen;
+}
+
 /// Maximum on-wire length of an mDNS hostname carried by a
 /// HostMdns candidate. The draft uses RFC 4122 v4 UUIDs (36
 /// characters, lowercase hex with dashes) plus the ".local"
@@ -57,6 +83,11 @@ struct Candidate {
     /// remain authoritative. Limited to `kMaxMdnsHostnameLen`
     /// bytes by the wire format.
     std::string    hostname{};
+    /// RFC 6544 transport flavour. Defaults to UDP so existing call
+    /// sites that build a Candidate via aggregate init continue to
+    /// behave as plain-UDP. TCP-flavoured candidates carry the
+    /// active / passive / simultaneous-open role here.
+    TransportType  transport = TransportType::Udp;
 
     std::string address_str() const;
     void set_address(const std::string& addr_str);
@@ -150,9 +181,25 @@ inline uint64_t pair_priority(uint32_t controlling_prio, uint32_t controlled_pri
 
 // ── Serialization ───────────────────────────────────────────────────────────
 
+/// Wire-level packing of `CandidateType` + `TransportType` inside the
+/// 8-bit `CandidateWire::type` slot. Low 5 bits hold the candidate
+/// type (HostMdns = 4 fits in 3 bits, leaving slack for future
+/// additions); bits 5-6 hold the transport variant (4 values, 2
+/// bits). Bit 7 is reserved. Older peers that mask with 0xFF and
+/// switch on the result will see a TCP-flavoured candidate as a
+/// completely unknown type and drop it gracefully; peers compiled
+/// against this header isolate the candidate type with
+/// `kCandidateTypeMask` and the transport with `kTransportShift`.
+inline constexpr uint8_t kCandidateTypeMask = 0x1F;
+inline constexpr uint8_t kTransportShift    = 5;
+inline constexpr uint8_t kTransportMask     = 0x03;
+
 inline CandidateWire to_wire(const Candidate& c) {
     CandidateWire w{};
-    w.type = static_cast<uint8_t>(c.type);
+    const uint8_t type_bits = static_cast<uint8_t>(c.type) & kCandidateTypeMask;
+    const uint8_t tx_bits =
+        (static_cast<uint8_t>(c.transport) & kTransportMask) << kTransportShift;
+    w.type = static_cast<uint8_t>(type_bits | tx_bits);
     w.family = static_cast<uint8_t>(c.family);
     w.port = htons(c.port);
     w.priority = htonl(c.priority);
@@ -162,7 +209,9 @@ inline CandidateWire to_wire(const Candidate& c) {
 
 inline Candidate from_wire(const CandidateWire& w) {
     Candidate c{};
-    c.type = static_cast<CandidateType>(w.type);
+    c.type = static_cast<CandidateType>(w.type & kCandidateTypeMask);
+    c.transport = static_cast<TransportType>(
+        (w.type >> kTransportShift) & kTransportMask);
     c.family = static_cast<AddressFamily>(w.family);
     c.port = ntohs(w.port);
     c.priority = ntohl(w.priority);
