@@ -433,9 +433,23 @@ public:
     const std::string& peer_id() const { return peer_id_; }
     bool is_controlling() const { return controlling_; }
 
-    const std::vector<Candidate>& local_candidates() const { return local_candidates_; }
-    const std::string& local_ufrag() const { return local_ufrag_; }
-    const std::string& local_pwd() const { return local_pwd_; }
+    /// Snapshots taken under `local_state_mu_`. The previous
+    /// reference-returning form raced with strand-side mutators
+    /// (`restart`, TURN-allocate callbacks, gather) because off-strand
+    /// callers (tests, signaling) hold the reference while the strand
+    /// reallocates the vector or reassigns the string.
+    std::vector<Candidate> local_candidates() const {
+        std::lock_guard lk(local_state_mu_);
+        return local_candidates_;
+    }
+    std::string local_ufrag() const {
+        std::lock_guard lk(local_state_mu_);
+        return local_ufrag_;
+    }
+    std::string local_pwd() const {
+        std::lock_guard lk(local_state_mu_);
+        return local_pwd_;
+    }
 
     std::chrono::steady_clock::time_point last_activity() const {
         return last_activity_.load(std::memory_order_acquire);
@@ -480,6 +494,13 @@ private:
     std::atomic<SessionState> state_{SessionState::New};
 
     // ── State machine data (strand-only access) ─────────────────────────────
+    /// `local_ufrag_`, `local_pwd_`, and `local_candidates_` are
+    /// strand-only on the write path but are also sampled
+    /// cross-thread through the public accessors (tests poll them
+    /// from the main thread; signaling plugins read them from their
+    /// own dispatcher). The mutex publishes strand-side writes to
+    /// off-strand readers; strand-side readers stay lock-free.
+    mutable std::mutex local_state_mu_;
     std::string local_ufrag_;
     std::string local_pwd_;
     std::vector<Candidate> local_candidates_;

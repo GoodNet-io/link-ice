@@ -92,6 +92,11 @@ IceSession::IceSession(asio::io_context& io,
       mdns_(std::move(mdns)),
       last_activity_(std::chrono::steady_clock::now()),
       pmtu_probe_timer_(strand_) {
+    /// Constructor: no observers exist yet, so the mutex isn't
+    /// strictly required, but locking keeps the publication pattern
+    /// uniform and lets TSan reason about all writes through the
+    /// same edge as the public accessors.
+    std::lock_guard lk(local_state_mu_);
     local_ufrag_ = generate_ufrag();
     local_pwd_   = generate_pwd();
 
@@ -379,8 +384,15 @@ void IceSession::restart() {
         self->turn_backup_probe_idx_ = 0;
         self->turn_last_failover_ = std::chrono::steady_clock::time_point{};
 
-        self->local_ufrag_ = IceSession::generate_ufrag();
-        self->local_pwd_   = IceSession::generate_pwd();
+        {
+            /// Publish credential + candidate-set wipe to off-strand
+            /// readers (`local_ufrag()`, `local_pwd()`,
+            /// `local_candidates()`).
+            std::lock_guard lk(self->local_state_mu_);
+            self->local_ufrag_ = IceSession::generate_ufrag();
+            self->local_pwd_   = IceSession::generate_pwd();
+            self->local_candidates_.clear();
+        }
 
         /// Drop the previous mDNS registration so the post-restart
         /// gather can mint a fresh `<uuid>.local` per the draft.
@@ -391,7 +403,6 @@ void IceSession::restart() {
             self->mdns_local_hostname_.clear();
         }
 
-        self->local_candidates_.clear();
         self->remote_candidates_.clear();
         self->remote_ufrag_.clear();
         self->remote_pwd_.clear();
@@ -508,6 +519,7 @@ void IceSession::gather_host_candidates() {
         c.hostname = mdns_local_hostname_;
         if (candidate_allowed(CandidateType::Host, c.family,
                                cfg_.candidate_filter_flags)) {
+            std::lock_guard lk(local_state_mu_);
             local_candidates_.push_back(c);
         }
         /// Skip raw-IP host candidates: the whole point of mDNS
@@ -537,6 +549,7 @@ void IceSession::gather_host_candidates() {
             c.priority = compute_priority(CandidateType::Host, 65535, 1);
             if (candidate_allowed(c.type, c.family,
                                    cfg_.candidate_filter_flags)) {
+                std::lock_guard lk(local_state_mu_);
                 local_candidates_.push_back(c);
             }
         } else if (ifa->ifa_addr->sa_family == AF_INET6) {
@@ -547,6 +560,7 @@ void IceSession::gather_host_candidates() {
             c.priority = compute_priority(CandidateType::Host, 65534, 1);
             if (candidate_allowed(c.type, c.family,
                                    cfg_.candidate_filter_flags)) {
+                std::lock_guard lk(local_state_mu_);
                 local_candidates_.push_back(c);
             }
         }
@@ -574,6 +588,7 @@ void IceSession::gather_tcp_host_candidates() {
     /// `local_candidates_` may reallocate and invalidate references
     /// — so the iteration copies the source candidate by value
     /// before pushing into the same vector.
+    std::lock_guard lk(local_state_mu_);
     const std::size_t udp_end = local_candidates_.size();
     static constexpr std::array<TransportType, 3> kTcpVariants = {
         TransportType::TcpActive,
@@ -985,6 +1000,7 @@ void IceSession::handle_gather_response(const StunMessage& msg,
     if (!already_have_srflx
         && candidate_allowed(c.type, c.family,
                               cfg_.candidate_filter_flags)) {
+        std::lock_guard lk(local_state_mu_);
         local_candidates_.push_back(c);
     }
 
@@ -1131,7 +1147,10 @@ void IceSession::try_next_turn_attempt() {
                                     self->cfg_.candidate_filter_flags)) {
                 return;
             }
-            self->local_candidates_.push_back(std::move(c));
+            {
+                std::lock_guard lk(self->local_state_mu_);
+                self->local_candidates_.push_back(std::move(c));
+            }
             /// Successful attempt — stash the remaining entries as
             /// backups and arm the periodic probe.
             self->turn_backups_.clear();
@@ -1301,9 +1320,12 @@ void IceSession::promote_turn_backup(std::shared_ptr<TurnClient> client,
     if (turn_) {
         turn_->close();
     }
-    std::erase_if(local_candidates_, [](const Candidate& c) {
-        return c.type == CandidateType::Relay;
-    });
+    {
+        std::lock_guard lk(local_state_mu_);
+        std::erase_if(local_candidates_, [](const Candidate& cnd) {
+            return cnd.type == CandidateType::Relay;
+        });
+    }
 
     turn_ = std::move(client);
     cfg_.turn = new_cfg;
@@ -1315,6 +1337,7 @@ void IceSession::promote_turn_backup(std::shared_ptr<TurnClient> client,
     c.set_address(relay.ip);
     c.priority = compute_priority(CandidateType::Relay, 65535, 1);
     if (candidate_allowed(c.type, c.family, cfg_.candidate_filter_flags)) {
+        std::lock_guard lk(local_state_mu_);
         local_candidates_.push_back(c);
     }
 
@@ -1795,6 +1818,7 @@ void IceSession::handle_check_response(const StunMessage& msg) {
                     prflx.set_address(mapped.ip);
                     prflx.port = mapped.port;
                     prflx.priority = compute_priority(CandidateType::Prflx, 65535, 1);
+                    std::lock_guard lk(local_state_mu_);
                     local_candidates_.push_back(prflx);
                 }
             }
