@@ -535,6 +535,14 @@ private:
     std::atomic<uint32_t> consent_missed_{0};
     uint32_t consent_recovery_attempts_ = 0;
 
+    // Auto-restart accounting — number of consent-loss-driven restarts
+    // already fired, and the wall-clock timestamp of the last one. Both
+    // strand-only. The counter is reset only by an explicit operator
+    // `restart()` (callers reaching for a fresh ICE round) so a long
+    // sequence of transient blips ultimately exhausts the cap.
+    uint32_t                              auto_restart_attempts_ = 0;
+    std::chrono::steady_clock::time_point auto_restart_last_{};
+
     // TURN
     std::shared_ptr<TurnClient> turn_;
 

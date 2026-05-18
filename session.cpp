@@ -1908,6 +1908,11 @@ void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
     state_.store(SessionState::Connected, std::memory_order_release);
     consent_missed_.store(0, std::memory_order_release);
     consent_recovery_attempts_ = 0;
+    /// Successful nomination clears the auto-restart budget — a session
+    /// that recovered after a transient outage gets a fresh attempt
+    /// allowance for the next one.
+    auto_restart_attempts_ = 0;
+    auto_restart_last_     = std::chrono::steady_clock::time_point{};
     nominated_cid_.store(cid, std::memory_order_release);
     /// Look up the cid's transport so subsequent `send()` /
     /// `on_keepalive` drives the correct carrier. The cid was opened
@@ -2032,6 +2037,38 @@ void IceSession::on_keepalive() {
             state_.store(SessionState::Checking, std::memory_order_release);
             build_check_list();
             begin_checks();
+            return;
+        }
+
+        /// Consent recovery exhausted. Before declaring Failed, give
+        /// `auto_restart_on_consent_loss` a turn: regenerate the
+        /// ufrag/pwd pair, drop pending state, and re-enter Gathering.
+        /// The backoff coalesces a burst of missed keepalives into one
+        /// restart so a single network blip does not chew through the
+        /// attempt budget.
+        if (cfg_.auto_restart_on_consent_loss &&
+            auto_restart_attempts_ <
+                static_cast<uint32_t>(cfg_.auto_restart_max_attempts)) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto since_last = now - auto_restart_last_;
+            const auto backoff = std::chrono::milliseconds(
+                cfg_.auto_restart_backoff_ms);
+            if (auto_restart_last_ == std::chrono::steady_clock::time_point{}
+                || since_last >= backoff) {
+                ++auto_restart_attempts_;
+                auto_restart_last_ = now;
+                consent_missed_.store(0, std::memory_order_release);
+                /// `restart()` schedules its body via dispatch on the
+                /// strand. We are already on the strand here (keepalive
+                /// timer handler), but `dispatch` short-circuits to a
+                /// direct call when invoked from inside the executor
+                /// so the reset still happens before we return.
+                restart();
+                return;
+            }
+            /// Inside the backoff window — silently drop this consent
+            /// loss; the in-flight restart already covers the burst.
+            consent_missed_.store(0, std::memory_order_release);
             return;
         }
 
