@@ -493,6 +493,27 @@ void IceLink::set_host_api(const host_api_t* api) noexcept {
         start_reaper();
     }
 
+    /// Linux interface-state subscription. `start()` returns false on
+    /// non-Linux platforms (no `__linux__`) or when bind fails; the
+    /// owning link silently runs without re-gather-on-flap in that
+    /// case.
+    bool want_iface_watcher = false;
+    {
+        std::lock_guard cfg_lk(cfg_mu_);
+        want_iface_watcher = cfg_.reactive_interface_change;
+    }
+    if (want_iface_watcher && !iface_watcher_) {
+        iface_watcher_ = std::make_unique<InterfaceWatcher>(
+            ioc_,
+            std::chrono::milliseconds(300),
+            [weak = std::weak_ptr<IceLink>(shared_from_this())] {
+                auto self = weak.lock();
+                if (!self) return;
+                self->on_interface_change();
+            });
+        (void)iface_watcher_->start();
+    }
+
     if (api_ != nullptr && api_->subscribe_config_reload != nullptr) {
         gn_subscription_id_t token = GN_INVALID_SUBSCRIPTION_ID;
         const auto rc = api_->subscribe_config_reload(
@@ -905,6 +926,39 @@ std::uint32_t IceLink::effective_path_mtu(
     return v != 0 ? v : mtu_.load(std::memory_order_relaxed);
 }
 
+void IceLink::on_interface_change() {
+    /// Snapshot the live sessions outside the locks to keep the
+    /// fan-out under O(N) re-entries minimal. Each session decides
+    /// internally whether to fold the change into a trickle update
+    /// (Connected) or full restart (anything else).
+    std::vector<std::shared_ptr<IceSession>> live;
+    {
+        std::lock_guard lk(sessions_mu_);
+        live.reserve(sessions_.size());
+        for (auto& [_id, e] : sessions_) {
+            if (e.session) live.push_back(e.session);
+        }
+    }
+    {
+        std::lock_guard lk(composer_mu_);
+        live.reserve(live.size() + composer_sessions_.size());
+        for (auto& [_id, e] : composer_sessions_) {
+            if (e.session) live.push_back(e.session);
+        }
+    }
+    for (auto& s : live) {
+        const auto st = s->state();
+        if (st == SessionState::New
+            || st == SessionState::Failed) continue;
+        /// Restart the FSM so a fresh gather picks up the new
+        /// interface layout. Connected sessions take a hit but the
+        /// alternative — silently using a stale host candidate set —
+        /// can leave the nominated pair routed through an interface
+        /// that has been deconfigured.
+        s->restart();
+    }
+}
+
 gn_result_t IceLink::restart_session(gn_conn_id_t conn) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_INVALID_STATE;
     std::shared_ptr<IceSession> session;
@@ -1245,6 +1299,11 @@ void IceLink::shutdown() {
     /// without an error_code overload — the call cannot fail in a way
     /// the caller can act on, so the value is discarded.
     (void)reaper_timer_.cancel();
+
+    if (iface_watcher_) {
+        iface_watcher_->stop();
+        iface_watcher_.reset();
+    }
 
     std::vector<gn_conn_id_t> ids_to_emit;
     std::vector<std::shared_ptr<IceSession>> live_sessions;

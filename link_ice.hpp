@@ -40,6 +40,7 @@
 #include <sdk/trust.h>
 #include <sdk/types.h>
 
+#include "interface_watcher.hpp"
 #include "mdns.hpp"
 #include "session.hpp"
 
@@ -341,6 +342,14 @@ private:
     /// TCP underneath transparently, so framing matches the plain
     /// TCP path.
     std::optional<gn::sdk::LinkCarrier>           carrier_tls_;
+
+    /// Linux netlink interface-state watcher. Brought up at
+    /// `set_host_api` time when `cfg_.reactive_interface_change` is
+    /// set (default true). Fires `on_interface_change` after a
+    /// debounced flap; on non-Linux the watcher quietly fails its
+    /// `start()` and stays inert.
+    std::unique_ptr<InterfaceWatcher>             iface_watcher_;
+    void on_interface_change();
 
     /// mDNS responder + resolver shared across every session.
     /// Bound lazily on the first session that needs it (i.e.

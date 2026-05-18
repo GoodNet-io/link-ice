@@ -27,6 +27,7 @@ add_library(goodnet_ice_objects OBJECT
     dns_ext_client.cpp
     mdns.cpp
     path_mtu.cpp
+    interface_watcher.cpp
 )
 target_link_libraries(goodnet_ice_objects PUBLIC
     GoodNet::sdk asio::asio Threads::Threads OpenSSL::Crypto PkgConfig::SODIUM)
