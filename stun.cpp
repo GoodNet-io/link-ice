@@ -257,6 +257,11 @@ StunBuilder& StunBuilder::add_nonce(const std::string& nonce) {
     return *this;
 }
 
+StunBuilder& StunBuilder::add_connection_id(uint32_t connection_id) {
+    add_attr_u32(TURN_ATTR_CONNECTION_ID, connection_id);
+    return *this;
+}
+
 StunBuilder& StunBuilder::add_integrity(const std::string& key) {
     // Build temporary header to compute HMAC over
     // Length includes the MESSAGE-INTEGRITY attribute (24 bytes: 4 hdr + 20 HMAC)
@@ -397,6 +402,9 @@ std::optional<StunMessage> parse_stun(std::span<const uint8_t> data) {
             break;
         case TURN_ATTR_NONCE:
             msg.nonce = std::string(reinterpret_cast<const char*>(attr_data), attr_len);
+            break;
+        case TURN_ATTR_CONNECTION_ID:
+            if (attr_len >= 4) msg.connection_id = read32(attr_data);
             break;
         case TURN_ATTR_DATA:
             msg.data.assign(attr_data, attr_data + attr_len);

@@ -61,6 +61,18 @@ constexpr uint16_t TURN_CHANNEL_BIND_ERROR    = 0x0119;
 constexpr uint8_t  REQUESTED_TRANSPORT_UDP = 17;
 constexpr uint8_t  REQUESTED_TRANSPORT_TCP = 6;
 
+/// RFC 6062 message types for TCP allocations. The Connect /
+/// ConnectionBind pair replaces ChannelBind on TCP-allocated relays;
+/// ConnectionAttempt is server-pushed when a remote peer connects
+/// to the relay.
+constexpr uint16_t TURN_CONNECT_REQUEST          = 0x000A;
+constexpr uint16_t TURN_CONNECT_RESPONSE         = 0x010A;
+constexpr uint16_t TURN_CONNECT_ERROR            = 0x011A;
+constexpr uint16_t TURN_CONNECTION_BIND_REQUEST  = 0x000B;
+constexpr uint16_t TURN_CONNECTION_BIND_RESPONSE = 0x010B;
+constexpr uint16_t TURN_CONNECTION_BIND_ERROR    = 0x011B;
+constexpr uint16_t TURN_CONNECTION_ATTEMPT_INDICATION = 0x001C;
+
 /// ChannelData per RFC 5766 §11.4 — efficient binary framing for
 /// data sent over a TURN-bound channel. First 2 bytes are the
 /// channel number (0x4000-0x7FFF); next 2 bytes are payload length;
@@ -80,6 +92,12 @@ constexpr uint16_t TURN_ATTR_XOR_RELAYED_ADDRESS  = 0x0016;
 constexpr uint16_t TURN_ATTR_REQUESTED_TRANSPORT  = 0x0019;
 constexpr uint16_t TURN_ATTR_REALM                = 0x0014;
 constexpr uint16_t TURN_ATTR_NONCE                = 0x0015;
+/// RFC 6062 §6.2: CONNECTION-ID is a 32-bit opaque server-assigned
+/// identifier returned in Connect / ConnectionAttempt and echoed by
+/// the client in ConnectionBind. The identifier is unique within an
+/// allocation and lets the client correlate a freshly opened data
+/// connection with the corresponding peer.
+constexpr uint16_t TURN_ATTR_CONNECTION_ID        = 0x002A;
 
 /// Parsed XOR-MAPPED-ADDRESS.
 struct MappedAddress {
@@ -120,6 +138,11 @@ public:
     StunBuilder& add_lifetime(uint32_t seconds);
     StunBuilder& add_realm(const std::string& realm);
     StunBuilder& add_nonce(const std::string& nonce);
+    /// RFC 6062 §6.2: CONNECTION-ID attribute (32-bit). Used in
+    /// Connect responses, ConnectionAttempt indications, and
+    /// ConnectionBind requests to link a data connection back to
+    /// the original peer pairing inside an allocation.
+    StunBuilder& add_connection_id(uint32_t connection_id);
 
     /// Add MESSAGE-INTEGRITY (HMAC-SHA1) and FINGERPRINT (CRC32).
     StunBuilder& add_integrity(const std::string& key);
@@ -163,6 +186,7 @@ struct StunMessage {
     std::optional<std::string>   username;
     std::optional<std::string>   realm;
     std::optional<std::string>   nonce;
+    std::optional<uint32_t>      connection_id;
     std::vector<uint8_t>         data;
     bool use_candidate = false;
 
