@@ -99,6 +99,13 @@ public:
     StunBuilder& add_ice_controlling(uint64_t tiebreaker);
     StunBuilder& add_ice_controlled(uint64_t tiebreaker);
     StunBuilder& add_xor_peer_address(const std::string& ip, uint16_t port);
+    /// XOR-RELAYED-ADDRESS attribute (RFC 5766 §14.5). Same XOR
+    /// encoding as XOR-PEER-ADDRESS but distinct attribute type.
+    StunBuilder& add_xor_relayed_address(const std::string& ip, uint16_t port);
+    /// ERROR-CODE attribute (RFC 5389 §15.6). @p code must be in
+    /// [300, 699]; @p reason is at most 763 bytes UTF-8.
+    StunBuilder& add_error_code(uint16_t code,
+                                  const std::string& reason);
     StunBuilder& add_channel_number(uint16_t channel);
     StunBuilder& add_data(std::span<const uint8_t> data);
     StunBuilder& add_requested_transport(uint8_t proto);

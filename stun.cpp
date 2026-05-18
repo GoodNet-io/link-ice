@@ -194,6 +194,29 @@ StunBuilder& StunBuilder::add_xor_peer_address(const std::string& ip, uint16_t p
     return *this;
 }
 
+StunBuilder& StunBuilder::add_xor_relayed_address(const std::string& ip,
+                                                    uint16_t port) {
+    auto enc = encode_xor_addr(ip, port, txn_id_);
+    add_attr(TURN_ATTR_XOR_RELAYED_ADDRESS, enc);
+    return *this;
+}
+
+StunBuilder& StunBuilder::add_error_code(uint16_t code,
+                                          const std::string& reason) {
+    /// RFC 5389 §15.6 ERROR-CODE layout: 2 bytes reserved (zero),
+    /// 1 byte class (hundreds digit), 1 byte number (modulo 100),
+    /// followed by UTF-8 reason phrase.
+    std::vector<uint8_t> buf;
+    buf.reserve(4 + reason.size());
+    buf.push_back(0);
+    buf.push_back(0);
+    buf.push_back(static_cast<uint8_t>(code / 100));
+    buf.push_back(static_cast<uint8_t>(code % 100));
+    buf.insert(buf.end(), reason.begin(), reason.end());
+    add_attr(STUN_ATTR_ERROR_CODE, buf);
+    return *this;
+}
+
 StunBuilder& StunBuilder::add_data(std::span<const uint8_t> data) {
     add_attr(TURN_ATTR_DATA, data);
     return *this;

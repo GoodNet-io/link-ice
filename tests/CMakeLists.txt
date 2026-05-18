@@ -5,6 +5,7 @@ add_executable(test_ice
     test_ice.cpp
     test_ice_composer.cpp
     test_ice_conformance.cpp
+    test_ice_multi_turn.cpp
     test_ice_turn_framing.cpp
     test_ice_dns.cpp
     test_ice_mdns.cpp)
