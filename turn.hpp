@@ -92,6 +92,34 @@ using TurnDataCallback = std::function<void(const std::string& peer_ip,
 using TurnAllocatedCallback = std::function<void(const std::string& relay_ip,
                                                   uint16_t relay_port)>;
 
+/// RFC 6062 §4.4 ConnectionAttempt indication callback. Fires when a
+/// remote peer connects to the TCP-allocated relay and the server
+/// pushes the (peer-address, connection-id) pair to the client. The
+/// TurnClient opens a fresh data carrier and ConnectionBinds it
+/// internally; the callback is purely informational for the session
+/// layer (logging / metrics).
+using TurnConnectionAttemptCallback = std::function<void(
+    const std::string& peer_ip, uint16_t peer_port,
+    std::uint32_t connection_id)>;
+
+/// RFC 6062 §4.3 data-connection bound callback. Fires once a data
+/// connection successfully completes the ConnectionBind handshake
+/// and is ready to carry raw bytes to/from @p peer_ip.
+using TurnDataConnectionCallback = std::function<void(
+    std::uint32_t connection_id,
+    gn_conn_id_t cid,
+    const std::string& peer_ip,
+    uint16_t peer_port)>;
+
+/// Carrier-factory hook supplied by the session for RFC 6062 data
+/// connections. The TurnClient asks the session to open a brand new
+/// TCP/TLS connection to the configured TURN server and returns the
+/// new conn id (or 0 on failure). The session pre-routes inbound
+/// bytes for that cid back into the TurnClient via
+/// `on_data_connection_inbound`, so the factory only owns carrier
+/// allocation + the per-cid data subscription.
+using TurnDataCarrierFactory = std::function<gn_conn_id_t()>;
+
 /// TURN client — manages allocation and relay.
 /// Owned by `IceSession` through `std::shared_ptr` so async refresh /
 /// recv closures can pin the client through `weak_from_this()` and
@@ -125,8 +153,35 @@ public:
     /// envelope ~36 bytes — meaningful saving on small payloads).
     /// Channels expire after 10 minutes per RFC; `schedule_refresh`
     /// re-binds before timeout. Idempotent — second call for the
-    /// same peer returns the existing channel.
+    /// same peer returns the existing channel. No-op when the
+    /// allocation is TCP (RFC 6062 §4.3 forbids CHANNEL-BIND on
+    /// TCP allocations); use `connect_to_peer` instead.
     void bind_channel(const std::string& peer_ip, uint16_t peer_port);
+
+    /// RFC 6062 §4.3: client-initiated peer connection on a TCP
+    /// allocation. Sends a Connect request carrying XOR-PEER-ADDRESS
+    /// to the server; the server attempts a TCP handshake to the
+    /// peer and replies with Connect-Response carrying CONNECTION-ID.
+    /// On success the TurnClient opens a fresh data carrier and
+    /// emits the data-connection callback once ConnectionBind
+    /// completes. No-op when the allocation is UDP.
+    void connect_to_peer(const std::string& peer_ip, uint16_t peer_port);
+
+    /// Wire the RFC 6062 callbacks + data carrier factory. The
+    /// factory is consulted on ConnectionAttempt indications and on
+    /// successful Connect responses; it must return a fresh TCP
+    /// carrier conn id and pre-route inbound bytes for that cid
+    /// back into `on_data_connection_inbound`.
+    void set_connection_attempt_callback(TurnConnectionAttemptCallback cb);
+    void set_data_connection_callback(TurnDataConnectionCallback cb);
+    void set_data_carrier_factory(TurnDataCarrierFactory factory);
+
+    /// RFC 6062 §4.5: feed inbound bytes received on a data carrier
+    /// back into the TurnClient. Until ConnectionBind completes the
+    /// bytes are STUN responses (parsed here); after the handshake
+    /// they are raw peer payload surfaced through the data callback.
+    void on_data_connection_inbound(gn_conn_id_t cid,
+                                      std::span<const std::uint8_t> bytes);
 
     /// Refresh allocation lifetime.
     void refresh();
@@ -212,7 +267,50 @@ private:
     /// when `cfg_.tcp_transport == false`.
     std::vector<uint8_t> rx_buffer_;
 
+    // ── RFC 6062 TCP-allocation state ──────────────────────────────
+    TurnConnectionAttemptCallback   conn_attempt_cb_;
+    TurnDataConnectionCallback      data_conn_cb_;
+    TurnDataCarrierFactory          data_carrier_factory_;
+    /// In-flight Connect requests keyed by transaction id. Connect
+    /// responses (RFC 6062 §4.4) carry CONNECTION-ID but not the
+    /// peer address; we re-pair via the txn id remembered at send.
+    struct PendingConnect {
+        std::string peer_ip;
+        uint16_t    peer_port;
+    };
+    std::unordered_map<std::string, PendingConnect> pending_connects_;
+    /// Pending ConnectionBind state for freshly opened data carrier
+    /// cids. Cleared once the BindResponse lands.
+    struct PendingBind {
+        std::uint32_t connection_id;
+        std::string   peer_ip;
+        uint16_t      peer_port;
+    };
+    std::unordered_map<gn_conn_id_t, PendingBind> pending_binds_;
+    /// Per-data-connection pre-bind STUN rx buffers. Each data
+    /// carrier delivers length-prefixed STUN responses until the
+    /// ConnectionBind handshake completes, after which the carrier
+    /// transitions to raw bytes and the buffer is dropped.
+    std::unordered_map<gn_conn_id_t, std::vector<std::uint8_t>>
+        data_conn_rx_buffers_;
+    /// Connection-id → carrier conn id for bound data connections.
+    std::unordered_map<std::uint32_t, gn_conn_id_t> data_connections_;
+    /// Bound carrier cid → (peer ip, peer port). Reverse lookup for
+    /// surfacing the source address on inbound raw bytes.
+    std::unordered_map<gn_conn_id_t,
+                         std::pair<std::string, uint16_t>>
+        bound_peers_;
+
     void send_to_server(std::span<const std::uint8_t> bytes) noexcept;
+    void open_data_connection(std::uint32_t connection_id,
+                                const std::string& peer_ip,
+                                uint16_t peer_port);
+    void send_framed_on_data_cid(gn_conn_id_t cid,
+                                   std::span<const std::uint8_t> bytes);
+    void dispatch_data_conn_message(gn_conn_id_t cid,
+                                      std::span<const std::uint8_t> bytes);
+    void handle_connection_attempt(const StunMessage& msg);
+    void handle_connect_response(const StunMessage& msg);
     /// Dispatch a single STUN message — shared between the UDP path
     /// (one datagram = one message) and the stream-framing path (one
     /// reassembled frame = one message). Centralising the dispatch

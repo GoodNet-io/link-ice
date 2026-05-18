@@ -181,6 +181,10 @@ void TurnClient::dispatch_inbound_message(std::span<const std::uint8_t> bytes) {
         /// turns out unusable. Real-world bind failures are rare
         /// (channel space exhaustion or stale nonce); v1 trades
         /// strict bookkeeping for simpler code.
+    } else if (parsed->msg_type == TURN_CONNECTION_ATTEMPT_INDICATION) {
+        handle_connection_attempt(*parsed);
+    } else if (parsed->msg_type == TURN_CONNECT_RESPONSE) {
+        handle_connect_response(*parsed);
     }
 }
 
@@ -248,6 +252,11 @@ void TurnClient::send_indication(const std::string& peer_ip, uint16_t peer_port,
 
 void TurnClient::bind_channel(const std::string& peer_ip,
                                 uint16_t peer_port) {
+    /// RFC 6062 §4.3: CHANNEL-BIND is not used on TCP allocations.
+    /// Drop the call before any state mutates so the session layer
+    /// can call bind_channel unconditionally on every peer without
+    /// special-casing the transport.
+    if (cfg_.requested_transport == REQUESTED_TRANSPORT_TCP) return;
     const auto key = peer_ip + ":" + std::to_string(peer_port);
     uint16_t channel = 0;
     {
@@ -340,6 +349,199 @@ void TurnClient::schedule_refresh() {
 
 MappedAddress TurnClient::relayed_address() const {
     return relayed_;
+}
+
+// ── RFC 6062 TCP-allocation data flow ──────────────────────────────
+
+void TurnClient::set_connection_attempt_callback(
+    TurnConnectionAttemptCallback cb) {
+    conn_attempt_cb_ = std::move(cb);
+}
+
+void TurnClient::set_data_connection_callback(
+    TurnDataConnectionCallback cb) {
+    data_conn_cb_ = std::move(cb);
+}
+
+void TurnClient::set_data_carrier_factory(TurnDataCarrierFactory factory) {
+    data_carrier_factory_ = std::move(factory);
+}
+
+void TurnClient::connect_to_peer(const std::string& peer_ip,
+                                   uint16_t peer_port) {
+    /// Connect is only legal on TCP allocations. The session layer
+    /// guards the caller side; this gate keeps a misconfigured call
+    /// from putting a stray Connect request on the wire.
+    if (cfg_.requested_transport != REQUESTED_TRANSPORT_TCP) return;
+
+    /// Build the Connect request first so we have its transaction
+    /// id to key the pending-connect map. The server reply (RFC
+    /// 6062 §4.4) only carries CONNECTION-ID; the peer address is
+    /// re-paired from the txn id on this side.
+    StunBuilder b(TURN_CONNECT_REQUEST);
+    b.add_xor_peer_address(peer_ip, peer_port);
+    if (!realm_.empty()) {
+        b.add_username(cfg_.username)
+         .add_realm(realm_)
+         .add_nonce(nonce_)
+         .add_integrity(auth_key_)
+         .add_fingerprint();
+    }
+    auto msg = b.build();
+
+    /// Bytes 8..20 of the STUN header carry the 12-byte txn id.
+    /// Pull them out without re-parsing — the layout is fixed.
+    std::string txn_key;
+    if (msg.size() >= 20) {
+        txn_key.assign(reinterpret_cast<const char*>(msg.data() + 8), 12);
+    }
+    {
+        std::lock_guard lk(mu_);
+        pending_connects_[txn_key] = {peer_ip, peer_port};
+    }
+    send_to_server(msg);
+}
+
+void TurnClient::handle_connect_response(const StunMessage& msg) {
+    if (!msg.connection_id) return;
+    PendingConnect pc{};
+    {
+        std::lock_guard lk(mu_);
+        std::string key(reinterpret_cast<const char*>(msg.txn_id.data()), 12);
+        auto it = pending_connects_.find(key);
+        if (it == pending_connects_.end()) return;
+        pc = it->second;
+        pending_connects_.erase(it);
+    }
+    open_data_connection(*msg.connection_id, pc.peer_ip, pc.peer_port);
+}
+
+void TurnClient::handle_connection_attempt(const StunMessage& msg) {
+    /// RFC 6062 §4.4: server-pushed indication that a remote peer
+    /// has connected to the relay. The client opens a fresh TCP
+    /// data carrier to the TURN server and binds it to the
+    /// announced CONNECTION-ID. The peer address is informational
+    /// for the session-side callback — the server already has the
+    /// connection state.
+    if (!msg.connection_id || !msg.xor_peer) return;
+    const auto cid = *msg.connection_id;
+    const auto& peer = *msg.xor_peer;
+    if (conn_attempt_cb_) {
+        conn_attempt_cb_(peer.ip, peer.port, cid);
+    }
+    open_data_connection(cid, peer.ip, peer.port);
+}
+
+void TurnClient::open_data_connection(std::uint32_t connection_id,
+                                         const std::string& peer_ip,
+                                         uint16_t peer_port) {
+    if (!data_carrier_factory_) return;
+    /// Session-side factory opens the TCP carrier conn AND
+    /// registers a per-cid inbound subscription that funnels bytes
+    /// back through `on_data_connection_inbound`. Returning the cid
+    /// hands ownership of the lifetime back here.
+    gn_conn_id_t cid = data_carrier_factory_();
+    if (cid == 0) return;
+
+    {
+        std::lock_guard lk(mu_);
+        pending_binds_[cid] = {connection_id, peer_ip, peer_port};
+    }
+
+    /// Send ConnectionBind on the new data carrier. After success
+    /// the carrier transitions to raw byte-stream mode and STUN
+    /// framing no longer applies on its inbound stream.
+    StunBuilder b(TURN_CONNECTION_BIND_REQUEST);
+    b.add_connection_id(connection_id);
+    if (!realm_.empty()) {
+        b.add_username(cfg_.username)
+         .add_realm(realm_)
+         .add_nonce(nonce_)
+         .add_integrity(auth_key_)
+         .add_fingerprint();
+    }
+    auto bind_msg = b.build();
+    send_framed_on_data_cid(cid, bind_msg);
+}
+
+void TurnClient::send_framed_on_data_cid(
+    gn_conn_id_t cid, std::span<const std::uint8_t> bytes) {
+    if (!carrier_ || cid == 0) return;
+    /// Data connections always ride TCP (RFC 6062), so STUN
+    /// framing applies — same length-prefix as the control channel.
+    std::vector<std::uint8_t> framed;
+    if (encode_stream_frame(bytes, framed)) {
+        (void)carrier_->send(cid, framed);
+    }
+}
+
+void TurnClient::on_data_connection_inbound(
+    gn_conn_id_t cid, std::span<const std::uint8_t> bytes) {
+    /// Determine whether the data connection is still in the
+    /// ConnectionBind handshake (length-prefixed STUN) or already
+    /// transitioned to raw bytes. A bound entry in `bound_peers_`
+    /// indicates the latter.
+    std::string peer_ip;
+    uint16_t    peer_port = 0;
+    bool bound = false;
+    {
+        std::lock_guard lk(mu_);
+        auto it = bound_peers_.find(cid);
+        if (it != bound_peers_.end()) {
+            bound = true;
+            peer_ip   = it->second.first;
+            peer_port = it->second.second;
+        }
+    }
+    if (bound) {
+        if (data_cb_) {
+            data_cb_(peer_ip, peer_port, bytes);
+        }
+        return;
+    }
+
+    /// Pre-bind state: STUN-framed response stream. Accumulate
+    /// arbitrary chunks until a complete length-prefixed envelope
+    /// is reassembled.
+    auto& buf = data_conn_rx_buffers_[cid];
+    buf.insert(buf.end(), bytes.begin(), bytes.end());
+    std::vector<std::uint8_t> frame;
+    while (try_take_stream_frame(buf, frame)) {
+        dispatch_data_conn_message(cid, frame);
+    }
+}
+
+void TurnClient::dispatch_data_conn_message(
+    gn_conn_id_t cid, std::span<const std::uint8_t> bytes) {
+    auto parsed = parse_stun(bytes);
+    if (!parsed) return;
+    if (parsed->msg_type == TURN_CONNECTION_BIND_RESPONSE) {
+        PendingBind pb{};
+        bool have_pending = false;
+        {
+            std::lock_guard lk(mu_);
+            auto it = pending_binds_.find(cid);
+            if (it != pending_binds_.end()) {
+                pb = it->second;
+                pending_binds_.erase(it);
+                data_connections_[pb.connection_id] = cid;
+                bound_peers_[cid] = {pb.peer_ip, pb.peer_port};
+                data_conn_rx_buffers_.erase(cid);
+                have_pending = true;
+            }
+        }
+        if (have_pending && data_conn_cb_) {
+            data_conn_cb_(pb.connection_id, cid, pb.peer_ip, pb.peer_port);
+        }
+        return;
+    }
+    if (parsed->msg_type == TURN_CONNECTION_BIND_ERROR) {
+        /// Bind failed — drop the pending entry. The carrier conn
+        /// is left to the session-side factory caller to tear down.
+        std::lock_guard lk(mu_);
+        pending_binds_.erase(cid);
+        data_conn_rx_buffers_.erase(cid);
+    }
 }
 
 } // namespace gn::link::ice
