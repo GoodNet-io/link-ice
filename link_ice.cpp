@@ -353,6 +353,20 @@ void IceLink::apply_config() noexcept {
         const bool b = (v != 0);
         apply_to_all_turns([&](TurnConfig& t) { t.tcp_transport = b; });
     }
+    /// draft-ietf-mmusic-mdns-ice-candidates host-candidate
+    /// obfuscation. Off by default: browsers turning this on broke
+    /// existing media-server integrations, so operators must opt
+    /// in. When `true`, the session emits a single
+    /// `<uuid>.local` candidate per gather and registers the name
+    /// with the link-shared mDNS responder.
+    if (gn_config_get_int64(api_, "ice.mdns_obfuscate_host_candidates",
+                              &v) == GN_OK) {
+        cfg.mdns_obfuscate_host_candidates = (v != 0);
+    }
+    if (gn_config_get_int64(api_, "ice.mdns_resolve_timeout_ms", &v) == GN_OK
+        && v > 0 && v < 60000) {
+        cfg.mdns_resolve_timeout_ms = static_cast<int>(v);
+    }
     /// TURN-over-TLS (RFC 5389 §7.2.2, `turns://` scheme). When
     /// enabled the session resolves `gn.link.tls` for the TURN
     /// server endpoint; framing is the same length-prefixed STUN
@@ -442,6 +456,23 @@ gn_link_caps_t IceLink::capabilities() noexcept {
     c.flags       = GN_LINK_CAP_DATAGRAM;
     c.max_payload = kDefaultMtu;
     return c;
+}
+
+std::shared_ptr<MdnsManager> IceLink::ensure_mdns_manager() {
+    /// Single mDNS manager per IceLink — multicast 5353 is a shared
+    /// resource and we don't want N sessions racing on its bind. The
+    /// manager is built lazily so deployments that never enable
+    /// `mdns_obfuscate_host_candidates` AND never receive a HostMdns
+    /// candidate pay no cost. On bind failure (port collision with
+    /// system mDNSResponder / Avahi without REUSEPORT) the manager
+    /// instance is still returned: the responder side is a no-op but
+    /// the resolver still issues outbound queries through the same
+    /// socket fall-back path.
+    if (mdns_) return mdns_;
+    auto m = std::make_shared<MdnsManager>(ioc_);
+    (void)m->start();
+    mdns_ = std::move(m);
+    return mdns_;
 }
 
 bool IceLink::parse_peer_pk_hex(std::string_view hex,
@@ -650,9 +681,16 @@ gn_result_t IceLink::connect(std::string_view uri) {
             carrier_tcp_.has_value() ? &*carrier_tcp_ : nullptr;
         gn::sdk::LinkCarrier* carrier_tls_ptr =
             carrier_tls_.has_value() ? &*carrier_tls_ : nullptr;
+        /// Hand every session a shared mDNS manager. The responder
+        /// side only fires when `mdns_obfuscate_host_candidates`
+        /// brings up local HostMdns candidates; the resolver side
+        /// is always-on so a peer's HostMdns candidate is
+        /// resolvable regardless of our own obfuscation setting.
+        auto mdns_snap = ensure_mdns_manager();
         auto session = std::make_shared<IceSession>(
             ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
-            /*controlling=*/true, make_callbacks(conn));
+            /*controlling=*/true, make_callbacks(conn),
+            std::move(mdns_snap));
         sessions_[conn] = {conn, session, peer_hex};
         peer_to_id_[peer_hex] = conn;
         published_ids_.push_back(conn);
@@ -851,10 +889,15 @@ gn_result_t IceLink::deliver_signal(
                     carrier_tcp_.has_value() ? &*carrier_tcp_ : nullptr;
                 gn::sdk::LinkCarrier* carrier_tls_ptr =
                     carrier_tls_.has_value() ? &*carrier_tls_ : nullptr;
+                std::shared_ptr<MdnsManager> mdns_snap;
+                if (cfg_snap.mdns_obfuscate_host_candidates) {
+                    mdns_snap = ensure_mdns_manager();
+                }
                 session = std::make_shared<IceSession>(
                     ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
                     /*controlling=*/false,
-                    make_callbacks(conn));
+                    make_callbacks(conn),
+                    std::move(mdns_snap));
                 sessions_[conn] = {conn, session, peer_hex};
                 peer_to_id_[peer_hex] = conn;
                 published_ids_.push_back(conn);
@@ -1004,10 +1047,17 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
             carrier_tcp_.has_value() ? &*carrier_tcp_ : nullptr;
         gn::sdk::LinkCarrier* carrier_tls_ptr =
             carrier_tls_.has_value() ? &*carrier_tls_ : nullptr;
+        /// Hand every session a shared mDNS manager. The responder
+        /// side only fires when `mdns_obfuscate_host_candidates`
+        /// brings up local HostMdns candidates; the resolver side
+        /// is always-on so a peer's HostMdns candidate is
+        /// resolvable regardless of our own obfuscation setting.
+        auto mdns_snap = ensure_mdns_manager();
         session = std::make_shared<IceSession>(
             ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
             /*controlling=*/true,
-            make_composer_callbacks(cid, canonical));
+            make_composer_callbacks(cid, canonical),
+            std::move(mdns_snap));
 
         ComposerEntry entry{};
         entry.session       = session;

@@ -72,7 +72,8 @@ IceSession::IceSession(asio::io_context& io,
                          gn::sdk::LinkCarrier* carrier_tls,
                          const IceConfig& cfg,
                          const std::string& peer_id, bool controlling,
-                         IceSessionCallbacks callbacks)
+                         IceSessionCallbacks callbacks,
+                         std::shared_ptr<MdnsManager> mdns)
     : io_(io), strand_(asio::make_strand(io.get_executor())),
       carrier_(carrier), carrier_tcp_(carrier_tcp),
       carrier_tls_(carrier_tls), cfg_(cfg),
@@ -81,6 +82,7 @@ IceSession::IceSession(asio::io_context& io,
       check_timer_(strand_),
       gather_timer_(strand_),
       keepalive_timer_(strand_),
+      mdns_(std::move(mdns)),
       last_activity_(std::chrono::steady_clock::now()) {
     local_ufrag_ = generate_ufrag();
     local_pwd_   = generate_pwd();
@@ -101,6 +103,10 @@ IceSession::~IceSession() {
     keepalive_timer_.cancel();
     gather_timer_.cancel();
     if (turn_) turn_->close();
+    if (mdns_ && !mdns_local_hostname_.empty()) {
+        mdns_->unregister_name(mdns_local_hostname_);
+        mdns_local_hostname_.clear();
+    }
     if (carrier_) {
         for (auto& [cid, _ep] : cid_to_endpoint_) {
             (void)carrier_->unsubscribe_data(cid);
@@ -146,6 +152,13 @@ void IceSession::set_remote(const std::string& ufrag, const std::string& pwd,
             begin_checks();
         }
     }
+
+    /// Kick off mDNS resolution for any HostMdns entries the peer
+    /// advertised. Resolutions complete asynchronously and fold
+    /// resolved IPs back into the check list via the callback path
+    /// in `resolve_remote_mdns_candidates`. The pairs built above
+    /// against the non-HostMdns subset start checking immediately.
+    resolve_remote_mdns_candidates();
 }
 
 void IceSession::send(std::span<const uint8_t> data) {
@@ -266,6 +279,11 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
             self->current_check_ = 0;
             self->run_next_check();
         }
+
+        /// Trickle batches may carry fresh HostMdns entries — resolve
+        /// them after the immediate build_check_list so non-mDNS
+        /// pairs start probing without waiting on resolver latency.
+        self->resolve_remote_mdns_candidates();
     });
 }
 
@@ -285,6 +303,15 @@ void IceSession::restart() {
 
         self->local_ufrag_ = IceSession::generate_ufrag();
         self->local_pwd_   = IceSession::generate_pwd();
+
+        /// Drop the previous mDNS registration so the post-restart
+        /// gather can mint a fresh `<uuid>.local` per the draft.
+        /// The new gather phase calls `register_name` again under
+        /// `gather_host_candidates`.
+        if (self->mdns_ && !self->mdns_local_hostname_.empty()) {
+            self->mdns_->unregister_name(self->mdns_local_hostname_);
+            self->mdns_local_hostname_.clear();
+        }
 
         self->local_candidates_.clear();
         self->remote_candidates_.clear();
@@ -337,6 +364,10 @@ void IceSession::close() {
         self->keepalive_timer_.cancel();
         self->gather_timer_.cancel();
         if (self->turn_) self->turn_->close();
+        if (self->mdns_ && !self->mdns_local_hostname_.empty()) {
+            self->mdns_->unregister_name(self->mdns_local_hostname_);
+            self->mdns_local_hostname_.clear();
+        }
         if (self->carrier_) {
             for (auto& [cid, _ep] : self->cid_to_endpoint_) {
                 (void)self->carrier_->unsubscribe_data(cid);
@@ -364,6 +395,39 @@ void IceSession::gather_host_candidates() {
         carrier_initialized_ = true;
     }
     if (local_port_ == 0) return;
+
+    /// draft-ietf-mmusic-mdns-ice-candidates §3.1: when host
+    /// obfuscation is enabled, the link advertises a SINGLE
+    /// `<uuid>.local` per session (the IP family on the wire is
+    /// IPv4 by convention — peers don't try to match on family for
+    /// HostMdns candidates, the resolver fans out to whatever A /
+    /// AAAA records the responder returns). The mDNS manager
+    /// records the name → local-IP mapping; remote peers query for
+    /// the name and discover the IP only if they're on the same
+    /// LAN segment.
+    const bool obfuscate = cfg_.mdns_obfuscate_host_candidates
+                            && mdns_ != nullptr;
+    if (obfuscate) {
+        mdns_local_hostname_ = generate_uuid_v4() + ".local";
+        mdns_->register_name(mdns_local_hostname_);
+
+        Candidate c{};
+        c.type     = CandidateType::HostMdns;
+        c.family   = AddressFamily::IPv4;
+        c.port     = local_port_;
+        c.priority = compute_priority(CandidateType::HostMdns, 65535, 1);
+        c.hostname = mdns_local_hostname_;
+        if (candidate_allowed(CandidateType::Host, c.family,
+                               cfg_.candidate_filter_flags)) {
+            local_candidates_.push_back(c);
+        }
+        /// Skip raw-IP host candidates: the whole point of mDNS
+        /// obfuscation is to NOT leak interior addresses. The IPv4
+        /// HostMdns above stands in for the entire host candidate
+        /// set; the resolver on the peer side discovers v4 + v6 via
+        /// the responder's A / AAAA records.
+        return;
+    }
 
     struct ifaddrs* iflist = nullptr;
     if (getifaddrs(&iflist) != 0) return;
@@ -399,6 +463,125 @@ void IceSession::gather_host_candidates() {
         }
     }
     freeifaddrs(iflist);
+}
+
+void IceSession::resolve_remote_mdns_candidates() {
+    /// Walk the remote set for HostMdns entries that still hold an
+    /// unresolved hostname (`!c.hostname.empty()` && IP all zeroes).
+    /// Each gets a one-shot mDNS query through the shared manager;
+    /// the resolver callback dispatches back onto this strand,
+    /// rewrites the entry in place with the resolved IP, and rebuilds
+    /// the check list so the new pair joins the queue.
+    if (!mdns_) return;
+    /// Snapshot indices to avoid mutating remote_candidates_ during
+    /// iteration; resolution callbacks land on the strand later and
+    /// mutate the vector then.
+    std::vector<std::pair<std::size_t, std::string>> queue;
+    for (std::size_t i = 0; i < remote_candidates_.size(); ++i) {
+        const auto& c = remote_candidates_[i];
+        if (c.type != CandidateType::HostMdns) continue;
+        if (c.hostname.empty()) continue;
+        if (!is_mdns_local_name(c.hostname)) continue;
+        queue.emplace_back(i, c.hostname);
+    }
+    if (queue.empty()) return;
+
+    const auto timeout = std::chrono::milliseconds(
+        cfg_.mdns_resolve_timeout_ms > 0
+            ? cfg_.mdns_resolve_timeout_ms : 5000);
+
+    for (auto& [idx, hostname] : queue) {
+        auto weak_self = std::weak_ptr<IceSession>(shared_from_this());
+        /// The resolver invokes the callback on its own strand. Hop
+        /// back to ours before touching `remote_candidates_`.
+        mdns_->resolve(hostname, timeout,
+            [weak_self, idx, hostname](const MdnsResolveResult& r) {
+                auto self = weak_self.lock();
+                if (!self) return;
+                asio::post(self->strand_,
+                    [self, idx, hostname, r] {
+                        if (self->state_.load(std::memory_order_acquire)
+                            == SessionState::Failed) return;
+                        if (idx >= self->remote_candidates_.size()) return;
+                        auto& slot = self->remote_candidates_[idx];
+                        if (slot.type != CandidateType::HostMdns) return;
+                        if (slot.hostname != hostname) return;
+
+                        if (!r.resolved
+                            || (r.ipv4.empty() && r.ipv6.empty())) {
+                            /// Drop the unresolved entry. Erasing
+                            /// shifts subsequent indices but every
+                            /// queued callback captures its own
+                            /// `idx`; since we used the index AT
+                            /// THE TIME the query was issued and
+                            /// the vector may have been mutated by
+                            /// earlier callbacks, we identify the
+                            /// slot by (idx, hostname) and bail if
+                            /// either no longer matches.
+                            slot.hostname.clear();
+                            slot.type = CandidateType::Host;
+                            return;
+                        }
+                        /// Rewrite the slot with the first resolved
+                        /// IPv4; append any additional A / AAAA
+                        /// records as separate Host candidates so
+                        /// every reachable interface gets a pair.
+                        auto first_ipv4 =
+                            !r.ipv4.empty() ? r.ipv4.front() : std::string{};
+                        auto first_ipv6 =
+                            !r.ipv6.empty() ? r.ipv6.front() : std::string{};
+                        slot.type = CandidateType::Host;
+                        slot.hostname.clear();
+                        if (!first_ipv4.empty()) {
+                            slot.set_address(first_ipv4);
+                        } else {
+                            slot.set_address(first_ipv6);
+                        }
+                        slot.priority = compute_priority(
+                            CandidateType::Host, 65535, 1);
+
+                        auto append_extra =
+                            [&](const std::string& ip,
+                                AddressFamily fam) {
+                            (void)fam;
+                            Candidate extra{};
+                            extra.type     = CandidateType::Host;
+                            extra.port     = slot.port;
+                            extra.priority = compute_priority(
+                                CandidateType::Host, 65535, 1);
+                            extra.set_address(ip);
+                            self->remote_candidates_.push_back(extra);
+                        };
+                        for (std::size_t k = 1; k < r.ipv4.size(); ++k) {
+                            append_extra(r.ipv4[k], AddressFamily::IPv4);
+                        }
+                        for (std::size_t k = (first_ipv4.empty() ? 1 : 0);
+                              k < r.ipv6.size(); ++k) {
+                            append_extra(r.ipv6[k], AddressFamily::IPv6);
+                        }
+
+                        /// Fold the freshly-resolved candidate(s)
+                        /// into the check list and kick off checks
+                        /// if we were waiting on this.
+                        const auto st = self->state_.load(
+                            std::memory_order_acquire);
+                        if (st == SessionState::WaitingRemote
+                            || st == SessionState::Gathering) {
+                            if (!self->local_candidates_.empty()) {
+                                self->state_.store(
+                                    SessionState::Checking,
+                                    std::memory_order_release);
+                                self->build_check_list();
+                                self->begin_checks();
+                            }
+                        } else if (st == SessionState::Checking) {
+                            self->build_check_list();
+                            self->current_check_ = 0;
+                            self->run_next_check();
+                        }
+                    });
+            });
+    }
 }
 
 gn_conn_id_t IceSession::ensure_remote_cid(const std::string& ip,
@@ -664,7 +847,24 @@ void IceSession::on_gathering_complete() {
 void IceSession::build_check_list() {
     check_list_.clear();
     for (auto& local : local_candidates_) {
+        /// Local HostMdns candidates carry only a hostname; the
+        /// matching `local_port_` + interface IPs live in the mDNS
+        /// responder's registration. For pair construction we use
+        /// the actual interface IPs by skipping the HostMdns entry
+        /// — the peer's check will arrive at our UDP carrier on
+        /// whichever interface answers their mDNS query, and the
+        /// triggered-check path mints a Prflx pair from the source
+        /// endpoint anyway.
+        if (local.type == CandidateType::HostMdns) continue;
         for (auto& remote : remote_candidates_) {
+            /// Remote HostMdns entries with an unresolved hostname
+            /// have no usable IP yet; the resolver callback rewrites
+            /// the slot and calls `build_check_list` again so the
+            /// pair lands here in the resolved form.
+            if (remote.type == CandidateType::HostMdns
+                && !remote.hostname.empty()) {
+                continue;
+            }
             if (local.family != remote.family) continue;
             CheckPair pair;
             pair.local = local;
@@ -1098,6 +1298,16 @@ void IceSession::on_keepalive() {
 // ── Candidate address helpers ───────────────────────────────────────────────
 
 std::string Candidate::address_str() const {
+    /// HostMdns candidates carry the `.local` name as their
+    /// human-readable identifier until the resolver fills in the IP.
+    /// Returning the hostname keeps logs / dedup keys
+    /// (`endpoint_key`) stable across the unresolved → resolved
+    /// transition: a deduplication key built from an empty-IP
+    /// candidate would collapse multiple distinct names down to
+    /// `0.0.0.0:<port>`.
+    if (type == CandidateType::HostMdns && !hostname.empty()) {
+        return hostname;
+    }
     if (family == AddressFamily::IPv4) {
         struct in_addr in;
         std::memcpy(&in, addr.data(), 4);

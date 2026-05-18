@@ -50,6 +50,8 @@ every bundled `.so` from there.
 | `ice.check_interval_ms` | int64 | `50` | per-pair check pacing |
 | `ice.aggressive_nomination` | bool | `false` | RFC 8445 §8.1.1 — fastest-possible nomination at the cost of pair churn |
 | `ice.path_mtu` | int64 | `1200` | RFC 8085 datagram size budget; bypass discovery when set |
+| `ice.mdns_obfuscate_host_candidates` | bool | `false` | draft-ietf-mmusic-mdns-ice-candidates — replace raw host IPs with `<uuid>.local` registered on multicast 224.0.0.251 / FF02::FB |
+| `ice.mdns_resolve_timeout_ms` | int64 | `5000` | how long to wait for a peer's `.local` candidate to resolve before dropping the pair |
 
 ## RFC coverage
 
@@ -64,9 +66,17 @@ every bundled `.so` from there.
 - RFC 8305 (Happy Eyeballs) — dual-family pre-fire in begin_checks
 - RFC 8085 (UDP usage) — path-MTU floor knob; RFC 8899 active
   probe discovery is planned
+- RFC 6762 (Multicast DNS) — minimal A/AAAA responder + resolver
+  used by mDNS host-candidate obfuscation
+- draft-ietf-mmusic-mdns-ice-candidates — `<uuid>.local` host
+  candidate variant; gated on `ice.mdns_obfuscate_host_candidates`
 
 ## Contract
 
 - Kernel-side link contract: `docs/contracts/link.en.md`
 - ICE wire candidates: `candidate.hpp::CandidateWire` (24 bytes)
   and `IceSignalData` (44 bytes). Stable for interop with bridges.
+  Signals that include `HostMdns` candidates carry an optional
+  trailer (`uint32` count + length-prefixed hostnames) after the
+  fixed-size candidate array. Signals without any HostMdns
+  candidate are byte-identical to the pre-mDNS form.

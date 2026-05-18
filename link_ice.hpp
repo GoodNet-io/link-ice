@@ -40,6 +40,7 @@
 #include <sdk/trust.h>
 #include <sdk/types.h>
 
+#include "mdns.hpp"
 #include "session.hpp"
 
 namespace gn::link::ice {
@@ -309,6 +310,16 @@ private:
     /// TCP underneath transparently, so framing matches the plain
     /// TCP path.
     std::optional<gn::sdk::LinkCarrier>           carrier_tls_;
+
+    /// mDNS responder + resolver shared across every session.
+    /// Bound lazily on the first session that needs it (i.e.
+    /// `mdns_obfuscate_host_candidates` is true, OR a peer
+    /// advertises a HostMdns candidate that needs resolving). One
+    /// instance per plugin so the multicast socket is bound once.
+    /// nullptr until first use; multiple sessions share the
+    /// shared_ptr through the IceSession constructor.
+    std::shared_ptr<MdnsManager>                  mdns_;
+    [[nodiscard]] std::shared_ptr<MdnsManager> ensure_mdns_manager();
 
     /// Composer-side state. Lives parallel to the kernel
     /// `sessions_` map so the bit-63 id range lookup picks the right

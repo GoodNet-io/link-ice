@@ -20,10 +20,16 @@
 namespace gn::link::ice {
 
 enum class CandidateType : uint8_t {
-    Host  = 0,
-    Srflx = 1,   // Server Reflexive
-    Relay = 2,   // TURN relay
-    Prflx = 3    // Peer Reflexive (learned from check response)
+    Host     = 0,
+    Srflx    = 1,   // Server Reflexive
+    Relay    = 2,   // TURN relay
+    Prflx    = 3,   // Peer Reflexive (learned from check response)
+    /// draft-ietf-mmusic-mdns-ice-candidates §3 — host candidate
+    /// whose IP is hidden behind a multicast-DNS `.local` name.
+    /// Treated as a Host-priority candidate for pair-priority
+    /// computation; the IP is discovered by querying the
+    /// hostname over multicast 224.0.0.251 / FF02::FB.
+    HostMdns = 4
 };
 
 enum class AddressFamily : uint8_t {
@@ -31,13 +37,26 @@ enum class AddressFamily : uint8_t {
     IPv6 = 2
 };
 
-/// @brief ICE candidate (host/srflx/relay) — address + priority + foundation.
+/// Maximum on-wire length of an mDNS hostname carried by a
+/// HostMdns candidate. The draft uses RFC 4122 v4 UUIDs (36
+/// characters, lowercase hex with dashes) plus the ".local"
+/// suffix — 42 bytes total. The ceiling is generous enough to
+/// allow alternative naming schemes (random base32 etc.) without
+/// reserving an unreasonable chunk of the wire.
+inline constexpr std::size_t kMaxMdnsHostnameLen = 64;
+
+/// @brief ICE candidate (host/srflx/relay/host-mdns).
 struct Candidate {
     CandidateType  type;
     AddressFamily  family;
     uint16_t       port;
     uint32_t       priority;
     std::array<uint8_t, 16> addr{};  // IPv4 in first 4 bytes, or full IPv6
+    /// Populated only for HostMdns candidates. Non-mDNS candidates
+    /// carry an empty hostname; the address-only fields above
+    /// remain authoritative. Limited to `kMaxMdnsHostnameLen`
+    /// bytes by the wire format.
+    std::string    hostname{};
 
     std::string address_str() const;
     void set_address(const std::string& addr_str);
@@ -81,14 +100,18 @@ constexpr uint8_t ICE_SIGNAL_ANSWER = 1;
 constexpr uint8_t ICE_SIGNAL_OFFER_EOC  = 2;
 constexpr uint8_t ICE_SIGNAL_ANSWER_EOC = 3;
 
-/// Compute candidate priority per RFC 8445.
+/// Compute candidate priority per RFC 8445. HostMdns shares the
+/// host type-preference per draft-ietf-mmusic-mdns-ice-candidates
+/// §3.2: it IS a host candidate, just with the IP replaced by a
+/// `.local` hostname for privacy.
 inline uint32_t compute_priority(CandidateType type, uint16_t local_pref, uint8_t component) {
     uint32_t type_pref = 0;
     switch (type) {
-        case CandidateType::Host:  type_pref = 126; break;
-        case CandidateType::Prflx: type_pref = 110; break;
-        case CandidateType::Srflx: type_pref = 100; break;
-        case CandidateType::Relay: type_pref = 0;   break;
+        case CandidateType::Host:     type_pref = 126; break;
+        case CandidateType::HostMdns: type_pref = 126; break;
+        case CandidateType::Prflx:    type_pref = 110; break;
+        case CandidateType::Srflx:    type_pref = 100; break;
+        case CandidateType::Relay:    type_pref = 0;   break;
     }
     return (type_pref << 24) | (static_cast<uint32_t>(local_pref) << 8) |
            (256 - component);
@@ -126,6 +149,30 @@ inline Candidate from_wire(const CandidateWire& w) {
     return c;
 }
 
+/// On-wire trailer carrying `.local` hostnames for HostMdns
+/// candidates per draft-ietf-mmusic-mdns-ice-candidates.
+///
+/// The trailer is APPENDED after the fixed `CandidateWire` array
+/// only when at least one candidate in the set is of type
+/// HostMdns. A signal that carries zero HostMdns candidates is
+/// byte-identical to the legacy wire format — so older peers
+/// that predate the mDNS extension keep parsing such signals
+/// unchanged, and the wire stays backward-compatible for the
+/// common case where the operator has not enabled mDNS host
+/// obfuscation.
+///
+/// Layout (network byte order throughout):
+///   uint32_t mdns_count;          // number of hostnames in the
+///                                 // trailer; matches the count of
+///                                 // HostMdns candidates above
+///   repeat mdns_count times:
+///       uint16_t hostname_len;    // 1..kMaxMdnsHostnameLen
+///       uint8_t  hostname[hostname_len];
+///
+/// Hostnames appear in the same order as the HostMdns candidates
+/// in the candidate array — the Nth HostMdns candidate maps to
+/// the Nth hostname in the trailer. Non-HostMdns candidates
+/// occupy the same `CandidateWire` slot they always did.
 inline std::vector<uint8_t> serialize_signal(
     const char* ufrag, const char* pwd,
     const std::vector<Candidate>& candidates) {
@@ -138,12 +185,44 @@ inline std::vector<uint8_t> serialize_signal(
     std::memcpy(hdr.pwd, pwd, pwd_len);
     hdr.candidate_count = htonl(static_cast<uint32_t>(candidates.size()));
 
-    std::vector<uint8_t> out(sizeof(hdr) + candidates.size() * sizeof(CandidateWire));
-    std::memcpy(out.data(), &hdr, sizeof(hdr));
+    /// Count HostMdns candidates so we can size the trailer.
+    uint32_t mdns_count = 0;
+    size_t   trailer_bytes = 0;
+    for (const auto& c : candidates) {
+        if (c.type == CandidateType::HostMdns && !c.hostname.empty()) {
+            ++mdns_count;
+            trailer_bytes += sizeof(uint16_t)
+                + std::min<size_t>(c.hostname.size(), kMaxMdnsHostnameLen);
+        }
+    }
+    /// Backward-compat: emit zero trailer bytes when no HostMdns
+    /// candidates are present.
+    const size_t header_bytes = sizeof(hdr);
+    const size_t fixed_bytes  = candidates.size() * sizeof(CandidateWire);
+    const size_t trailer_hdr  = (mdns_count > 0) ? sizeof(uint32_t) : 0;
+    std::vector<uint8_t> out(header_bytes + fixed_bytes + trailer_hdr + trailer_bytes);
+    std::memcpy(out.data(), &hdr, header_bytes);
 
     for (size_t i = 0; i < candidates.size(); ++i) {
         auto w = to_wire(candidates[i]);
-        std::memcpy(out.data() + sizeof(hdr) + i * sizeof(w), &w, sizeof(w));
+        std::memcpy(out.data() + header_bytes + i * sizeof(w), &w, sizeof(w));
+    }
+
+    if (mdns_count > 0) {
+        size_t off = header_bytes + fixed_bytes;
+        const uint32_t mc_net = htonl(mdns_count);
+        std::memcpy(out.data() + off, &mc_net, sizeof(mc_net));
+        off += sizeof(mc_net);
+        for (const auto& c : candidates) {
+            if (c.type != CandidateType::HostMdns || c.hostname.empty()) continue;
+            const auto len = static_cast<uint16_t>(
+                std::min<size_t>(c.hostname.size(), kMaxMdnsHostnameLen));
+            const uint16_t len_net = htons(len);
+            std::memcpy(out.data() + off, &len_net, sizeof(len_net));
+            off += sizeof(len_net);
+            std::memcpy(out.data() + off, c.hostname.data(), len);
+            off += len;
+        }
     }
     return out;
 }
@@ -164,18 +243,71 @@ inline bool deserialize_signal(std::span<const uint8_t> data,
 
     if (hdr.candidate_count > MAX_ICE_CANDIDATES) return false;
 
-    // Strict equality — trailing garbage means a malformed signal, not a
-    // permissively-truncated one. The previous `<` test let an attacker
-    // pad the buffer arbitrarily.
-    size_t expected = sizeof(hdr) + hdr.candidate_count * sizeof(CandidateWire);
-    if (data.size() != expected) return false;
+    /// Strict equality on the fixed prefix used to be the whole
+    /// check. The mDNS trailer (draft-ietf-mmusic-mdns-ice-candidates)
+    /// adds optional trailing bytes when at least one candidate is
+    /// HostMdns — so the check now splits in two: the fixed prefix
+    /// must be present, and any trailing bytes must parse into
+    /// length-prefixed hostnames that match the HostMdns candidates
+    /// in order. Anything that doesn't fit that grammar is rejected
+    /// the same way trailing garbage was before.
+    const size_t fixed_size =
+        sizeof(hdr) + hdr.candidate_count * sizeof(CandidateWire);
+    if (data.size() < fixed_size) return false;
 
     candidates.resize(hdr.candidate_count);
+    uint32_t mdns_candidate_count = 0;
     for (uint32_t i = 0; i < hdr.candidate_count; ++i) {
         CandidateWire w;
         std::memcpy(&w, data.data() + sizeof(hdr) + i * sizeof(w), sizeof(w));
         candidates[i] = from_wire(w);
+        if (candidates[i].type == CandidateType::HostMdns) {
+            ++mdns_candidate_count;
+        }
     }
+
+    if (data.size() == fixed_size) {
+        /// No trailer — legacy wire form. Reject if HostMdns
+        /// candidates were advertised but no hostnames followed;
+        /// otherwise the FSM has nothing to resolve and would
+        /// silently treat them as 0.0.0.0 host pairs.
+        return mdns_candidate_count == 0;
+    }
+
+    if (mdns_candidate_count == 0) {
+        /// Trailer present but no HostMdns candidate that would
+        /// consume it. Treat as malformed.
+        return false;
+    }
+
+    size_t off = fixed_size;
+    if (off + sizeof(uint32_t) > data.size()) return false;
+    uint32_t trailer_count = 0;
+    std::memcpy(&trailer_count, data.data() + off, sizeof(trailer_count));
+    trailer_count = ntohl(trailer_count);
+    off += sizeof(trailer_count);
+    if (trailer_count != mdns_candidate_count) return false;
+
+    /// Walk hostnames in lock-step with HostMdns candidates.
+    uint32_t hn_index = 0;
+    for (uint32_t i = 0; i < hdr.candidate_count; ++i) {
+        if (candidates[i].type != CandidateType::HostMdns) continue;
+        if (off + sizeof(uint16_t) > data.size()) return false;
+        uint16_t len_net = 0;
+        std::memcpy(&len_net, data.data() + off, sizeof(len_net));
+        off += sizeof(len_net);
+        const uint16_t len = ntohs(len_net);
+        if (len == 0 || len > kMaxMdnsHostnameLen) return false;
+        if (off + len > data.size()) return false;
+        candidates[i].hostname.assign(
+            reinterpret_cast<const char*>(data.data() + off), len);
+        off += len;
+        ++hn_index;
+    }
+    /// All bytes accounted for — same strict-equality discipline as
+    /// before.
+    if (off != data.size()) return false;
+    if (hn_index != trailer_count) return false;
     return true;
 }
 

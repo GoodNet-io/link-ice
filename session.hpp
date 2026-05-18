@@ -22,6 +22,7 @@
 /// notify_connect / notify_disconnect surface coverage.
 
 #include "candidate.hpp"
+#include "mdns.hpp"
 #include "stun.hpp"
 #include "turn.hpp"
 
@@ -129,6 +130,25 @@ struct IceConfig {
     /// `kCandidateFilter*` flags above. Default 0 = no filtering;
     /// every host / srflx / relay candidate is gathered as usual.
     std::uint32_t candidate_filter_flags = 0;
+
+    /// draft-ietf-mmusic-mdns-ice-candidates host-candidate
+    /// obfuscation. When `true`, host candidates ride the wire as
+    /// `<uuid>.local` names registered with the local mDNS
+    /// responder; remote peers resolve those names via multicast
+    /// DNS to recover the IP. This prevents leaking interior
+    /// addresses to peers off the LAN. Defaults to `false` because
+    /// browsers turning this on broke existing media-server
+    /// integrations — operators that need privacy parity with
+    /// browsers flip it on; everyone else stays on raw host
+    /// candidates.
+    bool mdns_obfuscate_host_candidates = false;
+
+    /// Timeout for resolving a remote `<uuid>.local` candidate via
+    /// mDNS. The draft suggests 5 seconds for the typical case.
+    /// Bounded by `session_timeout_s` at the session level — a
+    /// resolution that exceeds the session deadline is treated as
+    /// a candidate drop.
+    int  mdns_resolve_timeout_ms = 5000;
 };
 
 /// Decide whether a candidate of `(type, family)` survives the
@@ -212,7 +232,8 @@ public:
                gn::sdk::LinkCarrier* carrier_tls,
                const IceConfig& cfg,
                const std::string& peer_id, bool controlling,
-               IceSessionCallbacks callbacks);
+               IceSessionCallbacks callbacks,
+               std::shared_ptr<MdnsManager> mdns = nullptr);
     ~IceSession();
 
     /// Start candidate gathering.
@@ -364,6 +385,20 @@ private:
     // TURN
     std::shared_ptr<TurnClient> turn_;
 
+    // mDNS responder + resolver. Borrowed from the parent `IceLink`
+    // (one instance per plugin), so multiple sessions share the
+    // same multicast socket and registered-name table. nullptr
+    // when the parent link did not bind a manager — typically
+    // because `mdns_obfuscate_host_candidates` is `false` for
+    // every session, or the platform-specific bind failed.
+    std::shared_ptr<MdnsManager> mdns_;
+
+    // Hostname registered for THIS session's host obfuscation.
+    // Empty when mDNS host candidates are disabled. Held so the
+    // session can `unregister_name` on close and avoid leaking
+    // registrations across ICE restarts.
+    std::string  mdns_local_hostname_;
+
     // Tiebreaker
     uint64_t tiebreaker_ = 0;
 
@@ -392,6 +427,18 @@ private:
     /// composer_connect → cid mapping; reuses an existing cid if the
     /// endpoint has been seen before. Returns 0 on failure. Strand-only.
     gn_conn_id_t ensure_remote_cid(const std::string& ip, uint16_t port);
+
+    /// Replace HostMdns entries in `remote_candidates_` with their
+    /// resolved IP equivalents. For each `<uuid>.local` candidate,
+    /// query the mDNS resolver, replace the entry with a regular
+    /// Host candidate using the resolved IP if successful, or drop
+    /// it if resolution times out. The replacement happens in-place
+    /// and is followed by `build_check_list` / `run_next_check` so
+    /// pairs against the resolved IPs enter the check queue. Safe
+    /// to call before the FSM has reached Checking — the resolution
+    /// completes asynchronously and the result is folded in via
+    /// `add_remote_candidates`-like logic.
+    void resolve_remote_mdns_candidates();
 
     /// RFC 8445 §7.3.1.4 triggered check. Called from
     /// `on_carrier_data` after a valid inbound BINDING_REQUEST.
