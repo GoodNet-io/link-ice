@@ -39,7 +39,7 @@ every bundled `.so` from there.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `ice.stun_servers` | array of string | `["stun.l.google.com:19302"]` | `host:port` entries; reload-friendly |
-| `ice.turn_servers` | string | `""` | single `host:port`; multi-server fallback is planned |
+| `ice.turn_servers` | string OR array of string | `""` | TURN server entries; both forms accepted. Array form walks the list in order per RFC 8445 §6.1.4 fallback semantics. Single-string form populates one entry. Credentials (`turn_username` / `turn_password`) apply globally to every entry. |
 | `ice.turn_username` | string | `""` | TURN long-term credential |
 | `ice.turn_password` | string | `""` | TURN long-term credential |
 | `ice.turn_tcp` | bool | `false` | RFC 5389 §7.2.2 TURN-over-TCP — fallback when UDP-blocked; needs `gn.link.tcp` carrier |
