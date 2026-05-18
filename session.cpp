@@ -1075,12 +1075,12 @@ std::shared_ptr<TurnClient> IceSession::build_turn_client(
                                        std::span<const std::uint8_t> bytes) {
                 auto self = weak_self.lock();
                 if (!self) return;
-                auto client = weak_client.lock();
-                if (!client) return;
+                auto cli = weak_client.lock();
+                if (!cli) return;
                 std::vector<std::uint8_t> copy(bytes.begin(), bytes.end());
                 asio::post(self->strand_,
-                    [client, copy = std::move(copy)] {
-                        client->on_inbound(copy);
+                    [cli, copy = std::move(copy)] {
+                        cli->on_inbound(copy);
                     });
             });
     }

@@ -383,7 +383,9 @@ std::optional<StunMessage> parse_stun(std::span<const uint8_t> data) {
             break;
         case STUN_ATTR_ERROR_CODE:
             if (attr_len >= 4) {
-                uint16_t code = static_cast<uint16_t>(attr_data[2]) * 100 + attr_data[3];
+                uint16_t code = static_cast<uint16_t>(
+                    static_cast<unsigned>(attr_data[2]) * 100u +
+                    static_cast<unsigned>(attr_data[3]));
                 msg.error_code = code;
             }
             break;
