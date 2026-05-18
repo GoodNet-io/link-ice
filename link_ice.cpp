@@ -432,6 +432,22 @@ void IceLink::apply_config() noexcept {
         && v > 0 && v < 600000) {
         cfg.tcp_so_timeout_ms = static_cast<int>(v);
     }
+    /// Auto-restart on consent loss — when keepalive recovery is
+    /// exhausted the FSM regenerates credentials and re-enters
+    /// Gathering instead of dying outright. Caps + backoff protect
+    /// against an unreachable peer flapping the session forever.
+    if (gn_config_get_int64(api_, "ice.auto_restart_on_consent_loss",
+                              &v) == GN_OK) {
+        cfg.auto_restart_on_consent_loss = (v != 0);
+    }
+    if (gn_config_get_int64(api_, "ice.auto_restart_max_attempts",
+                              &v) == GN_OK && v >= 0 && v <= 100) {
+        cfg.auto_restart_max_attempts = static_cast<int>(v);
+    }
+    if (gn_config_get_int64(api_, "ice.auto_restart_backoff_ms",
+                              &v) == GN_OK && v >= 0 && v < 600000) {
+        cfg.auto_restart_backoff_ms = static_cast<int>(v);
+    }
     /// RFC 8899 DPLPMTUD knobs. Defaults match the IceConfig
     /// in-class initialisers; operators can disable probing on
     /// constrained paths (`ice.pmtu_active_probing = 0`), reshape

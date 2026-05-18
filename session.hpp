@@ -233,6 +233,27 @@ struct IceConfig {
     /// kernel's SYN-SYN exchange to land. Outside the window the
     /// check is abandoned and the next pair in the list runs.
     int  tcp_so_timeout_ms = 5000;
+
+    /// Auto-restart the ICE session when consent-freshness recovery is
+    /// exhausted instead of transitioning to `Failed`. A transient
+    /// network outage (wifi flap, cellular handoff) drops keepalive
+    /// responses past `consent_max_recovery`; with this on the FSM
+    /// regenerates ufrag/pwd and re-enters Gathering, giving the peer
+    /// a chance to re-signal and recover without an app-level
+    /// reconnect. `false` preserves the strict RFC 7675 behaviour
+    /// where the session dies on consent loss.
+    bool auto_restart_on_consent_loss = true;
+    /// Upper bound on consecutive auto-restarts before the session
+    /// gives up and transitions to `Failed`. Prevents an unreachable
+    /// peer from holding the session in a restart loop indefinitely.
+    /// 0 disables auto-restart entirely (equivalent to flipping
+    /// `auto_restart_on_consent_loss` off).
+    int  auto_restart_max_attempts = 3;
+    /// Minimum gap between two consecutive auto-restarts. A second
+    /// consent-loss landing inside this window is coalesced into the
+    /// in-flight restart — the FSM does not re-enter Gathering twice
+    /// for the same network blip.
+    int  auto_restart_backoff_ms = 500;
 };
 
 /// Decide whether a candidate of `(type, family)` survives the
