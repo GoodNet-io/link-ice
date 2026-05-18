@@ -125,11 +125,11 @@ IceSession::~IceSession() {
         mdns_->unregister_name(mdns_local_hostname_);
         mdns_local_hostname_.clear();
     }
-    if (carrier_) {
-        for (auto& [cid, _ep] : cid_to_endpoint_) {
-            (void)carrier_->unsubscribe_data(cid);
-            (void)carrier_->disconnect(cid);
-        }
+    for (auto& [cid, ep] : cid_to_endpoint_) {
+        auto* c = transport_is_tcp(ep.transport) ? carrier_tcp_ : carrier_;
+        if (!c) continue;
+        (void)c->unsubscribe_data(cid);
+        (void)c->disconnect(cid);
     }
 }
 
@@ -404,14 +404,16 @@ void IceSession::restart() {
         /// IceLink's other sessions) stays bound — only the per-peer
         /// mappings are torn down so the next gather negotiates fresh
         /// composer_connect's for the new candidate set.
-        if (self->carrier_) {
-            for (auto& [cid, _ep] : self->cid_to_endpoint_) {
-                (void)self->carrier_->unsubscribe_data(cid);
-                (void)self->carrier_->disconnect(cid);
-            }
+        for (auto& [cid, ep] : self->cid_to_endpoint_) {
+            auto* c = transport_is_tcp(ep.transport)
+                ? self->carrier_tcp_ : self->carrier_;
+            if (!c) continue;
+            (void)c->unsubscribe_data(cid);
+            (void)c->disconnect(cid);
         }
         self->endpoint_to_cid_.clear();
         self->cid_to_endpoint_.clear();
+        self->tcp_rx_buffers_.clear();
         self->carrier_initialized_ = false;
         self->local_port_ = 0;
 
@@ -438,14 +440,16 @@ void IceSession::close() {
             self->mdns_->unregister_name(self->mdns_local_hostname_);
             self->mdns_local_hostname_.clear();
         }
-        if (self->carrier_) {
-            for (auto& [cid, _ep] : self->cid_to_endpoint_) {
-                (void)self->carrier_->unsubscribe_data(cid);
-                (void)self->carrier_->disconnect(cid);
-            }
+        for (auto& [cid, ep] : self->cid_to_endpoint_) {
+            auto* c = transport_is_tcp(ep.transport)
+                ? self->carrier_tcp_ : self->carrier_;
+            if (!c) continue;
+            (void)c->unsubscribe_data(cid);
+            (void)c->disconnect(cid);
         }
         self->endpoint_to_cid_.clear();
         self->cid_to_endpoint_.clear();
+        self->tcp_rx_buffers_.clear();
         self->nominated_cid_.store(0, std::memory_order_release);
     });
 }
@@ -1362,6 +1366,22 @@ void IceSession::build_check_list() {
         (stride != 0 && cfg_.symmetric_port_prediction_attempts > 0)
             ? cfg_.symmetric_port_prediction_attempts : 0;
 
+    /// RFC 6544 §5.1 pairing rule: a TCP candidate pairs only with
+    /// a TCP candidate of the COMPLEMENTARY active/passive role —
+    /// active with passive, simultaneous-open with simultaneous-open.
+    /// Two passive candidates would both wait for connect(), two
+    /// active would both initiate without an acceptor.
+    auto tcp_transport_pairs =
+        [](TransportType l, TransportType r) noexcept -> bool {
+            if (l == TransportType::TcpActive)
+                return r == TransportType::TcpPassive;
+            if (l == TransportType::TcpPassive)
+                return r == TransportType::TcpActive;
+            if (l == TransportType::TcpSimultaneousOpen)
+                return r == TransportType::TcpSimultaneousOpen;
+            return false;
+        };
+
     for (auto& local : local_candidates_) {
         /// Local HostMdns candidates carry only a hostname; the
         /// matching `local_port_` + interface IPs live in the mDNS
@@ -1382,9 +1402,18 @@ void IceSession::build_check_list() {
                 continue;
             }
             if (local.family != remote.family) continue;
+            /// Transport must agree. UDP-UDP is the default; TCP-TCP
+            /// follows the active/passive complementarity rule above.
+            const bool both_udp = local.transport == TransportType::Udp
+                                   && remote.transport == TransportType::Udp;
+            if (!both_udp
+                && !tcp_transport_pairs(local.transport, remote.transport)) {
+                continue;
+            }
             CheckPair pair;
             pair.local = local;
             pair.remote = remote;
+            pair.transport_type = local.transport;
             pair.priority = pair_priority(local.priority, remote.priority, controlling_);
             pair.txn_id = generate_txn_id();
             check_list_.push_back(pair);
@@ -1516,9 +1545,47 @@ void IceSession::send_check(CheckPair& pair) {
                       .add_fingerprint()
                       .build();
 
+    if (transport_is_tcp(pair.transport_type)) {
+        /// RFC 6544 TCP check path. Active and SO variants both
+        /// initiate `connect()`; passive locals never reach
+        /// `send_check` from our side (the peer's active end opens
+        /// the socket and our reply rides whatever cid lands in
+        /// `on_carrier_data`). SO uses `arm_tcp_so_connect` which
+        /// also arms the bounded coordination timer.
+        gn_conn_id_t cid = 0;
+        if (pair.transport_type == TransportType::TcpSimultaneousOpen) {
+            cid = arm_tcp_so_connect(pair.remote.address_str(),
+                                       pair.remote.port);
+        } else if (pair.transport_type == TransportType::TcpActive) {
+            cid = ensure_remote_tcp_cid(pair.remote.address_str(),
+                                          pair.remote.port);
+        } else {
+            /// TcpPassive — wait for the peer to initiate. The
+            /// triggered-check path handles the eventual reply via
+            /// `on_carrier_data` once the peer's connect lands.
+            return;
+        }
+        if (cid == 0 || !carrier_tcp_) return;
+        const auto framed = frame_tcp_stun(msg);
+        (void)carrier_tcp_->send(cid, framed);
+        return;
+    }
+
     auto cid = ensure_remote_cid(pair.remote.address_str(), pair.remote.port);
     if (cid == 0 || !carrier_) return;
     (void)carrier_->send(cid, msg);
+}
+
+gn_conn_id_t IceSession::arm_tcp_so_connect(const std::string& ip,
+                                                std::uint16_t port) {
+    /// RFC 6544 §6: simultaneous-open fires `connect()` toward the
+    /// peer's TCP-SO candidate within `cfg_.tcp_so_timeout_ms`. We
+    /// reuse `ensure_remote_tcp_cid` for the actual connect call;
+    /// the kernel TCP stack performs the SYN-SYN exchange on its
+    /// own once both ends issue the connect inside the window. A
+    /// failed connect yields cid 0 — the caller treats that as a
+    /// check failure and the priority queue advances.
+    return ensure_remote_tcp_cid(ip, port);
 }
 
 // ── Receive + dispatch (strand) ─────────────────────────────────────────────
@@ -1613,7 +1680,21 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
             /// Reply rides the same cid the request arrived on — that
             /// is exactly the peer's endpoint regardless of NAT
             /// rewriting between announced candidate and actual src.
-            if (carrier_) (void)carrier_->send(cid, resp);
+            /// TCP cids need the 16-bit length-prefix wrap before
+            /// the byte stream hits the wire (RFC 5389 §7.2.2).
+            TransportType cid_tx = TransportType::Udp;
+            if (auto eit = cid_to_endpoint_.find(cid);
+                eit != cid_to_endpoint_.end()) {
+                cid_tx = eit->second.transport;
+            }
+            if (transport_is_tcp(cid_tx)) {
+                if (carrier_tcp_) {
+                    const auto framed = frame_tcp_stun(resp);
+                    (void)carrier_tcp_->send(cid, framed);
+                }
+            } else {
+                if (carrier_) (void)carrier_->send(cid, resp);
+            }
 
             std::string peer_ip;
             std::uint16_t peer_port = 0;
