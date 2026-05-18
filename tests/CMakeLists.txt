@@ -8,6 +8,7 @@ add_executable(test_ice
     test_ice_multi_turn.cpp
     test_ice_pmtu.cpp
     test_ice_turn_framing.cpp
+    test_ice_turn_tcp_alloc.cpp
     test_ice_dns.cpp
     test_ice_mdns.cpp
     test_ice_lite_and_pred.cpp
