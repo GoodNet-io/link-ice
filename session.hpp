@@ -23,6 +23,7 @@
 
 #include "candidate.hpp"
 #include "mdns.hpp"
+#include "path_mtu.hpp"
 #include "stun.hpp"
 #include "turn.hpp"
 
@@ -161,6 +162,31 @@ struct IceConfig {
     /// resolution that exceeds the session deadline is treated as
     /// a candidate drop.
     int  mdns_resolve_timeout_ms = 5000;
+
+    /// Conservative path-MTU floor in bytes, propagated from
+    /// `IceLink::mtu_` (read from `ice.path_mtu`, default 1200).
+    /// Doubles as the starting `effective_mtu` when active probing
+    /// is disabled or before the first probe ACK arrives.
+    int  path_mtu = 1200;
+    /// RFC 8899 DPLPMTUD active path-MTU discovery. When `true`, the
+    /// session probes upward from `path_mtu` along `pmtu_search_steps`
+    /// once the FSM enters `Connected`. Discovered values surface
+    /// through `effective_path_mtu()` and the `gn.link.ice.path_mtu`
+    /// extension. With probing disabled the effective MTU equals the
+    /// static config value.
+    bool pmtu_active_probing = true;
+    /// Ascending ladder of candidate MTU sizes in bytes. Probe-loss
+    /// halving converges to the largest size below the lowest failing
+    /// rung. The starting `path_mtu` is the conservative floor that
+    /// the FSM does not regress below.
+    std::vector<int> pmtu_search_steps{1200, 1400, 1500, 4000, 9000};
+    /// Per-probe deadline. A probe with no matching response within
+    /// this window is treated as a loss; two consecutive losses at
+    /// the same size collapse the search per RFC 8899 §5.2.
+    int  pmtu_probe_timeout_ms = 500;
+    /// Maximum number of in-flight probes. 1 is conservative and
+    /// matches RFC 8899 §5.1.4 reference recommendation.
+    int  pmtu_probe_concurrency = 1;
 };
 
 /// Decide whether a candidate of `(type, family)` survives the
@@ -307,6 +333,15 @@ public:
     /// candidate type. Pre-nomination reads return defaults with
     /// `nominated == false`.
     NominationMetrics nomination_metrics() const noexcept;
+
+    /// Largest MTU known to ride the nominated pair end-to-end. When
+    /// `pmtu_active_probing` is on this reflects the latest probe
+    /// outcome; otherwise it returns the static configured floor.
+    /// Reads are lock-free; the value is updated on the strand after
+    /// each probe ACK/loss.
+    std::uint32_t effective_path_mtu() const noexcept {
+        return effective_mtu_.load(std::memory_order_acquire);
+    }
 
 private:
     asio::io_context& io_;
@@ -525,8 +560,32 @@ private:
     void start_keepalive();
     void on_keepalive();
 
+    /// RFC 8899 DPLPMTUD: fire the next probe queued by `pmtu_probe_`
+    /// if the FSM is in `Searching`. Arms `pmtu_probe_timer_` for
+    /// `cfg_.pmtu_probe_timeout_ms`. Stops when the probe machine
+    /// reports `SearchComplete`.
+    void start_path_mtu_probe();
+    void on_path_mtu_probe_timeout();
+
     static std::string generate_ufrag();
     static std::string generate_pwd();
+
+    /// PathMtuProbe instance — present only when active probing is
+    /// enabled by the operator. nullptr otherwise, in which case
+    /// `effective_mtu_` stays pinned at the static config floor.
+    std::unique_ptr<PathMtuProbe>   pmtu_probe_;
+    /// Most recent probe transaction id; matched on the inbound
+    /// path so a legitimate binding-response routes back into the
+    /// probe machine rather than the consent counter.
+    TransactionId                  pmtu_inflight_txn_{};
+    bool                            pmtu_inflight_       = false;
+    /// Timer covering the in-flight probe; fires
+    /// `on_path_mtu_probe_timeout` if no ACK arrives in time.
+    asio::steady_timer              pmtu_probe_timer_;
+    /// Discovered MTU surfaced through `effective_path_mtu()` and
+    /// the `gn.link.ice.path_mtu` extension. Atomic so callers can
+    /// read without entering the strand.
+    std::atomic<std::uint32_t>      effective_mtu_{0};
 };
 
 } // namespace gn::link::ice

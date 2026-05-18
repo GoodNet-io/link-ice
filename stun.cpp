@@ -296,6 +296,29 @@ StunBuilder& StunBuilder::add_fingerprint() {
     return *this;
 }
 
+StunBuilder& StunBuilder::add_padding_to(std::size_t target_total_bytes) {
+    /// Current wire size = 20-byte header + accumulated attrs.
+    const std::size_t cur = 20 + attrs_.size();
+    if (target_total_bytes <= cur) return *this;
+
+    /// One TLV slot = 4-byte header + value (rounded up to a 4-byte
+    /// boundary). Minimum extra cost is 4 bytes (header alone, zero
+    /// value); the gap between `cur` and `target_total_bytes` must be
+    /// at least 4 for any padding to fit, and the leftover after the
+    /// header is the value payload. STUN attribute lengths are
+    /// 4-byte aligned on the wire, so the achievable target is the
+    /// caller's value rounded down to the nearest multiple of 4.
+    if (target_total_bytes - cur < 4) return *this;
+    const std::size_t aligned = target_total_bytes & ~static_cast<std::size_t>(0x3);
+    if (aligned <= cur) return *this;
+    const std::size_t value_len = aligned - cur - 4;
+    /// STUN attribute length field is 16 bits — cap accordingly.
+    if (value_len > 0xFFFFu) return *this;
+    std::vector<uint8_t> filler(value_len, 0);
+    add_attr(STUN_ATTR_UNKNOWN_ATTRIBUTES, filler);
+    return *this;
+}
+
 std::vector<uint8_t> StunBuilder::build() {
     std::vector<uint8_t> msg(20 + attrs_.size());
     write16(msg.data(), msg_type_);

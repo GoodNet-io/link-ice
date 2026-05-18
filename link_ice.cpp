@@ -308,6 +308,9 @@ void IceLink::apply_config() noexcept {
         && v >= 576 && v <= 65507) {
         mtu_.store(static_cast<std::uint32_t>(v),
                     std::memory_order_relaxed);
+        cfg.path_mtu = static_cast<int>(v);
+    } else {
+        cfg.path_mtu = static_cast<int>(mtu_.load(std::memory_order_relaxed));
     }
     /// Toggle aggressive nomination (default = regular per RFC 8445).
     /// Operators that need fastest-possible nomination (single-pair

@@ -85,11 +85,18 @@ IceSession::IceSession(asio::io_context& io,
       turn_allocate_timer_(strand_),
       turn_backup_timer_(strand_),
       mdns_(std::move(mdns)),
-      last_activity_(std::chrono::steady_clock::now()) {
+      last_activity_(std::chrono::steady_clock::now()),
+      pmtu_probe_timer_(strand_) {
     local_ufrag_ = generate_ufrag();
     local_pwd_   = generate_pwd();
 
     randombytes_buf(&tiebreaker_, sizeof(tiebreaker_));
+
+    /// Seed the effective MTU with the conservative configured floor.
+    /// Active probing replaces this on the first successful ACK once
+    /// the FSM reaches `Connected`.
+    effective_mtu_.store(static_cast<std::uint32_t>(cfg_.path_mtu),
+                          std::memory_order_release);
 }
 
 IceSession::~IceSession() {
@@ -106,6 +113,7 @@ IceSession::~IceSession() {
     gather_timer_.cancel();
     turn_allocate_timer_.cancel();
     turn_backup_timer_.cancel();
+    pmtu_probe_timer_.cancel();
     if (turn_) turn_->close();
     if (turn_backup_probe_) turn_backup_probe_->close();
     if (mdns_ && !mdns_local_hostname_.empty()) {
@@ -1514,6 +1522,73 @@ void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
         callbacks_.on_connected(peer_id_, ip, port);
 
     start_keepalive();
+
+    if (cfg_.pmtu_active_probing && !pmtu_probe_) {
+        pmtu_probe_ = std::make_unique<PathMtuProbe>(
+            static_cast<std::size_t>(cfg_.path_mtu),
+            cfg_.pmtu_search_steps);
+        start_path_mtu_probe();
+    }
+}
+
+void IceSession::start_path_mtu_probe() {
+    if (!pmtu_probe_) return;
+    if (state_.load(std::memory_order_acquire) != SessionState::Connected) return;
+    if (pmtu_inflight_) return;
+
+    const auto next = pmtu_probe_->next_probe_size();
+    if (!next) {
+        effective_mtu_.store(static_cast<std::uint32_t>(pmtu_probe_->effective_mtu()),
+                              std::memory_order_release);
+        return;
+    }
+
+    auto cid = nominated_cid_.load(std::memory_order_acquire);
+    if (cid == 0 || !carrier_) return;
+
+    /// Probe payload: STUN binding request padded to the candidate
+    /// wire size with UNKNOWN-ATTRIBUTES filler. MESSAGE-INTEGRITY +
+    /// FINGERPRINT keep the response routable through the per-cid
+    /// dispatcher's integrity gate. Username is the standard ICE
+    /// `<remote-ufrag>:<local-ufrag>` form so the peer treats the
+    /// probe as an ordinary connectivity check.
+    auto txn = generate_txn_id();
+    pmtu_inflight_txn_ = txn;
+    pmtu_inflight_     = true;
+
+    StunBuilder builder(STUN_BINDING_REQUEST);
+    builder.set_txn_id(txn)
+            .add_username(remote_ufrag_ + ":" + local_ufrag_)
+            .add_priority(0);
+    if (controlling_) {
+        builder.add_ice_controlling(tiebreaker_);
+    } else {
+        builder.add_ice_controlled(tiebreaker_);
+    }
+    builder.add_padding_to(*next)
+            .add_integrity(remote_pwd_)
+            .add_fingerprint();
+    auto msg = builder.build();
+    (void)carrier_->send(cid, msg);
+
+    pmtu_probe_timer_.expires_after(
+        std::chrono::milliseconds(cfg_.pmtu_probe_timeout_ms));
+    pmtu_probe_timer_.async_wait(asio::bind_executor(strand_,
+        [this, self = shared_from_this()](const std::error_code& ec) {
+            if (ec) return;
+            on_path_mtu_probe_timeout();
+        }));
+}
+
+void IceSession::on_path_mtu_probe_timeout() {
+    if (!pmtu_probe_ || !pmtu_inflight_) return;
+    pmtu_inflight_ = false;
+    pmtu_probe_->on_probe_loss();
+    effective_mtu_.store(static_cast<std::uint32_t>(pmtu_probe_->effective_mtu()),
+                          std::memory_order_release);
+    if (!pmtu_probe_->is_complete()) {
+        start_path_mtu_probe();
+    }
 }
 
 void IceSession::start_keepalive() {

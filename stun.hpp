@@ -22,6 +22,7 @@ namespace gn::link::ice {
 // ── STUN constants ──────────────────────────────────────────────────────────
 
 constexpr uint16_t STUN_BINDING_REQUEST     = 0x0001;
+constexpr uint16_t STUN_BINDING_INDICATION  = 0x0011;
 constexpr uint16_t STUN_BINDING_RESPONSE    = 0x0101;
 constexpr uint16_t STUN_BINDING_ERROR       = 0x0111;
 
@@ -30,6 +31,7 @@ constexpr uint32_t STUN_MAGIC_COOKIE        = 0x2112A442;
 // STUN attributes
 constexpr uint16_t STUN_ATTR_MAPPED_ADDRESS     = 0x0001;
 constexpr uint16_t STUN_ATTR_USERNAME           = 0x0006;
+constexpr uint16_t STUN_ATTR_UNKNOWN_ATTRIBUTES = 0x000A;
 constexpr uint16_t STUN_ATTR_MESSAGE_INTEGRITY  = 0x0008;
 constexpr uint16_t STUN_ATTR_ERROR_CODE         = 0x0009;
 constexpr uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
@@ -116,6 +118,16 @@ public:
     /// Add MESSAGE-INTEGRITY (HMAC-SHA1) and FINGERPRINT (CRC32).
     StunBuilder& add_integrity(const std::string& key);
     StunBuilder& add_fingerprint();
+
+    /// Append an UNKNOWN-ATTRIBUTES filler so the finalised message
+    /// reaches exactly @p target_total_bytes on the wire. The filler
+    /// is a single STUN attribute of type 0x000A whose value is zero
+    /// bytes; receivers ignore unknown comprehension-optional
+    /// attributes per RFC 5389 §15. Used by the DPLPMTUD prober to
+    /// size a binding-request to the candidate MTU under test.
+    /// No-op when the current build is already at or above
+    /// @p target_total_bytes.
+    StunBuilder& add_padding_to(std::size_t target_total_bytes);
 
     std::vector<uint8_t> build();
 
