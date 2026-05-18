@@ -2020,6 +2020,57 @@ void IceSession::start_keepalive() {
     on_keepalive();
 }
 
+bool IceSession::notify_consent_loss_for_test() {
+    /// Consent recovery exhausted. Before declaring Failed, give
+    /// `auto_restart_on_consent_loss` a turn: regenerate the
+    /// ufrag/pwd pair, drop pending state, and re-enter Gathering.
+    /// The backoff coalesces a burst of missed keepalives into one
+    /// restart so a single network blip does not chew through the
+    /// attempt budget.
+    if (cfg_.auto_restart_on_consent_loss &&
+        auto_restart_attempts_ <
+            static_cast<uint32_t>(cfg_.auto_restart_max_attempts)) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto since_last = now - auto_restart_last_;
+        const auto backoff = std::chrono::milliseconds(
+            cfg_.auto_restart_backoff_ms);
+        if (auto_restart_last_ == std::chrono::steady_clock::time_point{}
+            || since_last >= backoff) {
+            ++auto_restart_attempts_;
+            auto_restart_last_ = now;
+            consent_missed_.store(0, std::memory_order_release);
+            /// Surface a CONN_DOWN-equivalent path event to the
+            /// strategy chain before the restart fires. Carries
+            /// the reason token + attempt counters so consumers
+            /// can decide whether to deprioritise this conn or
+            /// fire an upper-layer reconnect.
+            if (callbacks_.on_auto_restart) {
+                callbacks_.on_auto_restart(
+                    peer_id_, "consent-loss",
+                    auto_restart_attempts_,
+                    static_cast<std::uint32_t>(
+                        cfg_.auto_restart_max_attempts));
+            }
+            /// `restart()` schedules its body via dispatch on the
+            /// strand. We are already on the strand here (keepalive
+            /// timer handler), but `dispatch` short-circuits to a
+            /// direct call when invoked from inside the executor
+            /// so the reset still happens before we return.
+            restart();
+            return true;
+        }
+        /// Inside the backoff window — silently drop this consent
+        /// loss; the in-flight restart already covers the burst.
+        consent_missed_.store(0, std::memory_order_release);
+        return true;
+    }
+
+    state_.store(SessionState::Failed, std::memory_order_release);
+    if (callbacks_.on_failed)
+        callbacks_.on_failed(peer_id_, ETIMEDOUT);
+    return false;
+}
+
 void IceSession::on_keepalive() {
     if (state_.load(std::memory_order_acquire) != SessionState::Connected) return;
     /// Lite agents per RFC 8445 §2.7 do not run consent freshness
@@ -2040,53 +2091,7 @@ void IceSession::on_keepalive() {
             return;
         }
 
-        /// Consent recovery exhausted. Before declaring Failed, give
-        /// `auto_restart_on_consent_loss` a turn: regenerate the
-        /// ufrag/pwd pair, drop pending state, and re-enter Gathering.
-        /// The backoff coalesces a burst of missed keepalives into one
-        /// restart so a single network blip does not chew through the
-        /// attempt budget.
-        if (cfg_.auto_restart_on_consent_loss &&
-            auto_restart_attempts_ <
-                static_cast<uint32_t>(cfg_.auto_restart_max_attempts)) {
-            const auto now = std::chrono::steady_clock::now();
-            const auto since_last = now - auto_restart_last_;
-            const auto backoff = std::chrono::milliseconds(
-                cfg_.auto_restart_backoff_ms);
-            if (auto_restart_last_ == std::chrono::steady_clock::time_point{}
-                || since_last >= backoff) {
-                ++auto_restart_attempts_;
-                auto_restart_last_ = now;
-                consent_missed_.store(0, std::memory_order_release);
-                /// Surface a CONN_DOWN-equivalent path event to the
-                /// strategy chain before the restart fires. Carries
-                /// the reason token + attempt counters so consumers
-                /// can decide whether to deprioritise this conn or
-                /// fire an upper-layer reconnect.
-                if (callbacks_.on_auto_restart) {
-                    callbacks_.on_auto_restart(
-                        peer_id_, "consent-loss",
-                        auto_restart_attempts_,
-                        static_cast<std::uint32_t>(
-                            cfg_.auto_restart_max_attempts));
-                }
-                /// `restart()` schedules its body via dispatch on the
-                /// strand. We are already on the strand here (keepalive
-                /// timer handler), but `dispatch` short-circuits to a
-                /// direct call when invoked from inside the executor
-                /// so the reset still happens before we return.
-                restart();
-                return;
-            }
-            /// Inside the backoff window — silently drop this consent
-            /// loss; the in-flight restart already covers the burst.
-            consent_missed_.store(0, std::memory_order_release);
-            return;
-        }
-
-        state_.store(SessionState::Failed, std::memory_order_release);
-        if (callbacks_.on_failed)
-            callbacks_.on_failed(peer_id_, ETIMEDOUT);
+        (void)notify_consent_loss_for_test();
         return;
     }
 

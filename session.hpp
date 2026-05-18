@@ -416,6 +416,18 @@ public:
     /// how the new credentials reach the peer.
     void restart();
 
+    /// Trigger the consent-loss decision point synchronously. Mirrors
+    /// what the keepalive handler does when consent recovery is
+    /// exhausted: depending on `cfg_.auto_restart_on_consent_loss` and
+    /// the remaining attempt budget, either re-enters Gathering
+    /// through `restart()` or transitions to Failed. Returns true when
+    /// the call decided to auto-restart, false when it transitioned
+    /// (or would transition) to Failed. Public so that test fixtures
+    /// can exercise the policy without driving a full STUN exchange to
+    /// Connected; production callers should not invoke this directly —
+    /// the FSM does the right thing from `on_keepalive`.
+    bool notify_consent_loss_for_test();
+
     // Accessors
     SessionState state() const { return state_.load(std::memory_order_acquire); }
     const std::string& peer_id() const { return peer_id_; }
