@@ -54,6 +54,31 @@ inline constexpr std::uint32_t kDefaultMtu = 1200;
 /// breakage of `gn_link_ice_signal_api_t` below.
 inline constexpr std::uint32_t kIceSignalVersion = 0x00010000U;
 
+/// `gn.link.ice.path_mtu` extension version. Bump on shape breakage
+/// of `gn_link_ice_path_mtu_api_t` below.
+inline constexpr std::uint32_t kIcePathMtuVersion = 0x00010000U;
+
+/// Path-MTU query surface for the `gn.link.ice.path_mtu` extension.
+/// Upper layers (security session, gnet protocol, app framers) use
+/// it to size their outbound frames to the value DPLPMTUD has
+/// discovered for the nominated pair. Returns the static configured
+/// floor when active probing is off, the conn id is unknown, or the
+/// session has not yet nominated a pair.
+extern "C" struct gn_link_ice_path_mtu_api_s {
+    std::uint32_t api_size;
+
+    /// Snapshot of the effective path MTU in bytes for @p conn.
+    /// Result is the conservative static value when no probe data
+    /// is available; the discovered MTU otherwise.
+    gn_result_t (*get)(void* ctx,
+                       gn_conn_id_t conn,
+                       std::uint32_t* out_mtu);
+
+    void* ctx;
+    void* _reserved[2];
+};
+using gn_link_ice_path_mtu_api_t = struct gn_link_ice_path_mtu_api_s;
+
 /// Peer-to-peer ICE signaling extension surfaced as
 /// `gn.link.ice.signal`. Handlers that own the signaling channel
 /// pass candidate blobs through this vtable; the ICE plugin maps
@@ -174,6 +199,12 @@ public:
     [[nodiscard]] std::uint32_t mtu() const noexcept {
         return mtu_.load(std::memory_order_relaxed);
     }
+
+    /// Largest MTU discovered for @p conn via RFC 8899 DPLPMTUD.
+    /// Falls back to `mtu()` when active probing is off, the conn id
+    /// is unknown, or the FSM has not yet recorded a result.
+    [[nodiscard]] std::uint32_t effective_path_mtu(
+        gn_conn_id_t conn) const noexcept;
 
     /// ── Composer surface ─────────────────────────────────────────
     ///

@@ -400,6 +400,38 @@ void IceLink::apply_config() noexcept {
         const bool b = (v != 0);
         apply_to_all_turns([&](TurnConfig& t) { t.tls_transport = b; });
     }
+    /// RFC 8899 DPLPMTUD knobs. Defaults match the IceConfig
+    /// in-class initialisers; operators can disable probing on
+    /// constrained paths (`ice.pmtu_active_probing = 0`), reshape
+    /// the ladder, or relax the per-probe timeout.
+    if (gn_config_get_int64(api_, "ice.pmtu_active_probing", &v) == GN_OK) {
+        cfg.pmtu_active_probing = (v != 0);
+    }
+    if (gn_config_get_int64(api_, "ice.pmtu_probe_timeout_ms", &v) == GN_OK
+        && v > 0 && v < 60000) {
+        cfg.pmtu_probe_timeout_ms = static_cast<int>(v);
+    }
+    if (gn_config_get_int64(api_, "ice.pmtu_probe_concurrency", &v) == GN_OK
+        && v > 0 && v <= 16) {
+        cfg.pmtu_probe_concurrency = static_cast<int>(v);
+    }
+    {
+        std::size_t arr = 0;
+        if (gn_config_get_array_size(api_, "ice.pmtu_search_steps",
+                                       &arr) == GN_OK && arr > 0) {
+            std::vector<int> steps;
+            steps.reserve(arr);
+            for (std::size_t i = 0; i < arr; ++i) {
+                std::int64_t step = 0;
+                if (gn_config_get_array_int64(api_, "ice.pmtu_search_steps",
+                                                 i, &step) == GN_OK
+                    && step >= 576 && step <= 65507) {
+                    steps.push_back(static_cast<int>(step));
+                }
+            }
+            if (!steps.empty()) cfg.pmtu_search_steps = std::move(steps);
+        }
+    }
 
     std::lock_guard lk(cfg_mu_);
     cfg_ = std::move(cfg);
@@ -836,6 +868,23 @@ NominationMetrics IceLink::nomination_metrics(
     }
     if (!session) return NominationMetrics{};
     return session->nomination_metrics();
+}
+
+std::uint32_t IceLink::effective_path_mtu(
+    gn_conn_id_t conn) const noexcept {
+    std::shared_ptr<IceSession> session;
+    if ((conn & kComposerIdBit) != 0) {
+        std::lock_guard lk(composer_mu_);
+        auto it = composer_sessions_.find(conn);
+        if (it != composer_sessions_.end()) session = it->second.session;
+    } else {
+        std::lock_guard lk(sessions_mu_);
+        auto it = sessions_.find(conn);
+        if (it != sessions_.end()) session = it->second.session;
+    }
+    if (!session) return mtu_.load(std::memory_order_relaxed);
+    const auto v = session->effective_path_mtu();
+    return v != 0 ? v : mtu_.load(std::memory_order_relaxed);
 }
 
 gn_result_t IceLink::restart_session(gn_conn_id_t conn) {
