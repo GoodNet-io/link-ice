@@ -44,6 +44,7 @@ every bundled `.so` from there.
 | `ice.turn_password` | string | `""` | TURN long-term credential |
 | `ice.turn_tcp` | bool | `false` | RFC 5389 §7.2.2 TURN-over-TCP — fallback when UDP-blocked; needs `gn.link.tcp` carrier |
 | `ice.turn_tls` | bool | `false` | RFC 5389 §7.2.2 TURN-over-TLS via `turns://` — needs `gn.link.tls` carrier; precedence over `turn_tcp` |
+| `ice.turn_requested_transport` | string / int | `"udp"` | RFC 6062 relay-side transport: `"udp"` / `17` keeps the RFC 5766 UDP-allocation flow; `"tcp"` / `6` requests a TCP-allocated relay where peers connect over TCP and the client uses CONNECT / CONNECTIONBIND for each data connection |
 | `ice.session_timeout_s` | int64 | `10` | gather + checks deadline |
 | `ice.keepalive_interval_s` | int64 | `20` | consent-freshness probe period |
 | `ice.consent_max_failures` | int64 | `3` | missed probes before recovery |
@@ -74,6 +75,10 @@ to specific `ice.*` knob combinations live in the kernel monorepo:
 - RFC 5389 / 5766 (STUN / TURN) — long-term credential auth,
   ChannelBind fast path (§11), Send-Indication fallback,
   TURN-over-TCP / TLS framing (§7.2.2)
+- RFC 6062 (TURN TCP allocations) — REQUESTED-TRANSPORT=6 in the
+  ALLOCATE request, ConnectionAttempt indication handling, Connect
+  / ConnectionBind for per-peer data connections (no CHANNEL-BIND
+  on TCP allocations)
 - RFC 8838 (Trickle ICE) — incremental candidates with
   end-of-candidates marker (OFFER_EOC / ANSWER_EOC)
 - RFC 8305 (Happy Eyeballs) — dual-family pre-fire in begin_checks

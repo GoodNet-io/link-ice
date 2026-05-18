@@ -7,6 +7,18 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### TURN TCP allocations (RFC 6062)
+
+The TURN allocation flow learns the TCP-relay variant from RFC
+6062. `ice.turn_requested_transport` defaults to `"udp"` (the
+RFC 5766 shape) and accepts `"tcp"` / `6` to request a TCP-
+allocated relay. The ALLOCATE request carries
+`REQUESTED-TRANSPORT = 6`; the data path swaps CHANNEL-BIND /
+ChannelData for CONNECT / CONNECTIONBIND with one TCP connection
+to the TURN server per peer. ConnectionAttempt indications
+trigger the same data-connection handshake when a remote peer
+connects to the relay first.
+
 ### Auto-restart on consent loss
 
 When RFC 7675 consent recovery is exhausted the session no longer
