@@ -57,6 +57,12 @@ every bundled `.so` from there.
 | `ice.symmetric_port_prediction_enabled` | bool | `true` | Probe predicted ports past the peer's advertised srflx when symmetric NAT is detected |
 | `ice.symmetric_port_prediction_attempts` | int64 | `8` | Max consecutive predicted ports to try (`peer.port + stride * k` for k in 1..N) |
 
+Operator-facing recipes that map deployment shapes (home network,
+UDP-blocked enterprise, multi-TURN HA, mDNS-only LAN, ICE-lite
+gateway, symmetric-NAT punch, PMTU optimisation, mobile reconnect)
+to specific `ice.*` knob combinations live in the kernel monorepo:
+[`docs/operator/ice-recipes.en.md`](../../../docs/operator/ice-recipes.en.md).
+
 ## RFC coverage
 
 - RFC 8445 (core ICE) — full controlled / controlling FSM,
