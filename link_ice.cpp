@@ -418,6 +418,20 @@ void IceLink::apply_config() noexcept {
         const bool b = (v != 0);
         apply_to_all_turns([&](TurnConfig& t) { t.tls_transport = b; });
     }
+    /// RFC 6544 TCP candidate emission. Defaults to enabled so
+    /// operators in UDP-blocked environments get TCP fallback
+    /// without a config toggle; the gather is still a no-op when
+    /// no `gn.link.tcp` carrier resolves.
+    if (gn_config_get_int64(api_, "ice.tcp_candidates_enabled", &v) == GN_OK) {
+        cfg.tcp_candidates_enabled = (v != 0);
+    }
+    /// RFC 6544 §6 simultaneous-open coordination window in
+    /// milliseconds. Bounded to keep a misconfigured value from
+    /// holding a check half-open indefinitely.
+    if (gn_config_get_int64(api_, "ice.tcp_so_timeout_ms", &v) == GN_OK
+        && v > 0 && v < 600000) {
+        cfg.tcp_so_timeout_ms = static_cast<int>(v);
+    }
     /// RFC 8899 DPLPMTUD knobs. Defaults match the IceConfig
     /// in-class initialisers; operators can disable probing on
     /// constrained paths (`ice.pmtu_active_probing = 0`), reshape
