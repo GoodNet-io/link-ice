@@ -698,6 +698,19 @@ IceSessionCallbacks IceLink::make_composer_callbacks(
                 cb(user, cid, data.data(), data.size());
             }
         },
+        .on_auto_restart = [weak_self, cid](const std::string&,
+                                              std::string_view reason,
+                                              std::uint32_t attempt,
+                                              std::uint32_t max_attempts) {
+            auto self = weak_self.lock();
+            if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            gn_log_info(self->api_,
+                "ice: auto-restart on %.*s (attempt %u/%u, "
+                "composer-cid=%llu)",
+                static_cast<int>(reason.size()), reason.data(),
+                attempt, max_attempts,
+                static_cast<unsigned long long>(cid));
+        },
     };
 }
 
@@ -736,6 +749,28 @@ IceSessionCallbacks IceLink::make_callbacks(gn_conn_id_t id) {
             self->frames_in_.fetch_add(1, std::memory_order_relaxed);
             (void)self->api_->notify_inbound_bytes(
                 self->api_->host_ctx, id, data.data(), data.size());
+        },
+        .on_auto_restart = [weak_self, id](const std::string&,
+                                            std::string_view reason,
+                                            std::uint32_t attempt,
+                                            std::uint32_t max_attempts) {
+            auto self = weak_self.lock();
+            if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            /// Surface the auto-restart decision as an INFO log line.
+            /// The kernel `gn.strategy.*` extension already exposes
+            /// `GN_PATH_EVENT_CONN_DOWN` for paths leaving the
+            /// candidate set, but firing it here would have the
+            /// kernel free the conn id and tear down the session we
+            /// are about to revive. Strategy consumers that need the
+            /// auto-restart signal can parse the log token; a future
+            /// `GN_PATH_EVENT_AUTO_RESTART` kernel-side enum would
+            /// let us emit a richer event without invalidating the
+            /// conn — out of scope for this sub-repo change.
+            gn_log_info(self->api_,
+                "ice: auto-restart on %.*s (attempt %u/%u, conn=%llu)",
+                static_cast<int>(reason.size()), reason.data(),
+                attempt, max_attempts,
+                static_cast<unsigned long long>(id));
         },
     };
 }

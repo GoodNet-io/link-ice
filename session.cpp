@@ -2058,6 +2058,18 @@ void IceSession::on_keepalive() {
                 ++auto_restart_attempts_;
                 auto_restart_last_ = now;
                 consent_missed_.store(0, std::memory_order_release);
+                /// Surface a CONN_DOWN-equivalent path event to the
+                /// strategy chain before the restart fires. Carries
+                /// the reason token + attempt counters so consumers
+                /// can decide whether to deprioritise this conn or
+                /// fire an upper-layer reconnect.
+                if (callbacks_.on_auto_restart) {
+                    callbacks_.on_auto_restart(
+                        peer_id_, "consent-loss",
+                        auto_restart_attempts_,
+                        static_cast<std::uint32_t>(
+                            cfg_.auto_restart_max_attempts));
+                }
                 /// `restart()` schedules its body via dispatch on the
                 /// strand. We are already on the strand here (keepalive
                 /// timer handler), but `dispatch` short-circuits to a

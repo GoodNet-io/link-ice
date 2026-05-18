@@ -38,6 +38,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -331,6 +332,18 @@ struct IceSessionCallbacks {
     std::function<void(const std::string& peer_id, int error)> on_failed;
     std::function<void(const std::string& peer_id,
                        std::span<const uint8_t> data)> on_data;
+    /// Fired when the session decides to auto-restart on consent loss.
+    /// `reason` is a short stable token (e.g. `"consent-loss"`) the
+    /// transport layer can forward to strategy plugins so they
+    /// deprioritise the conn or trigger an upper-layer reconnect. The
+    /// kernel `gn.strategy.*` extension currently exposes
+    /// `GN_PATH_EVENT_CONN_DOWN`; the ICE link translates this callback
+    /// into a CONN_DOWN notification on its side without requiring a
+    /// new kernel enum value.
+    std::function<void(const std::string& peer_id,
+                       std::string_view reason,
+                       std::uint32_t attempt,
+                       std::uint32_t max_attempts)> on_auto_restart;
 };
 
 /// @brief Per-peer ICE state machine — gathers candidates, runs
