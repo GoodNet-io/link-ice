@@ -146,12 +146,19 @@ private:
 
     asio::io_context& io_;
     asio::strand<asio::io_context::executor_type> strand_;
-    /// One v4 socket bound to 5353 with multicast group joined.
-    /// IPv6 path is wired the same way under `__linux__` when the
-    /// kernel supports it; query path also accepts the v6 group.
+    /// Dual-stack mDNS bindings: one socket per family, each joined
+    /// to its respective multicast group (`224.0.0.251` for v4,
+    /// `ff02::fb` for v6). Either socket may fail to bind on hosts
+    /// where the corresponding stack is disabled; the manager runs
+    /// in degraded mode in that case.
     asio::ip::udp::socket    socket_v4_;
-    asio::ip::udp::endpoint  recv_endpoint_;
-    std::array<std::uint8_t, 2048> rx_buf_{};
+    asio::ip::udp::socket    socket_v6_;
+    asio::ip::udp::endpoint  recv_endpoint_v4_;
+    asio::ip::udp::endpoint  recv_endpoint_v6_;
+    std::array<std::uint8_t, 2048> rx_buf_v4_{};
+    std::array<std::uint8_t, 2048> rx_buf_v6_{};
+    bool v4_open_ = false;
+    bool v6_open_ = false;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
@@ -176,8 +183,13 @@ private:
     /// going up or down mid-session requires `stop()` + `start()`.
     std::vector<std::string> local_v4_;
     std::vector<std::string> local_v6_;
+    /// Interface names that carry an IPv6 address; mirrored from
+    /// `getifaddrs` so the IPV6_JOIN_GROUP path can resolve each
+    /// scope to an `if_index` via `if_nametoindex`.
+    std::vector<std::string> local_v6_ifnames_;
 
-    void async_receive();
+    void async_receive_v4();
+    void async_receive_v6();
     void on_packet(std::span<const std::uint8_t> bytes,
                     const asio::ip::udp::endpoint& src);
 
@@ -185,11 +197,13 @@ private:
     void send_answer(const std::string& hostname,
                       const NameRecord& rec,
                       std::uint16_t txn_id,
+                      std::uint16_t qtype,
                       const asio::ip::udp::endpoint& dst);
 
     static std::string to_lower(std::string s);
     static void enumerate_local_addresses(std::vector<std::string>& v4,
-                                            std::vector<std::string>& v6);
+                                            std::vector<std::string>& v6,
+                                            std::vector<std::string>& v6_ifnames);
 };
 
 // ── Wire-level helpers (exposed for tests) ──────────────────────────────

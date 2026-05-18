@@ -354,9 +354,11 @@ std::optional<DnsParsedMessage> parse_dns_message(
 // ── Local interface enumeration ────────────────────────────────────────
 
 void MdnsManager::enumerate_local_addresses(std::vector<std::string>& v4,
-                                                std::vector<std::string>& v6) {
+                                                std::vector<std::string>& v6,
+                                                std::vector<std::string>& v6_ifnames) {
     v4.clear();
     v6.clear();
+    v6_ifnames.clear();
 #ifdef __linux__
     struct ifaddrs* list = nullptr;
     if (getifaddrs(&list) != 0) return;
@@ -376,11 +378,13 @@ void MdnsManager::enumerate_local_addresses(std::vector<std::string>& v4,
             char buf[INET6_ADDRSTRLEN]{};
             if (inet_ntop(AF_INET6, &s->sin6_addr, buf, sizeof(buf))) {
                 v6.emplace_back(buf);
+                v6_ifnames.emplace_back(ifa->ifa_name ? ifa->ifa_name : "");
             }
         }
     }
     freeifaddrs(list);
 #else
+    (void)v6_ifnames;
     // TODO(mdns): macOS / Windows interface enumeration. Falls back
     // to an empty address list, which means the responder cannot
     // answer queries until the platform path is wired in.
@@ -392,7 +396,8 @@ void MdnsManager::enumerate_local_addresses(std::vector<std::string>& v4,
 MdnsManager::MdnsManager(asio::io_context& io)
     : io_(io),
       strand_(asio::make_strand(io.get_executor())),
-      socket_v4_(strand_) {}
+      socket_v4_(strand_),
+      socket_v6_(strand_) {}
 
 MdnsManager::~MdnsManager() {
     /// Synchronous teardown only — `stop()` posts to the strand via
@@ -404,53 +409,120 @@ MdnsManager::~MdnsManager() {
     stopping_.store(true, std::memory_order_release);
     std::error_code ec;
     socket_v4_.close(ec);
+    socket_v6_.close(ec);
 }
 
 bool MdnsManager::start() {
     if (running_.exchange(true, std::memory_order_acq_rel)) {
         return true;
     }
-    enumerate_local_addresses(local_v4_, local_v6_);
+    enumerate_local_addresses(local_v4_, local_v6_, local_v6_ifnames_);
 
-    std::error_code ec;
-    asio::ip::udp::endpoint listen_ep(asio::ip::udp::v4(), kMdnsPort);
-    socket_v4_.open(asio::ip::udp::v4(), ec);
-    if (ec) {
-        running_.store(false, std::memory_order_release);
-        return false;
-    }
-    socket_v4_.set_option(asio::ip::udp::socket::reuse_address(true), ec);
-    /// SO_REUSEPORT lets the OS fan inbound multicast across every
-    /// process bound to 5353 (system Avahi / mDNSResponder may
-    /// already hold the port). On Linux REUSEPORT semantics include
-    /// REUSEADDR; on platforms without REUSEPORT the open just falls
-    /// back to the regular bind below.
-#ifdef SO_REUSEPORT
+    /// IPv4 socket: bind INADDR_ANY:5353, join 224.0.0.251. SO_REUSEPORT
+    /// lets the manager coexist with a system mDNS daemon (avahi /
+    /// mDNSResponder) that may already hold the port.
     {
-        const int yes = 1;
-        ::setsockopt(socket_v4_.native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                      &yes, sizeof(yes));
-    }
+        std::error_code ec;
+        socket_v4_.open(asio::ip::udp::v4(), ec);
+        if (!ec) {
+            socket_v4_.set_option(asio::ip::udp::socket::reuse_address(true), ec);
+#ifdef SO_REUSEPORT
+            {
+                const int yes = 1;
+                ::setsockopt(socket_v4_.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                              &yes, sizeof(yes));
+            }
 #endif
-    socket_v4_.bind(listen_ep, ec);
-    if (ec) {
-        socket_v4_.close(ec);
+            asio::ip::udp::endpoint listen_ep_v4(asio::ip::udp::v4(), kMdnsPort);
+            socket_v4_.bind(listen_ep_v4, ec);
+            if (!ec) {
+                /// Group-join failure is non-fatal: outbound queries still
+                /// work, the responder just misses inbound traffic.
+                std::error_code join_ec;
+                socket_v4_.set_option(
+                    asio::ip::multicast::join_group(
+                        asio::ip::make_address(kMdnsIPv4MulticastAddr)),
+                    join_ec);
+                socket_v4_.set_option(
+                    asio::ip::multicast::enable_loopback(true), join_ec);
+                v4_open_ = true;
+            } else {
+                socket_v4_.close(ec);
+            }
+        }
+    }
+
+    /// IPv6 socket: bind in6addr_any:5353, join ff02::fb per scoped
+    /// interface. IPv6 multicast routing is per-interface so the group
+    /// must be joined once per AF_INET6-bearing interface.
+    {
+        std::error_code ec;
+        socket_v6_.open(asio::ip::udp::v6(), ec);
+        if (!ec) {
+#ifdef IPV6_V6ONLY
+            {
+                const int yes = 1;
+                ::setsockopt(socket_v6_.native_handle(), IPPROTO_IPV6,
+                              IPV6_V6ONLY, &yes, sizeof(yes));
+            }
+#endif
+            socket_v6_.set_option(asio::ip::udp::socket::reuse_address(true), ec);
+#ifdef SO_REUSEPORT
+            {
+                const int yes = 1;
+                ::setsockopt(socket_v6_.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                              &yes, sizeof(yes));
+            }
+#endif
+            asio::ip::udp::endpoint listen_ep_v6(asio::ip::udp::v6(), kMdnsPort);
+            socket_v6_.bind(listen_ep_v6, ec);
+            if (!ec) {
+#ifdef __linux__
+                struct in6_addr group{};
+                inet_pton(AF_INET6, kMdnsIPv6MulticastAddr, &group);
+                bool joined_any = false;
+                for (const auto& ifname : local_v6_ifnames_) {
+                    if (ifname.empty()) continue;
+                    const auto if_index = if_nametoindex(ifname.c_str());
+                    if (if_index == 0) continue;
+                    struct ipv6_mreq mreq{};
+                    mreq.ipv6mr_multiaddr = group;
+                    mreq.ipv6mr_interface = if_index;
+                    if (::setsockopt(socket_v6_.native_handle(), IPPROTO_IPV6,
+                                       IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) == 0) {
+                        joined_any = true;
+                    }
+                }
+                /// Fallback default-scope join keeps wildcard receive
+                /// working in containers without any v6-addressed
+                /// interface (loopback-only namespaces).
+                if (!joined_any) {
+                    struct ipv6_mreq mreq{};
+                    mreq.ipv6mr_multiaddr = group;
+                    mreq.ipv6mr_interface = 0;
+                    (void)::setsockopt(socket_v6_.native_handle(), IPPROTO_IPV6,
+                                        IPV6_JOIN_GROUP, &mreq, sizeof(mreq));
+                }
+                {
+                    const int loop = 1;
+                    (void)::setsockopt(socket_v6_.native_handle(), IPPROTO_IPV6,
+                                        IPV6_MULTICAST_LOOP, &loop, sizeof(loop));
+                }
+#endif
+                v6_open_ = true;
+            } else {
+                socket_v6_.close(ec);
+            }
+        }
+    }
+
+    if (!v4_open_ && !v6_open_) {
         running_.store(false, std::memory_order_release);
         return false;
     }
-    /// Join the IPv4 multicast group. Failure is non-fatal: we keep
-    /// the socket bound so queries we generate still reach unicast
-    /// peers, but the responder side won't receive inbound queries.
-    socket_v4_.set_option(
-        asio::ip::multicast::join_group(
-            asio::ip::make_address(kMdnsIPv4MulticastAddr)),
-        ec);
-    /// Disable loopback so our own queries don't bounce back as
-    /// "inbound" packets — the resolver path would otherwise see
-    /// every outgoing query and try to parse it as a response.
-    socket_v4_.set_option(asio::ip::multicast::enable_loopback(true), ec);
 
-    async_receive();
+    if (v4_open_) async_receive_v4();
+    if (v6_open_) async_receive_v6();
     return true;
 }
 
@@ -460,6 +532,7 @@ void MdnsManager::stop() {
     asio::dispatch(strand_, [self = shared_from_this()] {
         std::error_code ec;
         self->socket_v4_.close(ec);
+        self->socket_v6_.close(ec);
         for (auto& [_name, queries] : self->pending_) {
             for (auto& q : queries) {
                 q->timer.cancel();
@@ -548,20 +621,39 @@ MdnsResolveResult MdnsManager::resolve_sync(
     return fut.get();
 }
 
-void MdnsManager::async_receive() {
+void MdnsManager::async_receive_v4() {
     if (stopping_.load(std::memory_order_acquire)) return;
+    if (!v4_open_) return;
     auto self = shared_from_this();
     socket_v4_.async_receive_from(
-        asio::buffer(rx_buf_), recv_endpoint_,
+        asio::buffer(rx_buf_v4_), recv_endpoint_v4_,
         asio::bind_executor(strand_,
             [self](const std::error_code& ec, std::size_t n) {
                 if (ec || self->stopping_.load(std::memory_order_acquire)) return;
                 if (n > 0) {
                     self->on_packet(
-                        std::span<const std::uint8_t>(self->rx_buf_.data(), n),
-                        self->recv_endpoint_);
+                        std::span<const std::uint8_t>(self->rx_buf_v4_.data(), n),
+                        self->recv_endpoint_v4_);
                 }
-                self->async_receive();
+                self->async_receive_v4();
+            }));
+}
+
+void MdnsManager::async_receive_v6() {
+    if (stopping_.load(std::memory_order_acquire)) return;
+    if (!v6_open_) return;
+    auto self = shared_from_this();
+    socket_v6_.async_receive_from(
+        asio::buffer(rx_buf_v6_), recv_endpoint_v6_,
+        asio::bind_executor(strand_,
+            [self](const std::error_code& ec, std::size_t n) {
+                if (ec || self->stopping_.load(std::memory_order_acquire)) return;
+                if (n > 0) {
+                    self->on_packet(
+                        std::span<const std::uint8_t>(self->rx_buf_v6_.data(), n),
+                        self->recv_endpoint_v6_);
+                }
+                self->async_receive_v6();
             }));
 }
 
@@ -576,7 +668,8 @@ void MdnsManager::on_packet(std::span<const std::uint8_t> bytes,
         if (parsed->question.empty()) return;
         auto it = names_.find(parsed->question);
         if (it == names_.end()) return;
-        send_answer(parsed->question, it->second, parsed->txn_id, src);
+        send_answer(parsed->question, it->second,
+                     parsed->txn_id, parsed->qtype, src);
         return;
     }
 
@@ -632,38 +725,78 @@ void MdnsManager::send_query(const std::string& hostname_lc,
                                   std::uint16_t txn_id) {
     if (stopping_.load(std::memory_order_acquire)) return;
     std::error_code ec;
-    asio::ip::udp::endpoint dst(
-        asio::ip::make_address(kMdnsIPv4MulticastAddr), kMdnsPort);
-    /// One A query + one AAAA query — two packets matches what
-    /// browsers do and keeps the per-record-type parsing simple.
+    /// One A query + one AAAA query — matches what browsers do and
+    /// keeps per-record-type parsing simple. Without an ip-hint we
+    /// don't know which family will resolve, so query both multicast
+    /// groups when both stacks are bound.
     auto pkt_a    = encode_dns_query(hostname_lc, txn_id, /*aaaa=*/false);
     auto pkt_aaaa = encode_dns_query(hostname_lc, txn_id, /*aaaa=*/true);
-    if (!pkt_a.empty()) {
-        socket_v4_.send_to(asio::buffer(pkt_a), dst, 0, ec);
+    if (v4_open_) {
+        asio::ip::udp::endpoint dst_v4(
+            asio::ip::make_address(kMdnsIPv4MulticastAddr), kMdnsPort);
+        if (!pkt_a.empty()) {
+            socket_v4_.send_to(asio::buffer(pkt_a), dst_v4, 0, ec);
+        }
+        if (!pkt_aaaa.empty()) {
+            socket_v4_.send_to(asio::buffer(pkt_aaaa), dst_v4, 0, ec);
+        }
     }
-    if (!pkt_aaaa.empty()) {
-        socket_v4_.send_to(asio::buffer(pkt_aaaa), dst, 0, ec);
+    if (v6_open_) {
+        asio::ip::udp::endpoint dst_v6(
+            asio::ip::make_address(kMdnsIPv6MulticastAddr), kMdnsPort);
+        if (!pkt_a.empty()) {
+            socket_v6_.send_to(asio::buffer(pkt_a), dst_v6, 0, ec);
+        }
+        if (!pkt_aaaa.empty()) {
+            socket_v6_.send_to(asio::buffer(pkt_aaaa), dst_v6, 0, ec);
+        }
     }
 }
 
 void MdnsManager::send_answer(const std::string& hostname,
                                    const NameRecord& rec,
                                    std::uint16_t txn_id,
+                                   std::uint16_t qtype,
                                    const asio::ip::udp::endpoint& dst) {
     if (stopping_.load(std::memory_order_acquire)) return;
-    auto pkt = encode_dns_response(hostname, txn_id, rec.ipv4, rec.ipv6);
+    /// Filter per qtype: A (1) → IPv4 only, AAAA (28) → IPv6 only,
+    /// anything else (ANY = 255, etc.) → both families. RFC 6762
+    /// §6 NSEC negative-answer for the absent type is not emitted —
+    /// peers tolerate the silent omission.
+    constexpr std::uint16_t kTypeA    = 1;
+    constexpr std::uint16_t kTypeAAAA = 28;
+    std::vector<std::string> v4_out;
+    std::vector<std::string> v6_out;
+    if (qtype == kTypeA) {
+        v4_out = rec.ipv4;
+    } else if (qtype == kTypeAAAA) {
+        v6_out = rec.ipv6;
+    } else {
+        v4_out = rec.ipv4;
+        v6_out = rec.ipv6;
+    }
+    if (v4_out.empty() && v6_out.empty()) return;
+    auto pkt = encode_dns_response(hostname, txn_id, v4_out, v6_out);
     if (pkt.empty()) return;
     std::error_code ec;
-    /// Answer on the multicast group per RFC 6762 §6 unless the
-    /// querier set the unicast-response bit — which we don't honour
-    /// here for simplicity. Multicast is always correct.
-    asio::ip::udp::endpoint mc(
-        asio::ip::make_address(kMdnsIPv4MulticastAddr), kMdnsPort);
-    socket_v4_.send_to(asio::buffer(pkt), mc, 0, ec);
-    /// Also unicast back to the questioner for fast-path delivery
-    /// on switches that filter mcast aggressively. RFC 6762 §6 §11
-    /// allow this; some responders do, others don't.
-    socket_v4_.send_to(asio::buffer(pkt), dst, 0, ec);
+    /// Answer on the multicast group per RFC 6762 §6. Route on the
+    /// family of the inbound query so AAAA queries land back on
+    /// `[ff02::fb]:5353` and A queries on 224.0.0.251.
+    const bool dst_is_v6 = dst.address().is_v6();
+    if (dst_is_v6 && v6_open_) {
+        asio::ip::udp::endpoint mc(
+            asio::ip::make_address(kMdnsIPv6MulticastAddr), kMdnsPort);
+        socket_v6_.send_to(asio::buffer(pkt), mc, 0, ec);
+        /// Also unicast back to the questioner for fast-path delivery
+        /// on switches that filter mcast aggressively. RFC 6762 §6 §11
+        /// allow this; some responders do, others don't.
+        socket_v6_.send_to(asio::buffer(pkt), dst, 0, ec);
+    } else if (v4_open_) {
+        asio::ip::udp::endpoint mc(
+            asio::ip::make_address(kMdnsIPv4MulticastAddr), kMdnsPort);
+        socket_v4_.send_to(asio::buffer(pkt), mc, 0, ec);
+        socket_v4_.send_to(asio::buffer(pkt), dst, 0, ec);
+    }
 }
 
 }  // namespace gn::link::ice
