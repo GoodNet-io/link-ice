@@ -734,10 +734,12 @@ void IceSession::handle_gather_response(const StunMessage& msg) {
     if (it == pending_stun_probes_.end()) return;
     if (!msg.xor_mapped) return;
 
-    /// First response wins. Drop the rest by clearing the pending set
-    /// + cancel the umbrella timeout.
-    pending_stun_probes_.clear();
-    gather_timer_.cancel();
+    /// Drop the matched transaction from the pending set so a
+    /// duplicate response doesn't get processed twice. Subsequent
+    /// responses from OTHER STUN servers still arrive and feed the
+    /// symmetric-NAT stride detector below — without that, a single-
+    /// STUN deployment would never observe stride.
+    pending_stun_probes_.erase(it);
 
     Candidate c{};
     c.type     = CandidateType::Srflx;
@@ -755,11 +757,50 @@ void IceSession::handle_gather_response(const StunMessage& msg) {
     }
     c.port = msg.xor_mapped->port;
 
-    if (candidate_allowed(c.type, c.family,
-                           cfg_.candidate_filter_flags)) {
+    /// Symmetric-NAT detection: two responses from the SAME local port
+    /// reporting DIFFERENT external ports prove the NAT is rewriting
+    /// per-destination. Record the stride so check-list construction
+    /// can probe predicted ports beyond the peer's advertised srflx.
+    if (cfg_.symmetric_port_prediction_enabled) {
+        if (!have_first_srflx_port_) {
+            first_observed_srflx_port_ = c.port;
+            have_first_srflx_port_ = true;
+        } else if (c.port != first_observed_srflx_port_
+                    && symmetric_stride_.load(std::memory_order_relaxed) == 0) {
+            const auto a = first_observed_srflx_port_;
+            const auto b = c.port;
+            const std::uint16_t stride =
+                static_cast<std::uint16_t>(
+                    a < b ? (b - a) : (a - b));
+            if (stride > 0) {
+                symmetric_stride_.store(stride, std::memory_order_release);
+            }
+        }
+    }
+
+    /// First response wins the srflx slot; subsequent responses still
+    /// contribute to stride detection (above) but don't add another
+    /// srflx candidate — the IP is the same per local port, the wire
+    /// difference is purely on the destination side.
+    bool already_have_srflx = false;
+    for (const auto& existing : local_candidates_) {
+        if (existing.type == CandidateType::Srflx) {
+            already_have_srflx = true;
+            break;
+        }
+    }
+    if (!already_have_srflx
+        && candidate_allowed(c.type, c.family,
+                              cfg_.candidate_filter_flags)) {
         local_candidates_.push_back(c);
     }
-    on_gathering_complete();
+
+    /// Drive the FSM forward as soon as the first valid srflx lands —
+    /// the stride-detection batch fills in afterwards on the strand.
+    if (!already_have_srflx) {
+        gather_timer_.cancel();
+        on_gathering_complete();
+    }
 }
 
 void IceSession::gather_relay() {
@@ -1128,6 +1169,27 @@ void IceSession::on_gathering_complete() {
 
 void IceSession::build_check_list() {
     check_list_.clear();
+    /// Port-prediction precondition: peer advertised symmetric, and
+    /// the operator left prediction on. Stride is taken from the
+    /// peer's wire flag (we don't know the peer's stride numerically,
+    /// so we assume the typical +1 step unless our own gather has
+    /// recorded a different stride — which still hints at the local
+    /// NAT's behaviour and is a reasonable starting heuristic). The
+    /// `attempts` cap bounds the check-list blow-up.
+    const auto peer_flags =
+        peer_signal_flags_.load(std::memory_order_acquire);
+    const bool peer_symmetric =
+        (peer_flags & ICE_SIGNAL_FLAG_SYMMETRIC) != 0;
+    const std::uint16_t stride = [&]() -> std::uint16_t {
+        if (!peer_symmetric
+            || !cfg_.symmetric_port_prediction_enabled) return 0;
+        const auto own = symmetric_stride_.load(std::memory_order_acquire);
+        return own != 0 ? own : static_cast<std::uint16_t>(1);
+    }();
+    const int prediction_attempts =
+        (stride != 0 && cfg_.symmetric_port_prediction_attempts > 0)
+            ? cfg_.symmetric_port_prediction_attempts : 0;
+
     for (auto& local : local_candidates_) {
         /// Local HostMdns candidates carry only a hostname; the
         /// matching `local_port_` + interface IPs live in the mDNS
@@ -1154,6 +1216,28 @@ void IceSession::build_check_list() {
             pair.priority = pair_priority(local.priority, remote.priority, controlling_);
             pair.txn_id = generate_txn_id();
             check_list_.push_back(pair);
+
+            /// Stride-predicted pairs: probe `peer.port + stride * k`
+            /// for k in 1..N alongside the canonical pair. Only
+            /// srflx peer candidates are interesting — host
+            /// candidates ride a direct path that prediction cannot
+            /// help with, relay candidates already have the TURN
+            /// server's stable port. Priority dropped by one rung so
+            /// the canonical pair wins when both succeed.
+            if (prediction_attempts > 0
+                && remote.type == CandidateType::Srflx) {
+                for (int k = 1; k <= prediction_attempts; ++k) {
+                    const std::uint32_t predicted =
+                        static_cast<std::uint32_t>(remote.port)
+                        + static_cast<std::uint32_t>(stride) * static_cast<std::uint32_t>(k);
+                    if (predicted > 65535) break;
+                    CheckPair pp = pair;
+                    pp.remote.port = static_cast<std::uint16_t>(predicted);
+                    pp.txn_id = generate_txn_id();
+                    pp.priority = pair.priority > 0 ? pair.priority - 1 : 0;
+                    check_list_.push_back(pp);
+                }
+            }
         }
     }
     std::ranges::sort(check_list_, [](const auto& a, const auto& b) {
