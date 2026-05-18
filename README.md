@@ -56,6 +56,9 @@ every bundled `.so` from there.
 | `ice.reactive_interface_change` | bool | `true` | Linux only: re-gather host candidates on `RTM_NEWLINK` / `RTM_NEWADDR` / `RTM_DELADDR` events |
 | `ice.symmetric_port_prediction_enabled` | bool | `true` | Probe predicted ports past the peer's advertised srflx when symmetric NAT is detected |
 | `ice.symmetric_port_prediction_attempts` | int64 | `8` | Max consecutive predicted ports to try (`peer.port + stride * k` for k in 1..N) |
+| `ice.auto_restart_on_consent_loss` | bool | `true` | Re-enter Gathering with fresh ufrag / pwd when RFC 7675 consent recovery is exhausted instead of transitioning to `Failed`. Designed for transient outages (wifi flap, cellular handoff). |
+| `ice.auto_restart_max_attempts` | int64 | `3` | Upper bound on consecutive auto-restarts before the session gives up and transitions to `Failed`. Counter resets on successful nomination. `0` disables auto-restart. |
+| `ice.auto_restart_backoff_ms` | int64 | `500` | Minimum gap between two consecutive auto-restarts. A burst of consent-loss events landing inside this window coalesces into a single restart. |
 
 Operator-facing recipes that map deployment shapes (home network,
 UDP-blocked enterprise, multi-TURN HA, mDNS-only LAN, ICE-lite

@@ -7,6 +7,33 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### Auto-restart on consent loss
+
+When RFC 7675 consent recovery is exhausted the session no longer
+transitions straight to `Failed`. With `ice.auto_restart_on_consent_loss`
+on (the default) the FSM regenerates ufrag / pwd, drops pending
+state, and re-enters Gathering — giving the peer a chance to
+re-signal and recover without an app-level reconnect. The transient
+network outage that motivated the change is the typical wifi flap
+or cellular handoff: keepalive responses stall past
+`consent_max_recovery`, the link comes back a few hundred
+milliseconds later, and the session resumes against a fresh
+candidate set rather than being torn down.
+
+`ice.auto_restart_max_attempts` caps the consecutive restart count
+so an unreachable peer cannot hold the session in a restart loop
+forever; the counter resets on successful nomination. A short
+`ice.auto_restart_backoff_ms` window coalesces a burst of
+consent-loss events into a single restart so one network blip does
+not chew through the attempt budget.
+
+The session surfaces the decision through a new `on_auto_restart`
+callback carrying a `"consent-loss"` reason token; the link side
+logs it at INFO so strategy plugins parsing the log stream can
+deprioritise the conn or trigger an upper-layer reconnect. A
+richer kernel-side `GN_PATH_EVENT_AUTO_RESTART` enum is on the
+roadmap.
+
 ### DPLPMTUD path-MTU discovery
 
 Active path-MTU discovery per RFC 8899 runs on every nominated
