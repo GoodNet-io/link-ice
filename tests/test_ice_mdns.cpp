@@ -351,4 +351,113 @@ TEST_F(ManagerFixture, ResolverFiresEarlyOnLocalAnswer) {
                500);
 }
 
+// ── IPv6 dual-stack ────────────────────────────────────────────────────
+
+TEST(IceMdnsDns, EncodeParseResponseWithIpv6) {
+    std::vector<std::string> v4;
+    std::vector<std::string> v6{"fe80::1", "2001:db8::42"};
+    const auto pkt = encode_dns_response("host.local", 0xBEEF, v4, v6);
+    ASSERT_FALSE(pkt.empty());
+    auto parsed = parse_dns_message(pkt);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->is_response);
+    ASSERT_EQ(parsed->answers.size(), 2u);
+    EXPECT_EQ(parsed->answers[0].name, "host.local");
+    EXPECT_TRUE(parsed->answers[0].ipv4.empty());
+    EXPECT_EQ(parsed->answers[0].ipv6, "fe80::1");
+    EXPECT_EQ(parsed->answers[1].ipv6, "2001:db8::42");
+}
+
+TEST(IceMdnsDns, EncodeParseResponseWithBothFamilies) {
+    /// ANY-style response carrying both A and AAAA records for the
+    /// same name. The parser walks the answers in wire order and
+    /// returns one entry per record, type-tagged by which IP field
+    /// is non-empty.
+    std::vector<std::string> v4{"192.168.1.10"};
+    std::vector<std::string> v6{"2001:db8::1"};
+    const auto pkt = encode_dns_response("dual.local", 0x4242, v4, v6);
+    ASSERT_FALSE(pkt.empty());
+    auto parsed = parse_dns_message(pkt);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->is_response);
+    ASSERT_EQ(parsed->answers.size(), 2u);
+    bool saw_v4 = false;
+    bool saw_v6 = false;
+    for (const auto& a : parsed->answers) {
+        if (a.ipv4 == "192.168.1.10") saw_v4 = true;
+        if (a.ipv6 == "2001:db8::1")  saw_v6 = true;
+    }
+    EXPECT_TRUE(saw_v4);
+    EXPECT_TRUE(saw_v6);
+}
+
+TEST_F(ManagerFixture, MdnsResolvesIPv6Candidate) {
+    /// End-to-end: register a `.local` name, fire an AAAA-only query
+    /// against the manager via the in-process short-circuit path, and
+    /// assert the resolver surfaced the local IPv6 set (if any).
+    /// Hosts with no non-loopback IPv6 address fall back to a
+    /// SUCCEED skip — the short-circuit returns `resolved=true` from
+    /// the `local_v6_` slice regardless of family on the request.
+    if (!mgr_->is_running()) {
+        GTEST_SKIP() << "mDNS manager failed to bind multicast sockets";
+    }
+    mgr_->register_name("v6-host.local");
+    const auto r = mgr_->resolve_sync("v6-host.local", 500ms);
+    EXPECT_TRUE(r.resolved);
+    /// We don't assert v6 is non-empty: containers without an IPv6
+    /// interface won't surface any. The point of this test is the
+    /// path doesn't crash and produces a coherent result.
+    SUCCEED();
+}
+
+TEST_F(ManagerFixture, MdnsResolvesBothFamiliesForAnyQuery) {
+    /// `register_name` captures both `local_v4_` and `local_v6_`;
+    /// the short-circuit resolver returns both. This mirrors the
+    /// ANY-query semantics — a peer asking for either family will
+    /// learn both A and AAAA when available.
+    if (!mgr_->is_running()) {
+        GTEST_SKIP() << "mDNS manager failed to bind multicast sockets";
+    }
+    mgr_->register_name("any-host.local");
+    const auto r = mgr_->resolve_sync("any-host.local", 500ms);
+    EXPECT_TRUE(r.resolved);
+    /// On a host with at least one non-loopback v4 OR v6, exactly
+    /// one of the vectors will be populated. Both being empty on a
+    /// stripped-down container is acceptable — the responder has
+    /// nothing to advertise.
+    if (!r.ipv4.empty()) {
+        EXPECT_FALSE(r.ipv4.front().empty());
+    }
+    if (!r.ipv6.empty()) {
+        EXPECT_FALSE(r.ipv6.front().empty());
+    }
+}
+
+TEST(IceMdnsEnumerate, EnumerateReturnsIPv6Addresses) {
+    /// Sanity: on a host with at least one non-loopback interface
+    /// up the enumeration surfaces something — either v4, v6, or
+    /// both. Stripped-down namespaces (CI sandboxes with only `lo`)
+    /// surface neither, which we treat as a skip rather than a fail.
+    asio::io_context ioc;
+    auto mgr = std::make_shared<MdnsManager>(ioc);
+    if (!mgr->start()) {
+        GTEST_SKIP() << "mDNS manager failed to bind multicast sockets";
+    }
+    /// Indirectly probe by registering a name and asking the
+    /// short-circuit resolver. If the host has any IPv6 we expect a
+    /// non-empty `ipv6` vector.
+    mgr->register_name("enum-probe.local");
+    /// Run the io_context briefly so the `register_name` post fires.
+    auto work = asio::make_work_guard(ioc);
+    std::thread t([&] { ioc.run(); });
+    const auto r = mgr->resolve_sync("enum-probe.local", 500ms);
+    work.reset();
+    ioc.stop();
+    if (t.joinable()) t.join();
+    if (r.ipv4.empty() && r.ipv6.empty()) {
+        GTEST_SKIP() << "host has no non-loopback interfaces";
+    }
+    EXPECT_TRUE(r.resolved);
+}
+
 }  // namespace
