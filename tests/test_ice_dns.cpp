@@ -124,6 +124,43 @@ TEST(ParseServiceUri, StunWithExplicitPort) {
     EXPECT_EQ(u.value().port,   3478u);
 }
 
+TEST(ParseServiceUri, StunWithAuthorityPrefix) {
+    /// `stun://host:port` is the colloquial form (RFC 7064 says just
+    /// `stun:` without the slashes, but every config-by-example
+    /// shipped on the WebRTC docs and every operator handing the
+    /// kernel a `stun://...` URL expects it to work). The parser
+    /// strips the optional `//` and treats the rest the same way.
+    auto u = parse_service_uri("stun://10.10.0.10:3478");
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u.value().scheme, "stun");
+    EXPECT_EQ(u.value().host,   "10.10.0.10");
+    EXPECT_EQ(u.value().port,   3478u);
+}
+
+TEST(ParseServiceUri, TurnWithAuthorityAndUserinfo) {
+    /// `turn://user:pass@host:port` carries credentials in the URI
+    /// per RFC 7065 §3. Our config schema passes the credentials
+    /// out-of-band (`ice.turn_username` / `ice.turn_password`),
+    /// so the URI parser drops the userinfo segment and surfaces
+    /// only the host + port.
+    auto u = parse_service_uri(
+        "turn://goodnet:bench-only-credentials@10.10.0.11:3478");
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u.value().scheme, "turn");
+    EXPECT_EQ(u.value().host,   "10.10.0.11");
+    EXPECT_EQ(u.value().port,   3478u);
+}
+
+TEST(ParseServiceUri, StunWithAuthorityNoPort) {
+    /// `stun://host` (no port) preserves the SRV-expansion request
+    /// path. Same shape as `stun:host`.
+    auto u = parse_service_uri("stun://stun.example.com");
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u.value().scheme, "stun");
+    EXPECT_EQ(u.value().host,   "stun.example.com");
+    EXPECT_EQ(u.value().port,   0u);
+}
+
 TEST(ParseServiceUri, UnknownSchemeRejected) {
     EXPECT_FALSE(parse_service_uri("https:example.com").has_value());
 }

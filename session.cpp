@@ -282,9 +282,17 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
             }
         }
 
-        /// Merge each new candidate, deduping by (ip, port, type).
-        /// Address comparison goes through `address_str()` to keep
-        /// IPv4 / IPv6 logic in one place.
+        /// Merge each new candidate, deduping by (ip, port, type,
+        /// transport). The transport key matters: a UDP host
+        /// candidate at 10.0.0.1:40000 is a different reachable
+        /// endpoint from a TCP-active host candidate at the same
+        /// (ip, port) — they ride distinct sockets on both ends,
+        /// produce distinct check pairs, and route via
+        /// `carrier_udp_` vs `carrier_tcp_`. Without the transport
+        /// component a TCP fallback set (RFC 6544) collapses into
+        /// a single UDP entry and the FSM never tries the TCP
+        /// pairs. Address comparison goes through `address_str()`
+        /// to keep IPv4 / IPv6 logic in one place.
         for (auto& c : cands) {
             const auto ip = c.address_str();
             const bool dup = std::any_of(
@@ -293,7 +301,8 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
                 [&](const Candidate& e) {
                     return e.address_str() == ip
                         && e.port == c.port
-                        && e.type == c.type;
+                        && e.type == c.type
+                        && e.transport == c.transport;
                 });
             if (!dup) self->remote_candidates_.push_back(std::move(c));
         }

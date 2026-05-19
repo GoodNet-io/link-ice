@@ -86,16 +86,38 @@ void srv_emit(void* user, const gn_dns_record_t* rec) {
 // ── parse_service_uri ──────────────────────────────────────────────────────
 
 std::optional<ServiceUri> parse_service_uri(std::string_view raw) {
-    /// Accept "stun:host", "stun:host:port", "turn:host",
-    /// "turn:host:port". Everything else (plain "host:port",
-    /// IP literals, "ipc://" path-style URIs) returns nullopt
-    /// so the caller knows to treat the entry as legacy.
+    /// Accept the RFC 7064 / 7065 canonical form `stun:host[:port]`
+    /// and `turn:host[:port]` PLUS the colloquial `stun://host[:port]`
+    /// / `turn://host[:port]` forms with the `//` authority
+    /// delimiter — operators routinely emit the latter (the WebRTC
+    /// JS shape `RTCIceServer.urls`, every config-by-example doc on
+    /// the web, etc.) and rejecting them would silently strand
+    /// gather without an `srflx` candidate. The TURN form also
+    /// tolerates a `user:pass@` userinfo prefix because RFC 7065 §3
+    /// lets it ride in the URI, even though our config schema feeds
+    /// credentials through `ice.turn_username` / `turn_password`.
+    /// Everything else (plain "host:port", IP literals,
+    /// "ipc://" path-style URIs, "https:…") returns nullopt so the
+    /// caller knows to treat the entry as legacy.
     auto colon = raw.find(':');
     if (colon == std::string_view::npos) return std::nullopt;
     const auto scheme = raw.substr(0, colon);
     if (scheme != "stun" && scheme != "turn") return std::nullopt;
     auto rest = raw.substr(colon + 1);
     if (rest.empty()) return std::nullopt;
+    /// Strip the optional `//` authority-delimiter prefix. Either
+    /// `stun:host` or `stun://host` is accepted; nothing else.
+    if (rest.size() >= 2 && rest[0] == '/' && rest[1] == '/') {
+        rest.remove_prefix(2);
+        if (rest.empty()) return std::nullopt;
+    }
+    /// Drop the optional `user[:pass]@` userinfo segment. Anything
+    /// before the rightmost `@` belongs to userinfo per RFC 3986
+    /// §3.2.1; the authority continues after.
+    if (auto at = rest.rfind('@'); at != std::string_view::npos) {
+        rest.remove_prefix(at + 1);
+        if (rest.empty()) return std::nullopt;
+    }
     /// Bracketed IPv6 literal — we don't try to do SRV on those.
     /// Operator wanted a literal, treat as legacy.
     if (rest.front() == '[') return std::nullopt;

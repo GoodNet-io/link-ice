@@ -7,6 +7,42 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### `stun://` / `turn://` URI form accepted in `ice.stun_servers` / `ice.turn_servers`
+
+`parse_service_uri` rejected the colloquial `stun://host:port` and
+`turn://user:pass@host:port` URI shapes — the parser pinned the
+RFC 7064 canonical `stun:host[:port]` form, treating the optional
+`//` authority delimiter as part of the hostname. Every operator
+config that emitted the WebRTC `RTCIceServer.urls`-style URI fed
+the `gather` path a malformed hostname (`//10.10.0.10`) on which
+`ensure_remote_cid` returned 0; `start_multi_stun_probes` saw an
+empty pending-probe set and fast-completed the gather without an
+`srflx` candidate. The session then advertised host-only
+candidates, the responder's check ladder saw exactly one
+host-to-host pair across NAT'd subnets, and `run_next_check`
+transitioned to `Failed` after `max_check_retries × check_interval_ms`
+(~200ms) with no nomination.
+
+The parser now strips the optional `//` authority delimiter AND
+the optional `user[:pass]@` userinfo segment per RFC 7065 §3,
+producing a clean `(host, port)` tuple regardless of which URI
+spelling the operator emitted. Both legacy `stun:host:port` and
+modern `stun://host:port` round-trip identically through `gather`
+now.
+
+### `add_remote_candidates` dedup keys on transport
+
+The candidate-merge dedup walked `(ip, port, type)` and dropped a
+TCP-active candidate at the same `(ip, port)` as a UDP host
+candidate as a duplicate. RFC 6544 emits one TCP candidate per
+interface IP per active/passive/SO variant alongside the UDP
+candidate at the matching `local_port`; without the transport
+key in the dedup, the responder's `remote_candidates_` collapsed
+the TCP fallback set into a single UDP entry and the check ladder
+never tried the TCP pairs. The dedup now keys on
+`(ip, port, type, transport)` so every transport variant rides as
+a first-class entry in the merged set.
+
 ### `gn.link.ice.signal` outbound poll surface
 
 `gn_link_ice_signal_api_t` gains a `poll_local` slot so out-of-process
