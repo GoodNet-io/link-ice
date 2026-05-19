@@ -87,6 +87,14 @@ TEST(CandidateFilter, ContradictoryFlagsDropEverything) {
 }
 
 // ── parse_service_uri ──────────────────────────────────────────────────────
+//
+// The parser now delegates host:port splitting to `gn::parse_uri`
+// (sdk/cpp/uri.hpp), with ICE-side preprocessing for the RFC 7064
+// `stun:host[:port]` no-slash form, the RFC 7065 `user[:pass]@`
+// userinfo segment, and the SRV-expansion "no port" branch. These
+// cases pin the contract at the wrapper boundary — any future fix
+// to host/port splitting lands once in the SDK and propagates here
+// for free.
 
 TEST(ParseServiceUri, RejectsLegacyHostPort) {
     /// `stun.example.com:3478` has no scheme prefix — leave it
@@ -167,6 +175,32 @@ TEST(ParseServiceUri, UnknownSchemeRejected) {
 
 TEST(ParseServiceUri, EmptyHostRejected) {
     EXPECT_FALSE(parse_service_uri("stun:").has_value());
+}
+
+TEST(ParseServiceUri, ControlBytesRejectedBySdkGate) {
+    /// CR/LF in the URI would let a peer smuggle an HTTP grammar
+    /// pair into any transport that concatenates the URI into a
+    /// wire frame (uri.en.md §5 #10). The SDK parser's
+    /// `uri_has_control_bytes` gate runs first; this case verifies
+    /// the wrapper inherits that protection.
+    EXPECT_FALSE(parse_service_uri("stun://host\r\n:3478").has_value());
+    EXPECT_FALSE(parse_service_uri("stun:host\x01:3478").has_value());
+}
+
+TEST(ParseServiceUri, PortOverflowRejectedBySdk) {
+    /// Port range and trailing-garbage rejection live in
+    /// `gn::parse_uri`; the wrapper just forwards the result.
+    EXPECT_FALSE(parse_service_uri("stun://host:65536").has_value());
+    EXPECT_FALSE(parse_service_uri("stun:host:99999").has_value());
+    EXPECT_FALSE(parse_service_uri("stun://host:9000x").has_value());
+}
+
+TEST(ParseServiceUri, PortZeroRejected) {
+    /// SRV-expansion uses `port == 0` to mean "ask gn.dns"; an
+    /// explicit `:0` would collide with that signal, so the wrapper
+    /// treats it as malformed regardless of the SDK parser's
+    /// permissive listen-side stance.
+    EXPECT_FALSE(parse_service_uri("stun://host:0").has_value());
 }
 
 // ── stub gn.dns extension + DnsExtClient ───────────────────────────────────

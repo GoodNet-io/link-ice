@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH GoodNet-linking-exception
 #include "dns_ext_client.hpp"
 
+#include <sdk/cpp/uri.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace gn::link::ice {
 
@@ -86,60 +89,83 @@ void srv_emit(void* user, const gn_dns_record_t* rec) {
 // ── parse_service_uri ──────────────────────────────────────────────────────
 
 std::optional<ServiceUri> parse_service_uri(std::string_view raw) {
-    /// Accept the RFC 7064 / 7065 canonical form `stun:host[:port]`
-    /// and `turn:host[:port]` PLUS the colloquial `stun://host[:port]`
-    /// / `turn://host[:port]` forms with the `//` authority
-    /// delimiter — operators routinely emit the latter (the WebRTC
-    /// JS shape `RTCIceServer.urls`, every config-by-example doc on
-    /// the web, etc.) and rejecting them would silently strand
-    /// gather without an `srflx` candidate. The TURN form also
-    /// tolerates a `user:pass@` userinfo prefix because RFC 7065 §3
-    /// lets it ride in the URI, even though our config schema feeds
-    /// credentials through `ice.turn_username` / `turn_password`.
-    /// Everything else (plain "host:port", IP literals,
-    /// "ipc://" path-style URIs, "https:…") returns nullopt so the
-    /// caller knows to treat the entry as legacy.
-    auto colon = raw.find(':');
-    if (colon == std::string_view::npos) return std::nullopt;
-    const auto scheme = raw.substr(0, colon);
+    /// Thin wrapper over `gn::parse_uri` (sdk/cpp/uri.hpp). The SDK
+    /// parser is the single canonical URI parser shared by every
+    /// transport plugin; ICE-specific quirks (RFC 7064's optional
+    /// `//` authority delimiter, RFC 7065's `user[:pass]@` userinfo,
+    /// the SRV-expansion "no port" form) are handled here as
+    /// preprocessing + post-extraction so the SDK parser stays the
+    /// one source of truth for control-byte rejection, port-overflow
+    /// rejection, and `host:port` splitting.
+    ///
+    /// Accepted shapes (rejected → nullopt):
+    ///   stun:host                       — SRV expansion (port == 0)
+    ///   stun:host:port                  — RFC 7064 canonical
+    ///   stun://host[:port]              — colloquial / WebRTC `urls`
+    ///   turn://user[:pass]@host:port    — RFC 7065 with credentials
+    /// Bracketed IPv6 literals, "https:…", and bare "host:port" all
+    /// fall through to nullopt — caller treats those as legacy.
+
+    /// Run the SDK's control-byte gate first so smuggled CR/LF can
+    /// never reach the rest of this function (uri.en.md §5 #10).
+    if (gn::uri_has_control_bytes(raw)) return std::nullopt;
+
+    const auto scheme_end = raw.find(':');
+    if (scheme_end == std::string_view::npos) return std::nullopt;
+    const auto scheme = raw.substr(0, scheme_end);
     if (scheme != "stun" && scheme != "turn") return std::nullopt;
-    auto rest = raw.substr(colon + 1);
+    auto rest = raw.substr(scheme_end + 1);
     if (rest.empty()) return std::nullopt;
-    /// Strip the optional `//` authority-delimiter prefix. Either
-    /// `stun:host` or `stun://host` is accepted; nothing else.
+
+    /// Strip the optional `//` authority-delimiter — RFC 7064 says
+    /// `stun:` (no slashes) is canonical, but every WebRTC config
+    /// shipped in the wild emits `stun://` so we tolerate both.
     if (rest.size() >= 2 && rest[0] == '/' && rest[1] == '/') {
         rest.remove_prefix(2);
         if (rest.empty()) return std::nullopt;
     }
-    /// Drop the optional `user[:pass]@` userinfo segment. Anything
-    /// before the rightmost `@` belongs to userinfo per RFC 3986
-    /// §3.2.1; the authority continues after.
+
+    /// Drop the optional `user[:pass]@` userinfo segment. RFC 7065
+    /// §3 lets credentials ride in the URI; our config schema feeds
+    /// them out-of-band through `ice.turn_username` / `turn_password`,
+    /// so we silently discard whatever's before the rightmost `@`.
     if (auto at = rest.rfind('@'); at != std::string_view::npos) {
         rest.remove_prefix(at + 1);
         if (rest.empty()) return std::nullopt;
     }
-    /// Bracketed IPv6 literal — we don't try to do SRV on those.
-    /// Operator wanted a literal, treat as legacy.
+
+    /// Bracketed IPv6 literal — operator picked an explicit address
+    /// and SRV expansion can't apply. Bounce back to the legacy
+    /// path so the caller falls through to its IP-literal branch.
     if (rest.front() == '[') return std::nullopt;
 
     ServiceUri u;
     u.scheme = std::string(scheme);
 
-    const auto host_end = rest.rfind(':');
-    if (host_end == std::string_view::npos) {
-        /// "stun:host" with no port — SRV expansion.
+    /// No `:` in the authority → SRV-expansion request, no port.
+    /// The SDK parser refuses missing ports by design (uri.en.md §5 #4),
+    /// so this branch is the one piece the SDK can't validate for us
+    /// — we still validated control bytes above.
+    if (rest.find(':') == std::string_view::npos) {
         u.host = std::string(rest);
         u.port = 0;
         return u;
     }
-    u.host = std::string(rest.substr(0, host_end));
-    try {
-        auto p = std::stoul(std::string(rest.substr(host_end + 1)));
-        if (p == 0 || p > 65535) return std::nullopt;
-        u.port = static_cast<std::uint16_t>(p);
-    } catch (...) {
+
+    /// Hand the normalised `scheme://host:port` form to the SDK
+    /// parser. `gn::parse_uri` owns host/port splitting + port-range
+    /// + trailing-garbage rejection from this point on.
+    std::string canonical;
+    canonical.reserve(u.scheme.size() + 3 + rest.size());
+    canonical.append(u.scheme).append("://").append(rest);
+
+    const auto parts = gn::parse_uri(canonical);
+    if (!parts || parts->host.empty() || parts->port == 0) {
         return std::nullopt;
     }
+
+    u.host = parts->host;
+    u.port = parts->port;
     return u;
 }
 

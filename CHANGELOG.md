@@ -7,6 +7,18 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### `dns_ext_client`: drop duplicate URI parser
+
+`parse_service_uri` now thin-wraps `gn::parse_uri` from
+`sdk/cpp/uri.hpp`. The `//` + userinfo bug found earlier is no
+longer reachable from ICE; future URI parsing fixes land once in
+the SDK and propagate to every transport plugin at once. The
+wrapper still owns the RFC 7064 `stun:host` no-slash shape, the
+RFC 7065 `user[:pass]@` userinfo strip, and the SRV-expansion
+"no port" branch — everything else (control-byte gate, host:port
+split, port-range and trailing-garbage rejection) defers to the
+SDK parser.
+
 ### `stun://` / `turn://` URI form accepted in `ice.stun_servers` / `ice.turn_servers`
 
 `parse_service_uri` rejected the colloquial `stun://host:port` and

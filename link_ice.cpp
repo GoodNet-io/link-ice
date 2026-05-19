@@ -21,6 +21,7 @@
 
 #include <sdk/conn_events.h>
 #include <sdk/convenience.h>
+#include <sdk/cpp/uri.hpp>
 
 #include <algorithm>
 #include <array>
@@ -165,22 +166,26 @@ void IceLink::apply_config() noexcept {
             t.port   = svc->port;
             return t;
         }
-        /// Legacy `host:port` string.
-        const std::string s(raw);
-        const auto colon = s.rfind(':');
-        if (colon != std::string::npos) {
-            t.server = s.substr(0, colon);
-            try {
-                const auto p = std::stoul(s.substr(colon + 1));
-                if (p == 0 || p > 65535) return std::nullopt;
-                t.port = static_cast<std::uint16_t>(p);
-            } catch (...) {
-                return std::nullopt;
-            }
+        /// Legacy `host:port` string — hand it to the SDK parser
+        /// (sdk/cpp/uri.hpp) so host:port splitting, port-range and
+        /// trailing-garbage rejection match every other transport.
+        /// A bare hostname without a colon stays addressable as a
+        /// schemeless entry the session FSM treats as host-only;
+        /// an entry that DOES carry a colon but fails SDK parsing
+        /// (port out of range, trailing garbage) bounces to nullopt
+        /// because the operator clearly intended a host:port.
+        if (raw.empty()) return std::nullopt;
+        if (gn::uri_has_control_bytes(raw)) return std::nullopt;
+        if (raw.find(':') == std::string_view::npos) {
+            t.server = std::string(raw);
             return t;
         }
-        if (s.empty()) return std::nullopt;
-        t.server = s;
+        const auto parts = gn::parse_uri(raw);
+        if (!parts || parts->host.empty() || parts->port == 0) {
+            return std::nullopt;
+        }
+        t.server = parts->host;
+        t.port   = parts->port;
         return t;
     };
 
