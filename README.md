@@ -9,11 +9,27 @@ prioritised connectivity checks, and surfaces post-nomination
 bytes through `host_api->notify_inbound_bytes`.
 
 ICE has no listening port — candidates ride out-of-band through the
-peer-to-peer `gn.link.ice.signal` extension. A signaling handler
-(heartbeat, a future signaling channel, or a bridge) calls
-`offer(peer_pk, blob)` / `answer(peer_pk, blob)` to deliver
-serialized candidate sets; the link maps `peer_pk` onto an
-`IceSession` and feeds the FSM.
+peer-to-peer `gn.link.ice.signal` extension. The extension is
+bidirectional:
+
+- **Inbound** (peer → us): a signaling handler calls
+  `offer(peer_pk, blob)` / `answer(peer_pk, blob)` (plus the
+  RFC 8838 §10 end-of-candidates variants `offer_eoc` /
+  `answer_eoc`) to deliver serialised candidate sets. The link maps
+  `peer_pk` onto an `IceSession` and feeds the FSM.
+- **Outbound** (us → peer): the signaling handler polls
+  `poll_local(peer_pk, &kind, buf, cap, &len)` to drain the
+  freshly serialised local-side candidate blob. `kind` is
+  `ICE_SIGNAL_OFFER_EOC` when this side is controlling,
+  `ICE_SIGNAL_ANSWER_EOC` when responding. Returns
+  `GN_ERR_NOT_FOUND` when no signal is queued for that peer (gather
+  still in progress or the queue was already drained); returns
+  `GN_ERR_OUT_OF_RANGE` with the required size in `*len` if `cap`
+  is too small (the queue entry stays in place for retry).
+
+The extension version is `0x00020000` since the outbound `poll_local`
+slot was added — older consumers that pin `0x00010000` fail the
+extension version check at register time.
 
 **Kind**: link · **Artefact**: dynamic plugin (`.so` via dlopen)
 · **License**: GPL-2.0 with Linking Exception (see `LICENSE`)

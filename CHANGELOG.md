@@ -7,6 +7,31 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### `gn.link.ice.signal` outbound poll surface
+
+`gn_link_ice_signal_api_t` gains a `poll_local` slot so out-of-process
+hosts (signalling bridges, the docker test harness, third-party
+glue) can drain serialised local-side candidate blobs without
+reaching into `IceLink::sessions_` C++. The slot returns one queued
+blob per call keyed by the peer pubkey, tagged with the matching
+`ICE_SIGNAL_*` kind (OFFER_EOC when this side is controlling,
+ANSWER_EOC when responding). `on_gathered` in `make_callbacks` /
+`make_composer_callbacks` was a no-op stub previously — it now
+serialises the full local candidate set, ufrag/pwd, and signal
+flags via the existing `serialize_signal` helper into a per-peer
+outbound queue.
+
+`OUT_OF_RANGE` returns leave the queue entry in place and surface
+the required buffer size in `*blob_len_out` so callers can retry
+with a sized buffer instead of dropping the blob. `NOT_FOUND` is
+the steady-state response once a peer's queue is drained — callers
+poll on whatever cadence their signalling channel demands.
+
+The shape change forces a version bump of `kIceSignalVersion` to
+`0x00020000`. Older consumers that pin `0x00010000` fail the
+`register_extension` version check at load time so the breaking
+ABI change cannot bind silently.
+
 ### TURN TCP allocations (RFC 6062)
 
 The TURN allocation flow learns the TCP-relay variant from RFC

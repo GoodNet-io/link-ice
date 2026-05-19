@@ -414,6 +414,205 @@ TEST(IceLink, RestartSessionAfterShutdownIsInvalidState) {
     EXPECT_EQ(t->restart_session(conn), GN_ERR_INVALID_STATE);
 }
 
+// ── poll_local outbound surface (v0x00020000) ──────────────────────────
+
+TEST(IceLinkPollLocal, GathererPublishesOfferEocForController) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    /// Controller-role connect — host gather runs synchronously, then
+    /// `on_gathered` fires the outbound publish.
+    const std::string uri = std::string("ice://") + kPeerPkHex;
+    ASSERT_EQ(t->connect(uri), GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s,
+              "initiator notify_connect");
+
+    /// Poll until the outbound queue carries the OFFER_EOC blob the
+    /// gather just enqueued. Loop bounded by the same 1s budget as
+    /// every other connect-side wait in this suite.
+    auto pk = peer_pk_bytes();
+    std::vector<std::uint8_t> buf(8192);
+    std::uint32_t kind = 0;
+    std::size_t blob_len = 0;
+    bool got_signal = false;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto rc = t->poll_local_signal(pk.data(), &kind,
+                                               buf.data(), buf.size(),
+                                               &blob_len);
+        if (rc == GN_OK) { got_signal = true; break; }
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_TRUE(got_signal);
+    EXPECT_EQ(kind,
+        static_cast<std::uint32_t>(gn::link::ice::ICE_SIGNAL_OFFER_EOC));
+    /// Without a wired UDP carrier in StubHost, gather produces no
+    /// host candidates and the blob is just the IceSignalData header
+    /// carrying our ufrag/pwd. Assert at least the header is present
+    /// so the round-trip via `deserialize_signal` is well-formed.
+    EXPECT_GE(blob_len, sizeof(gn::link::ice::IceSignalData));
+    gn::link::ice::IceSignalData parsed_hdr{};
+    std::vector<gn::link::ice::Candidate> parsed_cands;
+    EXPECT_TRUE(gn::link::ice::deserialize_signal(
+        std::span<const std::uint8_t>(buf.data(), blob_len),
+        parsed_hdr, parsed_cands));
+
+    /// Drained — second poll on the same peer returns NOT_FOUND
+    /// because the gather only fires `on_gathered` once.
+    EXPECT_EQ(t->poll_local_signal(pk.data(), &kind, buf.data(),
+                                     buf.size(), &blob_len),
+              GN_ERR_NOT_FOUND);
+
+    t->shutdown();
+}
+
+TEST(IceLinkPollLocal, OutboundQueueIsPerPeer) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    /// Different peer pubkey — never connected, so no queued blob.
+    std::array<std::uint8_t, GN_PUBLIC_KEY_BYTES> other_pk{};
+    for (std::size_t i = 0; i < GN_PUBLIC_KEY_BYTES; ++i) {
+        other_pk[i] = static_cast<std::uint8_t>(0xFF - i);
+    }
+
+    std::vector<std::uint8_t> buf(8192);
+    std::uint32_t kind = 0;
+    std::size_t blob_len = 0;
+    EXPECT_EQ(t->poll_local_signal(other_pk.data(), &kind, buf.data(),
+                                     buf.size(), &blob_len),
+              GN_ERR_NOT_FOUND);
+
+    t->shutdown();
+}
+
+TEST(IceLinkPollLocal, BufferTooSmallReturnsOutOfRangeAndKeepsEntry) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    const std::string uri = std::string("ice://") + kPeerPkHex;
+    ASSERT_EQ(t->connect(uri), GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s, "connect");
+
+    /// Wait until the outbound entry is queued.
+    auto pk = peer_pk_bytes();
+    std::vector<std::uint8_t> tiny(4);  // too small for any signal
+    std::uint32_t kind = 0;
+    std::size_t blob_len = 0;
+    gn_result_t rc = GN_ERR_NOT_FOUND;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        rc = t->poll_local_signal(pk.data(), &kind,
+                                    tiny.data(), tiny.size(), &blob_len);
+        if (rc == GN_ERR_OUT_OF_RANGE) break;
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_EQ(rc, GN_ERR_OUT_OF_RANGE);
+    EXPECT_GT(blob_len, tiny.size());
+
+    /// Entry retained — retry with a large enough buffer succeeds.
+    std::vector<std::uint8_t> big(blob_len);
+    std::size_t blob_len2 = 0;
+    EXPECT_EQ(t->poll_local_signal(pk.data(), &kind,
+                                     big.data(), big.size(), &blob_len2),
+              GN_OK);
+    EXPECT_EQ(blob_len2, blob_len);
+
+    t->shutdown();
+}
+
+TEST(IceLinkPollLocal, NullArgsReturnNullArg) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    auto pk = peer_pk_bytes();
+    std::uint32_t kind = 0;
+    std::size_t blob_len = 0;
+    std::vector<std::uint8_t> buf(64);
+
+    EXPECT_EQ(t->poll_local_signal(nullptr, &kind, buf.data(),
+                                     buf.size(), &blob_len),
+              GN_ERR_NULL_ARG);
+    EXPECT_EQ(t->poll_local_signal(pk.data(), nullptr, buf.data(),
+                                     buf.size(), &blob_len),
+              GN_ERR_NULL_ARG);
+    EXPECT_EQ(t->poll_local_signal(pk.data(), &kind, buf.data(),
+                                     buf.size(), nullptr),
+              GN_ERR_NULL_ARG);
+    /// `blob_cap > 0` requires a non-null `blob_out`.
+    EXPECT_EQ(t->poll_local_signal(pk.data(), &kind, nullptr,
+                                     64, &blob_len),
+              GN_ERR_NULL_ARG);
+    /// `blob_cap == 0` with null `blob_out` is allowed as a probe:
+    /// it returns OUT_OF_RANGE if a blob is queued so callers can
+    /// size their buffer.
+    /// (Not asserted here — depends on timing of the queued blob.)
+
+    t->shutdown();
+}
+
+TEST(IceLinkPollLocal, AnswerEocForResponderRole) {
+    auto t = std::make_shared<IceLink>();
+    StubHost h;
+    auto api = make_stub_api(h);
+    t->set_host_api(&api);
+
+    /// Deliver a remote OFFER — this allocates a responder-role
+    /// session, which calls `gather()` whose `on_gathered` fires
+    /// the local `ANSWER_EOC` publish.
+    gn::link::ice::IceSignalData hdr{};
+    const char ufrag[] = "REMUufra";
+    std::memcpy(hdr.ufrag, ufrag, sizeof(hdr.ufrag));
+    const char pwd[] = "REMpwdtestpwd_secret_value_h";
+    std::memcpy(hdr.pwd, pwd, std::min(sizeof(hdr.pwd), sizeof(pwd)));
+    hdr.candidate_count = 0;
+    std::vector<std::uint8_t> blob(sizeof(hdr));
+    std::memcpy(blob.data(), &hdr, sizeof(hdr));
+
+    auto pk = peer_pk_bytes();
+    ASSERT_EQ(t->deliver_signal(pk.data(),
+                                  gn::link::ice::ICE_SIGNAL_OFFER,
+                                  std::span<const std::uint8_t>(
+                                      blob.data(), blob.size())),
+              GN_OK);
+    wait_for([&] { return h.connects.load() >= 1; }, 1s,
+              "responder notify_connect");
+
+    std::vector<std::uint8_t> buf(8192);
+    std::uint32_t kind = 0;
+    std::size_t blob_len = 0;
+    bool got_signal = false;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto rc = t->poll_local_signal(pk.data(), &kind,
+                                               buf.data(), buf.size(),
+                                               &blob_len);
+        if (rc == GN_OK) { got_signal = true; break; }
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_TRUE(got_signal);
+    EXPECT_EQ(kind,
+        static_cast<std::uint32_t>(gn::link::ice::ICE_SIGNAL_ANSWER_EOC));
+
+    t->shutdown();
+}
+
+TEST(IceLinkPollLocal, SignalExtensionVersionBumped) {
+    /// The bump to 0x00020000 is the canary the harness uses to
+    /// detect a plugin .so that lacks the outbound `poll_local`
+    /// slot. Hard-coded here so any future shape change re-triggers
+    /// review.
+    EXPECT_EQ(gn::link::ice::kIceSignalVersion, 0x00020000U);
+}
+
 TEST(IceLink, DisconnectIsIdempotent) {
     auto t = std::make_shared<IceLink>();
     StubHost h;

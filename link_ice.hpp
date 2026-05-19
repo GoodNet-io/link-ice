@@ -53,7 +53,12 @@ inline constexpr std::uint32_t kDefaultMtu = 1200;
 
 /// `gn.link.ice.signal` extension version — bumped only on shape
 /// breakage of `gn_link_ice_signal_api_t` below.
-inline constexpr std::uint32_t kIceSignalVersion = 0x00010000U;
+/// 0x00020000 adds the outbound `poll_local` slot so out-of-process
+/// hosts can drain serialised local-side candidate blobs without
+/// reaching into `IceLink::sessions_`. The shape break makes the
+/// version bump load-bearing — older consumers that pin 0x00010000
+/// will refuse to bind against the new vtable layout.
+inline constexpr std::uint32_t kIceSignalVersion = 0x00020000U;
 
 /// `gn.link.ice.path_mtu` extension version. Bump on shape breakage
 /// of `gn_link_ice_path_mtu_api_t` below.
@@ -121,6 +126,39 @@ extern "C" struct gn_link_ice_signal_api_s {
                                 const std::uint8_t* blob,
                                 std::size_t blob_size);
 
+    /// Poll the latest serialised local-side signal blob for @p peer_pk.
+    /// `kind_out` returns one of `ICE_SIGNAL_OFFER` / `ICE_SIGNAL_ANSWER`
+    /// / `ICE_SIGNAL_OFFER_EOC` / `ICE_SIGNAL_ANSWER_EOC` matching the
+    /// inbound `offer` / `answer` / `offer_eoc` / `answer_eoc` slots.
+    /// `blob_out` is a caller-provided buffer of `blob_cap` bytes;
+    /// `blob_len_out` receives the actual blob length.
+    ///
+    /// Returns:
+    ///   `GN_OK`             — a fresh blob was returned and drained
+    ///                          from the per-peer queue.
+    ///   `GN_ERR_NOT_FOUND`  — no pending local signal for that peer
+    ///                          (gathering still in progress, or the
+    ///                          queue was drained by a previous call).
+    ///   `GN_ERR_OUT_OF_RANGE` — `blob_cap` is too small; the queue
+    ///                          entry is left intact and
+    ///                          `blob_len_out` is populated with the
+    ///                          required size so callers can retry
+    ///                          with a larger buffer.
+    ///   `GN_ERR_NULL_ARG`   — any required pointer is null.
+    ///
+    /// Each successful poll drains one queued blob: callers should
+    /// loop until `GN_ERR_NOT_FOUND` to flush all pending trickle
+    /// batches for a peer. The final entry of any gather is the
+    /// `*_EOC` variant carrying the full local candidate set — peers
+    /// that miss intermediate trickle batches still see the complete
+    /// state once gather completes.
+    gn_result_t (*poll_local)(void* ctx,
+                                const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+                                std::uint32_t* kind_out,
+                                std::uint8_t* blob_out,
+                                std::size_t blob_cap,
+                                std::size_t* blob_len_out);
+
     void* ctx;
     void* _reserved[2];
 };
@@ -176,6 +214,23 @@ public:
         const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
         std::uint8_t kind,
         std::span<const std::uint8_t> blob);
+
+    /// Drain the next outbound signal blob queued for @p peer_pk.
+    /// Mirrors the contract of `gn_link_ice_signal_api_t::poll_local` —
+    /// see that header for the return-code semantics. Public so the
+    /// `plugin_entry.cpp` thunk for the `poll_local` slot can dispatch
+    /// without reaching into the outbound queue directly.
+    ///
+    /// On `GN_OK` the queued entry is removed. On `GN_ERR_OUT_OF_RANGE`
+    /// the entry stays so the caller can retry with a larger buffer;
+    /// `*blob_len_out` carries the size needed. `kind_out` is populated
+    /// with the on-the-wire `ICE_SIGNAL_*` kind from `candidate.hpp`.
+    [[nodiscard]] gn_result_t poll_local_signal(
+        const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+        std::uint32_t* kind_out,
+        std::uint8_t* blob_out,
+        std::size_t blob_cap,
+        std::size_t* blob_len_out);
 
     /// Snapshot of nomination metrics for `conn`. Used by
     /// `gn.link.ice` metrics extension consumers (strategy plugins
@@ -386,6 +441,29 @@ private:
     std::vector<ComposerAcceptSub>                        composer_accept_subs_;
     std::atomic<std::uint64_t>                            next_composer_id_{1};
     std::atomic<gn_subscription_id_t>                     next_accept_token_{1};
+
+    /// Outbound signal queue. Populated from the strand by
+    /// `make_callbacks().on_gathered` once per gather: the serialised
+    /// OFFER_EOC / ANSWER_EOC blob (with the full local candidate
+    /// set) is appended and waits for an out-of-process consumer to
+    /// drain it through the `poll_local` slot of `gn.link.ice.signal`.
+    /// Keyed by the peer pubkey hex so consumers index by the same
+    /// identifier they used for `connect("ice://<hex>")`.
+    struct OutboundSignal {
+        std::uint32_t          kind;
+        std::vector<std::uint8_t> blob;
+    };
+    mutable std::mutex                                    outbound_mu_;
+    std::unordered_map<std::string, std::vector<OutboundSignal>>
+                                                            outbound_signals_;
+
+    /// Strand-side helper: serialise the session's local candidate
+    /// set + ufrag/pwd + flags and append the resulting blob to
+    /// `outbound_signals_` under the peer pubkey. `kind` picks
+    /// OFFER_EOC when the session is controlling, ANSWER_EOC
+    /// otherwise — out-of-process consumers route the blob to the
+    /// peer's `offer_eoc` or `answer_eoc` slot accordingly.
+    void enqueue_local_signal(const std::shared_ptr<IceSession>& session);
 };
 
 }  // namespace gn::link::ice

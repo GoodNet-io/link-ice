@@ -293,6 +293,21 @@ gn_result_t signal_ext_answer_eoc(void* ctx,
     } catch (...) { return GN_ERR_NULL_ARG; }
 }
 
+gn_result_t signal_ext_poll_local(void* ctx,
+                                     const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+                                     std::uint32_t* kind_out,
+                                     std::uint8_t* blob_out,
+                                     std::size_t blob_cap,
+                                     std::size_t* blob_len_out) {
+    if (!ctx || !peer_pk || !kind_out || !blob_len_out) return GN_ERR_NULL_ARG;
+    if (blob_cap > 0 && !blob_out) return GN_ERR_NULL_ARG;
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        return p->link->poll_local_signal(peer_pk, kind_out,
+                                            blob_out, blob_cap, blob_len_out);
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
 void install_link_extension(IcePlugin* p) {
     auto& v = p->link_extension_vtable;
     v                  = gn_link_api_t{};
@@ -341,6 +356,7 @@ void install_signal_extension(IcePlugin* p) {
     v.answer        = &signal_ext_answer;
     v.offer_eoc     = &signal_ext_offer_eoc;
     v.answer_eoc    = &signal_ext_answer_eoc;
+    v.poll_local    = &signal_ext_poll_local;
     v.ctx           = p;
 }
 

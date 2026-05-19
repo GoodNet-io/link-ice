@@ -667,9 +667,21 @@ IceSessionCallbacks IceLink::make_composer_callbacks(
     auto weak_self = std::weak_ptr<IceLink>(shared_from_this());
     return {
         .on_gathered = [weak_self, cid](const std::string&) {
-            (void)cid;
             auto self = weak_self.lock();
             if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            /// Same outbound-signal serialisation as the kernel-side
+            /// `make_callbacks` path — composer-owned sessions still
+            /// need to publish their local candidate set so the
+            /// remote peer can drive checks.
+            std::shared_ptr<IceSession> session;
+            {
+                std::lock_guard lk(self->composer_mu_);
+                auto it = self->composer_sessions_.find(cid);
+                if (it != self->composer_sessions_.end()) {
+                    session = it->second.session;
+                }
+            }
+            if (session) self->enqueue_local_signal(session);
         },
         /// Nomination — fire composer accept-bus subscribers so the
         /// L2 (QUIC / DTLS) can install per-cid data subscriptions
@@ -750,9 +762,22 @@ IceSessionCallbacks IceLink::make_callbacks(gn_conn_id_t id) {
     auto weak_self = std::weak_ptr<IceLink>(shared_from_this());
     return {
         .on_gathered = [weak_self, id](const std::string&) {
-            (void)id;
             auto self = weak_self.lock();
             if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
+            /// Serialise the freshly gathered local-side candidate
+            /// set into the outbound queue so out-of-process hosts
+            /// (harness / signalling bridge) can drain it through
+            /// the `gn.link.ice.signal` extension's `poll_local`
+            /// slot and forward to the peer. Was a no-op stub — the
+            /// missing wire here is exactly what stalled the 3-node
+            /// docker harness in `Gathering` forever.
+            std::shared_ptr<IceSession> session;
+            {
+                std::lock_guard lk(self->sessions_mu_);
+                auto it = self->sessions_.find(id);
+                if (it != self->sessions_.end()) session = it->second.session;
+            }
+            if (session) self->enqueue_local_signal(session);
         },
         .on_connected = [weak_self, id](const std::string&,
                                           const std::string& /*ip*/,
@@ -866,6 +891,26 @@ gn_result_t IceLink::connect(std::string_view uri) {
         {
             std::lock_guard cfg_lk(cfg_mu_);
             cfg_snap = cfg_;
+        }
+        /// Lazy carrier resolution. `set_host_api` runs at plugin
+        /// init phase — peer link plugins (`gn.link.udp`,
+        /// `gn.link.tcp`, `gn.link.tls`) only register their
+        /// extension vtables in the kernel's register phase that
+        /// follows, so the first `query_extension_checked` from init
+        /// returns NOT_FOUND. Retry here on the connect path: by the
+        /// time the host actually issues `gn_core_connect`, every
+        /// plugin has finished registering. Without this retry,
+        /// gather runs with `carrier_ == nullptr` and produces zero
+        /// host / srflx / relay candidates — the FSM goes
+        /// straight to a stalled WaitingRemote.
+        if (api_ != nullptr && !carrier_udp_) {
+            carrier_udp_ = gn::sdk::LinkCarrier::query(api_, "udp");
+        }
+        if (api_ != nullptr && !carrier_tcp_) {
+            carrier_tcp_ = gn::sdk::LinkCarrier::query(api_, "tcp");
+        }
+        if (api_ != nullptr && !carrier_tls_) {
+            carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
         }
         gn::sdk::LinkCarrier* carrier_ptr =
             carrier_udp_.has_value() ? &*carrier_udp_ : nullptr;
@@ -1123,17 +1168,36 @@ gn_result_t IceLink::deliver_signal(
         if (!api_ || !api_->notify_connect) return GN_ERR_NOT_IMPLEMENTED;
         gn_conn_id_t conn = GN_INVALID_ID;
         std::shared_ptr<IceSession> session;
+        /// Check the composer side first — `gn_core_connect("ice://…")`
+        /// lands there via the `gn.link.ice` extension's `connect`
+        /// slot, so a controller-role session created from a kernel
+        /// host call lives in `composer_sessions_`. Fold the incoming
+        /// OFFER's candidates into it before considering responder
+        /// allocation.
+        {
+            std::lock_guard lk(composer_mu_);
+            if (auto it = composer_peer_to_id_.find(peer_hex);
+                it != composer_peer_to_id_.end()) {
+                auto cit = composer_sessions_.find(it->second);
+                if (cit != composer_sessions_.end()) {
+                    session = cit->second.session;
+                }
+            }
+        }
         {
             std::lock_guard lk(sessions_mu_);
-            if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
-                /// Already gathering / checking against this peer —
-                /// fold the freshly arrived candidates into the
-                /// existing session.
-                auto sit = sessions_.find(it->second);
-                if (sit != sessions_.end()) {
-                    session = sit->second.session;
+            if (!session) {
+                if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
+                    /// Already gathering / checking against this peer —
+                    /// fold the freshly arrived candidates into the
+                    /// existing session.
+                    auto sit = sessions_.find(it->second);
+                    if (sit != sessions_.end()) {
+                        session = sit->second.session;
+                    }
                 }
-            } else {
+            }
+            if (!session) {
                 const std::string canonical = "ice://" + peer_hex;
                 const auto rc = api_->notify_connect(
                     api_->host_ctx, peer_pk, canonical.c_str(),
@@ -1144,6 +1208,20 @@ gn_result_t IceLink::deliver_signal(
                 {
                     std::lock_guard cfg_lk(cfg_mu_);
                     cfg_snap = cfg_;
+                }
+                /// Lazy carrier resolution — see the matching block
+                /// in `connect()` for the why. Plugin init runs
+                /// before peer plugins finish registering their
+                /// extensions; the responder allocation here can
+                /// happen well after init, so retry the query.
+                if (api_ != nullptr && !carrier_udp_) {
+                    carrier_udp_ = gn::sdk::LinkCarrier::query(api_, "udp");
+                }
+                if (api_ != nullptr && !carrier_tcp_) {
+                    carrier_tcp_ = gn::sdk::LinkCarrier::query(api_, "tcp");
+                }
+                if (api_ != nullptr && !carrier_tls_) {
+                    carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
                 }
                 gn::sdk::LinkCarrier* carrier_ptr =
                     carrier_udp_.has_value() ? &*carrier_udp_ : nullptr;
@@ -1191,15 +1269,29 @@ gn_result_t IceLink::deliver_signal(
     /// ANSWER path — must correlate to an existing controller-role
     /// session. A stray answer with no in-flight session is
     /// `GN_ERR_NOT_FOUND` rather than spawning a fresh responder.
+    /// Both the kernel-side `sessions_` map and the composer-side
+    /// `composer_sessions_` map are consulted: a kernel host that
+    /// reaches `gn_core_connect("ice://…")` actually lands in the
+    /// composer surface (the `gn.link.ice` extension's `connect`
+    /// slot routes there), so the controller-role session for a
+    /// given peer can live in either map depending on the caller.
     std::shared_ptr<IceSession> session;
     {
         std::lock_guard lk(sessions_mu_);
-        auto it = peer_to_id_.find(peer_hex);
-        if (it == peer_to_id_.end()) return GN_ERR_NOT_FOUND;
-        auto sit = sessions_.find(it->second);
-        if (sit == sessions_.end()) return GN_ERR_NOT_FOUND;
-        session = sit->second.session;
+        if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
+            auto sit = sessions_.find(it->second);
+            if (sit != sessions_.end()) session = sit->second.session;
+        }
     }
+    if (!session) {
+        std::lock_guard lk(composer_mu_);
+        if (auto it = composer_peer_to_id_.find(peer_hex);
+            it != composer_peer_to_id_.end()) {
+            auto cit = composer_sessions_.find(it->second);
+            if (cit != composer_sessions_.end()) session = cit->second.session;
+        }
+    }
+    if (!session) return GN_ERR_NOT_FOUND;
     if (session) {
         session->set_peer_signal_flags(signal_flags);
         /// Trickle-friendly: ANSWER blobs merge into the existing
@@ -1213,6 +1305,77 @@ gn_result_t IceLink::deliver_signal(
                 session->add_remote_candidates(
                     ufrag, pwd, std::move(cands), eoc);
             });
+    }
+    return GN_OK;
+}
+
+void IceLink::enqueue_local_signal(
+    const std::shared_ptr<IceSession>& session) {
+    if (!session) return;
+    /// Snapshot under the session's `local_state_mu_` (accessors
+    /// already hold it) so we serialise a consistent view without
+    /// blocking the strand mid-write.
+    const auto cands  = session->local_candidates();
+    const auto ufrag  = session->local_ufrag();
+    const auto pwd    = session->local_pwd();
+    const auto flags  = session->local_signal_flags();
+    /// Empty candidate sets are legal under trickle ICE — the
+    /// envelope still carries our ufrag/pwd so the peer can match
+    /// inbound check requests. Subsequent trickle deltas can ride
+    /// the same per-peer queue once srflx / relay land. Log only
+    /// (not skip) so production operators can spot a gather that
+    /// produced nothing usable.
+    if (cands.empty()) {
+        gn_log_info(api_,
+            "ice: on_gathered with empty local candidate set "
+            "(peer=%s) — publishing ufrag/pwd-only signal",
+            session->peer_id().c_str());
+    }
+    auto blob = serialize_signal(ufrag.c_str(), pwd.c_str(), cands, flags);
+    /// Controlling = we issued the OFFER, so the local-side blob
+    /// is the OFFER_EOC for the peer's responder-allocate path.
+    /// Non-controlling = we got the OFFER first and are now sending
+    /// our ANSWER_EOC.
+    const std::uint32_t kind = session->is_controlling()
+        ? static_cast<std::uint32_t>(ICE_SIGNAL_OFFER_EOC)
+        : static_cast<std::uint32_t>(ICE_SIGNAL_ANSWER_EOC);
+    {
+        std::lock_guard lk(outbound_mu_);
+        outbound_signals_[session->peer_id()].push_back(
+            OutboundSignal{kind, std::move(blob)});
+    }
+}
+
+gn_result_t IceLink::poll_local_signal(
+    const std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES],
+    std::uint32_t* kind_out,
+    std::uint8_t* blob_out,
+    std::size_t blob_cap,
+    std::size_t* blob_len_out) {
+    if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_INVALID_STATE;
+    if (!peer_pk || !kind_out || !blob_len_out) return GN_ERR_NULL_ARG;
+    if (blob_cap > 0 && !blob_out) return GN_ERR_NULL_ARG;
+    const auto peer_hex = pk_to_hex(peer_pk);
+    std::lock_guard lk(outbound_mu_);
+    auto it = outbound_signals_.find(peer_hex);
+    if (it == outbound_signals_.end() || it->second.empty()) {
+        return GN_ERR_NOT_FOUND;
+    }
+    const auto& entry = it->second.front();
+    *blob_len_out = entry.blob.size();
+    if (entry.blob.size() > blob_cap) {
+        /// Buffer too small — surface the required size but leave
+        /// the queue entry intact so callers can retry without
+        /// dropping the blob on the floor.
+        return GN_ERR_OUT_OF_RANGE;
+    }
+    *kind_out = entry.kind;
+    if (entry.blob.size() > 0) {
+        std::memcpy(blob_out, entry.blob.data(), entry.blob.size());
+    }
+    it->second.erase(it->second.begin());
+    if (it->second.empty()) {
+        outbound_signals_.erase(it);
     }
     return GN_OK;
 }
@@ -1304,6 +1467,18 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
         {
             std::lock_guard cfg_lk(cfg_mu_);
             cfg_snap = cfg_;
+        }
+        /// Lazy carrier resolution — same rationale as kernel-side
+        /// `connect()`. Composer connects happen after init, so the
+        /// peer link plugins are guaranteed registered by now.
+        if (api_ != nullptr && !carrier_udp_) {
+            carrier_udp_ = gn::sdk::LinkCarrier::query(api_, "udp");
+        }
+        if (api_ != nullptr && !carrier_tcp_) {
+            carrier_tcp_ = gn::sdk::LinkCarrier::query(api_, "tcp");
+        }
+        if (api_ != nullptr && !carrier_tls_) {
+            carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
         }
         gn::sdk::LinkCarrier* carrier_ptr =
             carrier_udp_.has_value() ? &*carrier_udp_ : nullptr;
