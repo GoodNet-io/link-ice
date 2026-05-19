@@ -22,12 +22,15 @@
 #include <asio/dispatch.hpp>
 #include <asio/post.hpp>
 
+#include <sdk/cpp/uri.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -54,6 +57,38 @@ std::string endpoint_uri(const std::string& ip, uint16_t port) {
 
 std::string endpoint_uri_tcp(const std::string& ip, uint16_t port) {
     return "tcp://" + ip + ":" + std::to_string(port);
+}
+
+/// Split a `cfg_.stun_servers` entry (always bare `host:port` per the
+/// `link_ice.cpp` normalisation pipeline; see `push_stun`) into its
+/// host + port halves through the SDK's canonical URI parser. Prepends
+/// `stun://` so `gn::parse_uri` (sdk/cpp/uri.hpp) handles the
+/// `host:port` split, port-range, and trailing-garbage rejection.
+/// Symmetric with `parse_service_uri` (dns_ext_client.cpp) — same
+/// parser for every form of STUN-server input.
+///
+/// When the entry carries no `:` at all, fall back to the historic
+/// default-port behaviour (`3478`, RFC 5389 §9) so an operator that
+/// configured only a hostname still gets a working probe.
+///
+/// Returns nullopt on every failure the SDK parser rejects: empty
+/// host, malformed port, port > 65535, trailing garbage, control
+/// bytes. Callers `continue` past such entries.
+std::optional<std::pair<std::string, std::uint16_t>>
+split_stun_host_port(std::string_view server) {
+    if (server.empty()) return std::nullopt;
+    if (server.find(':') == std::string_view::npos) {
+        return std::make_pair(std::string(server),
+                              static_cast<std::uint16_t>(3478));
+    }
+    std::string canonical;
+    canonical.reserve(7 + server.size());
+    canonical.append("stun://").append(server);
+    const auto parts = gn::parse_uri(canonical);
+    if (!parts || parts->host.empty() || parts->port == 0) {
+        return std::nullopt;
+    }
+    return std::make_pair(parts->host, parts->port);
 }
 
 }  // namespace
@@ -849,19 +884,10 @@ void IceSession::gather_tcp_server_reflexive() {
     if (cfg_.stun_servers.empty()) return;
 
     for (auto& server : cfg_.stun_servers) {
-        std::string host = server;
-        std::uint16_t port = 3478;
-        auto colon = server.rfind(':');
-        if (colon != std::string::npos) {
-            host = server.substr(0, colon);
-            try {
-                auto port_val = std::stoul(server.substr(colon + 1));
-                if (port_val > 65535) continue;
-                port = static_cast<std::uint16_t>(port_val);
-            } catch (...) {
-                continue;
-            }
-        }
+        const auto split = split_stun_host_port(server);
+        if (!split) continue;
+        const auto& host = split->first;
+        const auto  port = split->second;
         auto cid = ensure_remote_tcp_cid(host, port);
         if (cid == 0) continue;
         auto txn = generate_txn_id();
@@ -882,19 +908,10 @@ void IceSession::start_multi_stun_probes() {
     /// later and are dropped because `pending_stun_probes_` is cleared
     /// on first success.
     for (auto& server : cfg_.stun_servers) {
-        std::string host = server;
-        uint16_t    port = 3478;
-        auto colon = server.rfind(':');
-        if (colon != std::string::npos) {
-            host = server.substr(0, colon);
-            try {
-                auto port_val = std::stoul(server.substr(colon + 1));
-                if (port_val > 65535) continue;
-                port = static_cast<uint16_t>(port_val);
-            } catch (...) {
-                continue;
-            }
-        }
+        const auto split = split_stun_host_port(server);
+        if (!split) continue;
+        const auto& host = split->first;
+        const auto  port = split->second;
 
         auto cid = ensure_remote_cid(host, port);
         if (cid == 0) continue;
