@@ -500,14 +500,34 @@ void TurnClient::on_data_connection_inbound(
         return;
     }
 
-    /// Pre-bind state: STUN-framed response stream. Accumulate
-    /// arbitrary chunks until a complete length-prefixed envelope
-    /// is reassembled.
-    auto& buf = data_conn_rx_buffers_[cid];
+    /// Pre-bind state: STUN-framed response stream. The accumulated
+    /// rx buffer lives in `data_conn_rx_buffers_[cid]` until the
+    /// carrier transitions to bound, at which point
+    /// `dispatch_data_conn_message` removes it from the map. The
+    /// dispatch sits beneath `try_take_stream_frame` on the same
+    /// stack, so the buffer is moved out and drained from a local
+    /// — any tail is moved back only while the carrier is still
+    /// pre-bind, since bound carriers route raw bytes through
+    /// `data_cb_` and don't consult this map.
+    std::vector<std::uint8_t> buf;
+    {
+        std::lock_guard lk(mu_);
+        auto it = data_conn_rx_buffers_.find(cid);
+        if (it != data_conn_rx_buffers_.end()) {
+            buf = std::move(it->second);
+            data_conn_rx_buffers_.erase(it);
+        }
+    }
     buf.insert(buf.end(), bytes.begin(), bytes.end());
     std::vector<std::uint8_t> frame;
     while (try_take_stream_frame(buf, frame)) {
         dispatch_data_conn_message(cid, frame);
+    }
+    if (!buf.empty()) {
+        std::lock_guard lk(mu_);
+        if (bound_peers_.find(cid) == bound_peers_.end()) {
+            data_conn_rx_buffers_[cid] = std::move(buf);
+        }
     }
 }
 
