@@ -2032,13 +2032,27 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
 
         /// Gather-phase responses come from operator-configured STUN
         /// servers that do NOT share our local pwd, so they carry no
-        /// MESSAGE-INTEGRITY. The transaction-id match in
-        /// `handle_gather_response` provides the necessary
-        /// off-path protection (attacker must guess a 12-byte id to
-        /// inject a fake srflx). Peer-side messages — checks, consent,
-        /// nomination — still pass through the integrity gate below.
-        if (st == SessionState::Gathering &&
-            parsed->msg_type == STUN_BINDING_RESPONSE) {
+        /// MESSAGE-INTEGRITY. The transaction-id match against
+        /// `pending_stun_probes_` is the gate: an attacker would
+        /// have to guess a 12-byte transaction id to inject a fake
+        /// srflx, which is the same off-path protection the standard
+        /// STUN BINDING-REQUEST/RESPONSE pair relies on.
+        ///
+        /// Gate on `pending_stun_probes_` rather than `state`. The
+        /// responder flow flips state to Checking the moment the
+        /// peer's OFFER merges remote candidates, but the gather-
+        /// side STUN probes are still in flight against the
+        /// operator's STUN servers — their responses must still
+        /// feed the srflx candidate set. A state-based gate
+        /// dropped those silently because BINDING_RESPONSE without
+        /// MESSAGE-INTEGRITY then fails the peer-side integrity
+        /// check below.
+        if (parsed->msg_type == STUN_BINDING_RESPONSE
+            && !pending_stun_probes_.empty()
+            && std::find(pending_stun_probes_.begin(),
+                          pending_stun_probes_.end(),
+                          parsed->txn_id)
+                != pending_stun_probes_.end()) {
             TransportType src_tx = TransportType::Udp;
             if (auto eit = cid_to_endpoint_.find(cid);
                 eit != cid_to_endpoint_.end()) {
@@ -2047,6 +2061,7 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
             handle_gather_response(*parsed, src_tx);
             return;
         }
+        (void)st;
 
         /// STUN messages from a peer must carry a MESSAGE-INTEGRITY
         /// attribute and pass HMAC verification with our local pwd.
