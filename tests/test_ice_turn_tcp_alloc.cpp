@@ -359,24 +359,36 @@ TEST(TurnTcpAlloc, DataConnectionBindRoundTrip) {
         h.ioc, &*h.carrier, control_cid, cfg,
         std::move(data_cb), TurnAllocatedCallback{});
 
+    /// Stack-owned storage for the `std::weak_ptr<TurnClient>`
+    /// wrappers handed to subscription callbacks as `void* user`.
+    /// The wrappers must outlive every cid subscription they back,
+    /// so the test owns them in a vector that gets torn down at
+    /// scope exit — after `client` resets and after every cid has
+    /// been unsubscribed via the harness destructor.
+    std::vector<std::unique_ptr<std::weak_ptr<TurnClient>>>
+        weak_holders;
+    auto make_weak_user = [&](const std::shared_ptr<TurnClient>& sp)
+        -> std::weak_ptr<TurnClient>* {
+        weak_holders.push_back(
+            std::make_unique<std::weak_ptr<TurnClient>>(sp));
+        return weak_holders.back().get();
+    };
+
     /// Wire the control connection's inbound bytes back into the
     /// TurnClient. Production code does this through the session
     /// dispatcher; the unit test bypasses the session so the
     /// subscription is set up directly here.
-    {
-        auto weak_ctrl = std::weak_ptr<TurnClient>(client);
-        FakeStreamCarrier::s_sub_data(
-            &h.fake, control_cid,
-            +[](void* user, gn_conn_id_t /*cc*/,
-                 const std::uint8_t* b, std::size_t n) {
-                auto* wptr =
-                    static_cast<std::weak_ptr<TurnClient>*>(user);
-                if (auto sp = wptr->lock()) {
-                    sp->on_inbound(std::span(b, n));
-                }
-            },
-            new std::weak_ptr<TurnClient>(weak_ctrl));
-    }
+    FakeStreamCarrier::s_sub_data(
+        &h.fake, control_cid,
+        +[](void* user, gn_conn_id_t /*cc*/,
+             const std::uint8_t* b, std::size_t n) {
+            auto* wptr =
+                static_cast<std::weak_ptr<TurnClient>*>(user);
+            if (auto sp = wptr->lock()) {
+                sp->on_inbound(std::span(b, n));
+            }
+        },
+        make_weak_user(client));
 
     /// Track the freshly opened data carrier cid so the test can
     /// route the BindResponse + raw bytes onto the right cid.
@@ -388,7 +400,6 @@ TEST(TurnTcpAlloc, DataConnectionBindRoundTrip) {
             /// Wire inbound bytes for this cid back into the
             /// TurnClient — emulates the session-side per-cid
             /// subscription that production code installs.
-            auto weak = std::weak_ptr<TurnClient>(client);
             FakeStreamCarrier::s_sub_data(
                 &h.fake, cid,
                 +[](void* user, gn_conn_id_t cc,
@@ -400,10 +411,7 @@ TEST(TurnTcpAlloc, DataConnectionBindRoundTrip) {
                             cc, std::span(b, n));
                     }
                 },
-                /// The lifetime of the weak_ptr wrapper has to
-                /// outlive the carrier subscription; leaking it is
-                /// fine for the test scope (process ends shortly).
-                new std::weak_ptr<TurnClient>(weak));
+                make_weak_user(client));
             return cid;
         });
 
