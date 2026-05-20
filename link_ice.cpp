@@ -773,9 +773,7 @@ IceSessionCallbacks IceLink::make_callbacks(gn_conn_id_t id) {
             /// set into the outbound queue so out-of-process hosts
             /// (harness / signalling bridge) can drain it through
             /// the `gn.link.ice.signal` extension's `poll_local`
-            /// slot and forward to the peer. Was a no-op stub — the
-            /// missing wire here is exactly what stalled the 3-node
-            /// docker harness in `Gathering` forever.
+            /// slot and forward to the peer.
             std::shared_ptr<IceSession> session;
             {
                 std::lock_guard lk(self->sessions_mu_);
@@ -1263,9 +1261,20 @@ gn_result_t IceLink::deliver_signal(
                  ufrag = std::move(ufrag),
                  pwd = std::move(pwd),
                  cands = std::move(candidates)]() mutable {
+                    /// Gather BEFORE merging the peer's candidates.
+                    /// `add_remote_candidates` dispatches its body
+                    /// to the session strand; asio may run that
+                    /// dispatch inline (the calling thread already
+                    /// services ioc_ work, so the strand sees itself
+                    /// as runnable), which would mean the body
+                    /// observes `state == New` and skips the
+                    /// Gathering → Checking promotion. Running
+                    /// `gather()` first guarantees state is
+                    /// `Gathering` and host candidates are
+                    /// populated before the body checks them.
+                    if (fresh_session) session->gather();
                     session->add_remote_candidates(
                         ufrag, pwd, std::move(cands), eoc);
-                    if (fresh_session) session->gather();
                 });
         }
         return GN_OK;

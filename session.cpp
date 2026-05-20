@@ -348,6 +348,17 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
         if (cur == SessionState::WaitingRemote ||
             cur == SessionState::Gathering) {
             if (!self->local_candidates_.empty()) {
+                /// Trickle ICE: publish the local candidate set the
+                /// moment we have one alongside the remote OFFER —
+                /// BEFORE state transition + checks. This way the
+                /// ANSWER goes out even if begin_checks blocks or
+                /// the strand gets tied up with the connectivity
+                /// check loop afterwards. srflx candidates trickle
+                /// out as later deltas under the same outbound
+                /// queue.
+                if (self->callbacks_.on_gathered) {
+                    self->callbacks_.on_gathered(self->peer_id_);
+                }
                 self->state_.store(SessionState::Checking,
                                     std::memory_order_release);
                 self->build_check_list();
@@ -939,14 +950,18 @@ void IceSession::start_multi_stun_probes() {
     gather_timer_.async_wait(asio::bind_executor(strand_,
         [this, self = shared_from_this()](const std::error_code& ec) {
             if (ec) return;
-            if (state_.load(std::memory_order_acquire) !=
-                SessionState::Gathering) {
-                return;
-            }
             /// Every probe timed out — proceed without srflx. host +
             /// relay candidates (if any) still drive connectivity
             /// checks; nomination will succeed if peers can reach each
-            /// other directly or through TURN.
+            /// other directly or through TURN. We deliberately do NOT
+            /// short-circuit on `state != Gathering`: the responder
+            /// flow flips state to Checking the moment OFFER arrival
+            /// merges remote candidates, but the gather-side STUN
+            /// probes still need to fire `on_gathered` so the local
+            /// candidate set (host + any srflx that DID return) is
+            /// serialised into the outbound signal queue. Without
+            /// this, the peer never sees an ANSWER and the harness
+            /// stalls until its own deadline.
             pending_stun_probes_.clear();
             on_gathering_complete();
         }));
