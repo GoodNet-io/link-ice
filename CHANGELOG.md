@@ -7,6 +7,27 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### `gn.link.portmap` integration: explicit-port-mapped srflx candidates
+
+`IceSession::gather()` now runs a new step `gather_portmap()` between
+host gather and TURN allocation when the host exposes the
+`gn.link.portmap` extension (UPnP IGD / PCP / NAT-PMP, version
+`0x00010000`). The session asks the router for a `(ext_ip, ext_port)`
+mapping bound to the local UDP port and emits the result as a
+dedicated srflx candidate. The mapping is released best-effort on
+session teardown via the matching `release()` slot. Peers consume
+the candidate identically to a STUN-discovered srflx — same wire
+shape, same priority structure — but the foundation hash uses the
+synthetic server string `"portmap"` so pacing groups stay distinct
+from STUN-allocated srflx entries.
+
+The path is purely additive: a missing extension, a zero
+`supported_protocols()` mask, or a router refusal all fall back to
+the pre-existing STUN-srflx + TURN-relay gather flow without
+behaviour change. TCP-side portmap candidates are not yet wired —
+deferred to a future commit that mirrors the UDP request slot for
+RFC 6544 TCP fallback.
+
 ### `dns_ext_client`: drop duplicate URI parser
 
 `parse_service_uri` now thin-wraps `gn::parse_uri` from

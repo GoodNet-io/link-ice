@@ -116,6 +116,43 @@ public address where running full ICE would be redundant. The peer
 side must always be a full ICE agent; two lite agents cannot
 complete the handshake because no one drives the checks.
 
+## NAT port mapping (`gn.link.portmap`)
+
+When the host exposes the `gn.link.portmap` extension (UPnP IGD / PCP
+/ NAT-PMP, version `0x00010000`), `IceSession::gather()` runs an
+additional step between the host and TURN gather phases: it asks the
+router for an explicit `(ext_ip, ext_port)` mapping bound to the
+session's local UDP port and emits the mapping as an extra srflx
+candidate. The candidate is wire-identical to a STUN-discovered srflx
+entry — peers consume it the same way (same `CandidateWire::type` low
+nibble, same priority structure) — but its foundation hash uses the
+synthetic server string `"portmap"` and its priority occupies a
+distinct slot (`local_pref = 65534` vs. STUN srflx `65535`,
+`component = 2`) so the two coexist in the check list without
+collapsing into a single pacing group.
+
+The path is purely additive:
+
+- Missing extension → `gather_portmap` is a no-op, the session falls
+  back to STUN srflx + TURN relay unchanged.
+- Zero `supported_protocols()` mask (the extension is present but no
+  protocol reached the local gateway) → same no-op.
+- `request()` failure (router refused, transient probe loss) → no
+  candidate emitted, the rest of gather completes.
+- `host-only` / `relay-only` candidate filters drop the portmap
+  candidate the same way they drop STUN srflx / TURN relay.
+
+The mapping is released through `release(GN_PORTMAP_UDP, local_port)`
+on session teardown (`IceSession::close()` and dtor). Failure to
+release is non-fatal — the underlying plugin's renewal table clears
+the entry once the router-granted `lifetime_s` expires without a
+refresh.
+
+TCP-side portmap candidates (`GN_PORTMAP_TCP` for the RFC 6544 TCP
+host port) are deferred: the current gather flow emits the UDP
+mapping only. Operators relying on TCP fallback continue to use the
+STUN-over-TCP srflx path.
+
 ## Contract
 
 - Kernel-side link contract: `docs/contracts/link.en.md`

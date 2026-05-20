@@ -25,6 +25,7 @@ add_library(goodnet_ice_objects OBJECT
     stun.cpp
     turn.cpp
     dns_ext_client.cpp
+    portmap_ext_client.cpp
     mdns.cpp
     path_mtu.cpp
     interface_watcher.cpp

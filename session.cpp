@@ -112,10 +112,12 @@ IceSession::IceSession(asio::io_context& io,
                          const IceConfig& cfg,
                          const std::string& peer_id, bool controlling,
                          IceSessionCallbacks callbacks,
-                         std::shared_ptr<MdnsManager> mdns)
+                         std::shared_ptr<MdnsManager> mdns,
+                         IcePortmapClient* portmap_ext)
     : io_(io), strand_(asio::make_strand(io.get_executor())),
       carrier_(carrier), carrier_tcp_(carrier_tcp),
-      carrier_tls_(carrier_tls), cfg_(cfg),
+      carrier_tls_(carrier_tls),
+      portmap_ext_(portmap_ext), cfg_(cfg),
       peer_id_(peer_id),
       controlling_(cfg.lite_mode ? false : controlling),
       callbacks_(std::move(callbacks)),
@@ -165,6 +167,11 @@ IceSession::~IceSession() {
         mdns_->unregister_name(mdns_local_hostname_);
         mdns_local_hostname_.clear();
     }
+    /// Best-effort portmap release. Matches the TURN-deallocation
+    /// pattern above: ignore failure since the router will time the
+    /// mapping out on its own once `lifetime_s` elapses without a
+    /// renewal.
+    release_portmap_mapping();
     for (auto& [cid, ep] : cid_to_endpoint_) {
         auto* c = transport_is_tcp(ep.transport) ? carrier_tcp_ : carrier_;
         if (!c) continue;
@@ -180,6 +187,14 @@ void IceSession::gather() {
     /// posted, so direct `local_candidates_` mutation is race-free.
     state_.store(SessionState::Gathering, std::memory_order_release);
     gather_host_candidates();
+
+    /// Optional NAT mapping via the `gn.link.portmap` extension. Runs
+    /// after host gather so `local_port_` is known. The portmap
+    /// extension is synchronous (request returns the mapping or
+    /// fails); the srflx candidate is pushed inline and ready before
+    /// the FSM moves on to TURN / STUN. Missing extension or
+    /// zero-protocol mask is a transparent no-op.
+    gather_portmap();
 
     /// TURN allocation runs in parallel with STUN; the relay candidate
     /// arrives via callback once `gn.ice.turn` answers.
@@ -521,6 +536,12 @@ void IceSession::close() {
             self->mdns_->unregister_name(self->mdns_local_hostname_);
             self->mdns_local_hostname_.clear();
         }
+        /// Tear down any portmap mapping we punched during gather so
+        /// the router reclaims the external port the moment we go
+        /// away. Mirrors the TURN deallocation above — best-effort,
+        /// the renewal table inside the portmap plugin clears even
+        /// when the router's reply never arrives.
+        self->release_portmap_mapping();
         for (auto& [cid, ep] : self->cid_to_endpoint_) {
             auto* c = transport_is_tcp(ep.transport)
                 ? self->carrier_tcp_ : self->carrier_;
@@ -623,6 +644,115 @@ void IceSession::gather_host_candidates() {
     freeifaddrs(iflist);
 
     gather_tcp_host_candidates();
+}
+
+void IceSession::gather_portmap() {
+    /// Skip every short-circuit case the user-facing contract calls
+    /// out as a graceful-degradation point.
+    if (portmap_ext_ == nullptr)               return;
+    if (local_port_ == 0)                       return;
+    /// Honour the same operator filter mask that gates host / srflx
+    /// / relay gather. Portmap candidates are emitted with type
+    /// `Srflx`, so a `host-only` filter drops them; a `relay-only`
+    /// filter also drops them. The `exclude-ipv4` flag drops them
+    /// because the portmap protocols answer with an IPv4 external
+    /// address by convention (PCP supports v6 but the in-tree plugin
+    /// currently surfaces v4 mappings only).
+    const auto filter = cfg_.candidate_filter_flags;
+    if ((filter & kCandidateFilterHostOnly)  != 0) return;
+    if ((filter & kCandidateFilterRelayOnly) != 0) return;
+
+    /// Probe the supported-protocols mask first. Zero means no
+    /// portmap protocol is reachable from this network — the
+    /// extension is present but every probe came back silent. Skip
+    /// the request entirely so we don't hammer the underlying
+    /// discovery loop on every gather.
+    const std::uint32_t supported = portmap_ext_->supported_protocols();
+    if ((supported & (GN_PORTMAP_PROTO_UPNP
+                        | GN_PORTMAP_PROTO_PCP
+                        | GN_PORTMAP_PROTO_NATPMP)) == 0) {
+        return;
+    }
+
+    /// Ask the router for a UDP mapping with the conventional ICE
+    /// hint values: lifetime 3600 s (matches the typical NAT-PMP
+    /// default before the plugin's own renewal cadence kicks in),
+    /// no external-port hint (let the router pick — symmetric NATs
+    /// will refuse a fixed external port and we don't want to bias
+    /// the choice).
+    gn_portmap_mapping_t mapping{};
+    const bool ok = portmap_ext_->request(GN_PORTMAP_UDP,
+                                            local_port_,
+                                            /*external_port_hint=*/0,
+                                            /*lifetime_hint_s=*/3600,
+                                            &mapping);
+    if (!ok) return;
+    /// Defensive parse of the router-reported ext_ip — a malformed
+    /// blob (NUL-terminated dotted-decimal that doesn't lex as v4 or
+    /// v6) is treated as a failed mapping. The plugin contract says
+    /// the field is NUL-terminated; trust but verify.
+    if (mapping.ext_port == 0) return;
+    const std::string ext_ip(mapping.ext_ip);
+    if (ext_ip.empty()) return;
+
+    Candidate c{};
+    c.type     = CandidateType::Srflx;
+    c.port     = mapping.ext_port;
+    c.set_address(ext_ip);
+    if (c.family != AddressFamily::IPv4
+        && c.family != AddressFamily::IPv6) {
+        /// `set_address` leaves `family` unset when the string lexes
+        /// as neither v4 nor v6 — drop the mapping rather than push
+        /// a garbage candidate. We do NOT call release here: the
+        /// underlying plugin still has a valid renewal entry and
+        /// will time it out on its own.
+        return;
+    }
+    /// Operator-filter gate (exclude-ipv4 / exclude-ipv6). Run after
+    /// the address parse so the family check is authoritative.
+    if (!candidate_allowed(c.type, c.family, filter)) {
+        return;
+    }
+
+    /// Priority — RFC 8445 §5.1.2.1 type-preference 100 for Srflx.
+    /// The local-pref slot is set to 65534 (one rung below the
+    /// STUN-srflx default of 65535) so STUN-discovered srflx
+    /// candidates outrank the portmap entry on identical
+    /// (component, type) tuples. Component id stays at 2 — the
+    /// (type_pref, local_pref, component) triple gives the portmap
+    /// candidate a distinct priority slot so the check-list ordering
+    /// is deterministic.
+    c.priority = compute_priority(CandidateType::Srflx, 65534, 2);
+    /// Foundation — RFC 8445 §5.1.1.3. The synthetic server string
+    /// `"portmap"` distinguishes portmap-allocated srflx from
+    /// STUN-allocated srflx so the foundation tuple stays unique.
+    /// Peers compute their own foundations from the wire-recovered
+    /// fields; the foundation is intentionally not on the wire.
+    c.foundation = compute_foundation(CandidateType::Srflx,
+                                        ext_ip,
+                                        /*server=*/"portmap",
+                                        c.transport);
+
+    {
+        std::lock_guard lk(local_state_mu_);
+        local_candidates_.push_back(std::move(c));
+    }
+    /// Stash the mapping for release on teardown. We track only the
+    /// most-recent mapping per session because a gather cycle issues
+    /// exactly one portmap request for `local_port_`; an ICE
+    /// restart re-runs gather and overwrites the slot after the
+    /// previous mapping is released.
+    portmap_mapping_ = mapping;
+}
+
+void IceSession::release_portmap_mapping() noexcept {
+    if (portmap_ext_ == nullptr) return;
+    if (!portmap_mapping_.has_value()) return;
+    const auto m = *portmap_mapping_;
+    portmap_mapping_.reset();
+    /// Best-effort — the underlying plugin handles router-side
+    /// failure (lifetime expiry, router reboot) on its own.
+    (void)portmap_ext_->release(m.protocol, m.int_port);
 }
 
 void IceSession::gather_tcp_host_candidates() {

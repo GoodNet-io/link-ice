@@ -42,6 +42,7 @@
 
 #include "interface_watcher.hpp"
 #include "mdns.hpp"
+#include "portmap_ext_client.hpp"
 #include "session.hpp"
 
 namespace gn::link::ice {
@@ -397,6 +398,18 @@ private:
     /// TCP underneath transparently, so framing matches the plain
     /// TCP path.
     std::optional<gn::sdk::LinkCarrier>           carrier_tls_;
+
+    /// Optional `gn.link.portmap` extension client. Resolved at
+    /// `set_host_api` time (same lazy-retry pattern as the carrier
+    /// lookups so plugins that register their extension after
+    /// `set_host_api` still get picked up on the first
+    /// `connect` / `composer_connect` call). When present, each
+    /// IceSession runs `gather_portmap()` to punch a (ext_ip, ext_port)
+    /// mapping through UPnP IGD / PCP / NAT-PMP and emit it as an
+    /// extra srflx candidate alongside STUN-discovered ones. Missing
+    /// extension or zero `supported_protocols()` mask is a no-op —
+    /// gather completes unchanged.
+    std::optional<IcePortmapClient>               portmap_ext_;
 
     /// Linux netlink interface-state watcher. Brought up at
     /// `set_host_api` time when `cfg_.reactive_interface_change` is

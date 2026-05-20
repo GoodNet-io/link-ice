@@ -24,6 +24,7 @@
 #include "candidate.hpp"
 #include "mdns.hpp"
 #include "path_mtu.hpp"
+#include "portmap_ext_client.hpp"
 #include "stun.hpp"
 #include "turn.hpp"
 
@@ -389,7 +390,8 @@ public:
                const IceConfig& cfg,
                const std::string& peer_id, bool controlling,
                IceSessionCallbacks callbacks,
-               std::shared_ptr<MdnsManager> mdns = nullptr);
+               std::shared_ptr<MdnsManager> mdns = nullptr,
+               IcePortmapClient* portmap_ext = nullptr);
     ~IceSession();
 
     /// Start candidate gathering.
@@ -542,6 +544,18 @@ private:
     /// handles handshake + record encryption transparently. Passed
     /// in when `cfg_.turn.tls_transport == true`.
     gn::sdk::LinkCarrier* carrier_tls_ = nullptr;
+    /// Optional `gn.link.portmap` extension client. Borrowed from the
+    /// parent `IceLink` (one instance per plugin so multiple sessions
+    /// share the renewal table inside the portmap plugin). nullptr
+    /// means the extension was not exposed by the host — gather skips
+    /// the portmap step and falls back to STUN-srflx / TURN-relay
+    /// without further work.
+    IcePortmapClient* portmap_ext_ = nullptr;
+    /// Active portmap mapping for this session's `local_port_`. Filled
+    /// by `gather_portmap()` on success; released on session teardown
+    /// (`close()` / dtor) by issuing `portmap_ext_->release()`. Match
+    /// the TURN deallocation lifecycle: best-effort, ignore failure.
+    std::optional<gn_portmap_mapping_t> portmap_mapping_;
     IceConfig cfg_;
     std::string peer_id_;
     bool controlling_;
@@ -707,6 +721,22 @@ private:
     void handle_gather_response(const StunMessage& msg,
                                   TransportType src_transport);
     void gather_relay();
+    /// Optional NAT-mapping gather step driven by the `gn.link.portmap`
+    /// extension. When the host exposes UPnP IGD / PCP / NAT-PMP via
+    /// the extension, this asks the router for an explicit
+    /// `(ext_ip, ext_port)` mapping for `local_port_` and pushes a
+    /// dedicated srflx candidate (`server = "portmap"` in the
+    /// foundation hash so the entry is distinct from STUN-discovered
+    /// srflx) into `local_candidates_`. No-op when the extension is
+    /// missing, the supported-protocols mask is zero, or
+    /// `local_port_ == 0`. Strand-safe — all candidate-vector
+    /// mutations grab `local_state_mu_` like the other gather paths.
+    void gather_portmap();
+    /// Release any portmap-allocated mapping held by this session.
+    /// Idempotent and best-effort: matches the TURN-deallocation
+    /// pattern in `close()` / dtor. Safe to call when no mapping was
+    /// ever requested.
+    void release_portmap_mapping() noexcept;
     /// Start the next ALLOCATE attempt against
     /// `cfg_.turn_servers[turn_attempt_idx_]`. Arms
     /// `turn_allocate_timer_` for `cfg_.turn_allocate_timeout_s`.

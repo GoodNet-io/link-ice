@@ -30,3 +30,25 @@ endif()
 gtest_discover_tests(test_ice
     DISCOVERY_TIMEOUT 30
     PROPERTIES TIMEOUT 60)
+
+# Standalone target so the portmap-extension gather flow can be
+# exercised independently of the larger `test_ice` aggregate. The
+# task contract calls out
+# `cmake --build build-release --target test_ice_portmap_gather`.
+add_executable(test_ice_portmap_gather
+    test_ice_portmap_gather.cpp)
+target_link_libraries(test_ice_portmap_gather PRIVATE
+    GoodNet::sdk
+    goodnet_ice_objects
+    asio::asio
+    Threads::Threads
+    OpenSSL::Crypto
+    GTest::gtest
+    GTest::gtest_main)
+target_compile_features(test_ice_portmap_gather PRIVATE cxx_std_23)
+if(COMMAND goodnet_apply_pch)
+    goodnet_apply_pch(test_ice_portmap_gather)
+endif()
+gtest_discover_tests(test_ice_portmap_gather
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES TIMEOUT 60)

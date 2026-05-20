@@ -550,6 +550,16 @@ void IceLink::set_host_api(const host_api_t* api) noexcept {
     if (api_ != nullptr && !carrier_tls_) {
         carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
     }
+    /// Resolve `gn.link.portmap` at the same lazy point as the
+    /// carriers. The portmap plugin is optional — a deployment
+    /// without UPnP / PCP / NAT-PMP infrastructure simply leaves
+    /// `portmap_ext_` empty and gather_portmap becomes a no-op.
+    /// Same retry-on-`connect` pattern (see below) covers the case
+    /// where the portmap plugin registers its extension after
+    /// `set_host_api` returns.
+    if (api_ != nullptr && !portmap_ext_) {
+        portmap_ext_ = IcePortmapClient::query(api_);
+    }
 
     /// Reaper rides `weak_from_this()`; first `set_host_api` is the
     /// earliest point at which the enclosing `make_shared` has
@@ -915,12 +925,17 @@ gn_result_t IceLink::connect(std::string_view uri) {
         if (api_ != nullptr && !carrier_tls_) {
             carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
         }
+        if (api_ != nullptr && !portmap_ext_) {
+            portmap_ext_ = IcePortmapClient::query(api_);
+        }
         gn::sdk::LinkCarrier* carrier_ptr =
             carrier_udp_.has_value() ? &*carrier_udp_ : nullptr;
         gn::sdk::LinkCarrier* carrier_tcp_ptr =
             carrier_tcp_.has_value() ? &*carrier_tcp_ : nullptr;
         gn::sdk::LinkCarrier* carrier_tls_ptr =
             carrier_tls_.has_value() ? &*carrier_tls_ : nullptr;
+        IcePortmapClient* portmap_ptr =
+            portmap_ext_.has_value() ? &*portmap_ext_ : nullptr;
         /// Hand every session a shared mDNS manager. The responder
         /// side only fires when `mdns_obfuscate_host_candidates`
         /// brings up local HostMdns candidates; the resolver side
@@ -930,7 +945,7 @@ gn_result_t IceLink::connect(std::string_view uri) {
         auto session = std::make_shared<IceSession>(
             ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
             /*controlling=*/true, make_callbacks(conn),
-            std::move(mdns_snap));
+            std::move(mdns_snap), portmap_ptr);
         sessions_[conn] = {conn, session, peer_hex};
         peer_to_id_[peer_hex] = conn;
         published_ids_.push_back(conn);
@@ -1226,12 +1241,17 @@ gn_result_t IceLink::deliver_signal(
                 if (api_ != nullptr && !carrier_tls_) {
                     carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
                 }
+                if (api_ != nullptr && !portmap_ext_) {
+                    portmap_ext_ = IcePortmapClient::query(api_);
+                }
                 gn::sdk::LinkCarrier* carrier_ptr =
                     carrier_udp_.has_value() ? &*carrier_udp_ : nullptr;
                 gn::sdk::LinkCarrier* carrier_tcp_ptr =
                     carrier_tcp_.has_value() ? &*carrier_tcp_ : nullptr;
                 gn::sdk::LinkCarrier* carrier_tls_ptr =
                     carrier_tls_.has_value() ? &*carrier_tls_ : nullptr;
+                IcePortmapClient* portmap_ptr =
+                    portmap_ext_.has_value() ? &*portmap_ext_ : nullptr;
                 std::shared_ptr<MdnsManager> mdns_snap;
                 if (cfg_snap.mdns_obfuscate_host_candidates) {
                     mdns_snap = ensure_mdns_manager();
@@ -1240,7 +1260,7 @@ gn_result_t IceLink::deliver_signal(
                     ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
                     /*controlling=*/false,
                     make_callbacks(conn),
-                    std::move(mdns_snap));
+                    std::move(mdns_snap), portmap_ptr);
                 sessions_[conn] = {conn, session, peer_hex};
                 peer_to_id_[peer_hex] = conn;
                 published_ids_.push_back(conn);
@@ -1494,12 +1514,17 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
         if (api_ != nullptr && !carrier_tls_) {
             carrier_tls_ = gn::sdk::LinkCarrier::query(api_, "tls");
         }
+        if (api_ != nullptr && !portmap_ext_) {
+            portmap_ext_ = IcePortmapClient::query(api_);
+        }
         gn::sdk::LinkCarrier* carrier_ptr =
             carrier_udp_.has_value() ? &*carrier_udp_ : nullptr;
         gn::sdk::LinkCarrier* carrier_tcp_ptr =
             carrier_tcp_.has_value() ? &*carrier_tcp_ : nullptr;
         gn::sdk::LinkCarrier* carrier_tls_ptr =
             carrier_tls_.has_value() ? &*carrier_tls_ : nullptr;
+        IcePortmapClient* portmap_ptr =
+            portmap_ext_.has_value() ? &*portmap_ext_ : nullptr;
         /// Hand every session a shared mDNS manager. The responder
         /// side only fires when `mdns_obfuscate_host_candidates`
         /// brings up local HostMdns candidates; the resolver side
@@ -1510,7 +1535,7 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
             ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
             /*controlling=*/true,
             make_composer_callbacks(cid, canonical),
-            std::move(mdns_snap));
+            std::move(mdns_snap), portmap_ptr);
 
         ComposerEntry entry{};
         entry.session       = session;
