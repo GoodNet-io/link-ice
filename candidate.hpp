@@ -15,6 +15,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace gn::link::ice {
@@ -88,10 +89,56 @@ struct Candidate {
     /// behave as plain-UDP. TCP-flavoured candidates carry the
     /// active / passive / simultaneous-open role here.
     TransportType  transport = TransportType::Udp;
+    /// RFC 8445 §5.1.1.3 candidate foundation. Decimal string derived
+    /// from `(type, base-address, server-address, transport)`. Two
+    /// candidates share a foundation iff all four components match —
+    /// the FSM groups pairs by `(local.foundation, remote.foundation)`
+    /// so the Frozen → Waiting → In-Progress pacing in `run_next_check`
+    /// can unfreeze sibling pairs once any pair of the group succeeds.
+    /// Computed by `compute_foundation()` at gather time; the wire
+    /// format does not carry the foundation field (peers compute their
+    /// own foundations from the wire-recovered components).
+    std::string    foundation{};
 
     std::string address_str() const;
     void set_address(const std::string& addr_str);
 };
+
+/// RFC 8445 §5.1.1.3 foundation hash. Stable FNV-1a-64 over the
+/// `(type, base-address, server-address, transport)` quadruple, then
+/// rendered as a decimal string so the value round-trips through any
+/// text-based diagnostic surface. Two candidates with byte-identical
+/// inputs always produce the same string; a change in any component
+/// (different STUN server, different interface IP, different
+/// transport) yields a different foundation. `base_address` is the
+/// candidate's own interface IP for host candidates and the local
+/// interface IP used to reach the STUN/TURN server for srflx/relay
+/// candidates. `server_address` is empty for host candidates and the
+/// peer-side STUN/TURN server IP for srflx/relay.
+[[nodiscard]] inline std::string compute_foundation(
+        CandidateType type,
+        std::string_view base_address,
+        std::string_view server_address,
+        TransportType transport) noexcept {
+    /// FNV-1a-64 keeps the implementation header-only and avoids a
+    /// dependency on the (process-randomised) std::hash. Stability
+    /// across processes matters for log diffing and cross-test
+    /// comparison; std::hash is unspecified between runs.
+    uint64_t h = 0xcbf29ce484222325ULL;
+    constexpr uint64_t prime = 0x100000001b3ULL;
+    auto mix = [&](uint8_t b) noexcept {
+        h ^= static_cast<uint64_t>(b);
+        h *= prime;
+    };
+    mix(static_cast<uint8_t>(type));
+    mix(0xFF);
+    for (char c : base_address) mix(static_cast<uint8_t>(c));
+    mix(0xFF);
+    for (char c : server_address) mix(static_cast<uint8_t>(c));
+    mix(0xFF);
+    mix(static_cast<uint8_t>(transport));
+    return std::to_string(h);
+}
 
 /// Binary wire format for signaling (24 bytes per candidate).
 #pragma pack(push, 1)

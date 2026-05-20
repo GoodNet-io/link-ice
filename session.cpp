@@ -1448,6 +1448,24 @@ void IceSession::build_check_list() {
             return false;
         };
 
+    /// RFC 8445 §5.1.1.3: ensure every local candidate has a stable
+    /// foundation before we start grouping pairs. Remote foundations
+    /// arrive through trickle; we synthesise one here when the peer
+    /// didn't supply it so the foundation tuple is always well-formed.
+    assign_local_foundations();
+    for (auto& r : remote_candidates_) {
+        if (r.foundation.empty()) {
+            /// We don't know the peer's STUN/TURN topology, so the
+            /// best we can do is hash the wire-visible tuple. Different
+            /// (ip, type, transport) yields a different foundation
+            /// which is sufficient for the pacing logic — peers that
+            /// gather the same remote candidate twice (Trickle dedup)
+            /// will land on the same string.
+            r.foundation = compute_foundation(
+                r.type, r.address_str(), /*server=*/{}, r.transport);
+        }
+    }
+
     for (auto& local : local_candidates_) {
         /// Local HostMdns candidates carry only a hostname; the
         /// matching `local_port_` + interface IPs live in the mDNS
@@ -1502,6 +1520,20 @@ void IceSession::build_check_list() {
                     pp.remote.port = static_cast<std::uint16_t>(predicted);
                     pp.txn_id = generate_txn_id();
                     pp.priority = pair.priority > 0 ? pair.priority - 1 : 0;
+                    /// Predicted-port pairs probe a DIFFERENT endpoint
+                    /// than the canonical pair — even though the IP /
+                    /// type / transport quadruple matches, the actual
+                    /// reachable port differs. Give each predicted
+                    /// pair a port-distinguished remote foundation so
+                    /// the Frozen → Waiting pacing treats them as a
+                    /// separate group and races them alongside the
+                    /// canonical pair instead of parking them behind
+                    /// it (the canonical pair against a wrong port
+                    /// will never succeed → predicted pairs would
+                    /// never unfreeze).
+                    pp.remote.foundation = remote.foundation
+                        + ":p"
+                        + std::to_string(predicted);
                     check_list_.push_back(pp);
                 }
             }
@@ -1510,6 +1542,29 @@ void IceSession::build_check_list() {
     std::ranges::sort(check_list_, [](const auto& a, const auto& b) {
         return a.priority > b.priority;
     });
+
+    /// RFC 8445 §6.1.2.6 initial states: per foundation tuple
+    /// `(local.foundation, remote.foundation)`, the highest-priority
+    /// pair starts in Waiting and the remaining pairs sharing that
+    /// tuple start in Frozen. The sort above guarantees the first
+    /// pair we see for each tuple is the highest-priority one, so a
+    /// single pass over the list suffices.
+    std::unordered_map<std::string, bool> seen_tuple;
+    for (auto& p : check_list_) {
+        const auto& lfnd = p.local.foundation;
+        const auto& rfnd = p.remote.foundation;
+        const std::string key = lfnd + "|" + rfnd;
+        auto [it, inserted] = seen_tuple.try_emplace(key, true);
+        if (inserted) {
+            /// First (highest-priority) pair for this foundation tuple
+            /// becomes the representative — Waiting from the start.
+            p.state = PairState::Waiting;
+        } else {
+            /// Sibling for an already-represented foundation tuple.
+            /// Frozen until the representative succeeds + unfreezes.
+            p.state = PairState::Frozen;
+        }
+    }
     current_check_ = 0;
 }
 
@@ -1539,10 +1594,16 @@ void IceSession::begin_checks() {
     bool fired_v6 = false;
     for (auto& p : check_list_) {
         if (fired_v4 && fired_v6) break;
+        /// Happy-eyeballs only pre-fires pairs that are already in
+        /// Waiting per the foundation-tuple initial split — Frozen
+        /// pairs stay parked until a sibling succeeds.
+        if (p.state != PairState::Waiting) continue;
         if (p.local.family == AddressFamily::IPv4 && !fired_v4) {
+            p.state = PairState::InProgress;
             send_check(p);
             fired_v4 = true;
         } else if (p.local.family == AddressFamily::IPv6 && !fired_v6) {
+            p.state = PairState::InProgress;
             send_check(p);
             fired_v6 = true;
         }
@@ -1554,21 +1615,50 @@ void IceSession::begin_checks() {
 void IceSession::run_next_check() {
     if (state_.load(std::memory_order_acquire) != SessionState::Checking) return;
 
-    if (current_check_ >= check_list_.size()) {
+    /// First pass: walk InProgress pairs. RFC 5389 §7.2.1 STUN
+    /// retransmits keep firing on the same txn id until the response
+    /// arrives or the retry budget is spent — retransmits do NOT
+    /// count as new pairs entering the in-progress set, so the
+    /// concurrency cap doesn't gate them. A pair whose retries are
+    /// exhausted transitions to Failed and yields its slot to a
+    /// Waiting sibling.
+    for (auto& p : check_list_) {
+        if (p.state != PairState::InProgress) continue;
+        if (p.retries >= static_cast<uint8_t>(cfg_.max_check_retries)) {
+            p.state = PairState::Failed;
+        } else {
+            send_check(p);
+        }
+    }
+
+    /// Second pass: promote Waiting pairs to InProgress until the
+    /// concurrency cap (RFC §6.1.2.5) is hit. Frozen pairs stay
+    /// parked until a sibling on the same foundation tuple succeeds
+    /// (`unfreeze_siblings`). Succeeded / Failed are terminal.
+    bool any_pending = false;
+    for (auto& p : check_list_) {
+        if (p.state == PairState::Frozen
+            || p.state == PairState::Waiting
+            || p.state == PairState::InProgress) {
+            any_pending = true;
+        }
+        if (in_progress_count() >= kCheckConcurrencyCap) break;
+        if (p.state == PairState::Waiting
+            && p.retries < static_cast<uint8_t>(cfg_.max_check_retries)) {
+            p.state = PairState::InProgress;
+            send_check(p);
+        }
+    }
+
+    if (!any_pending) {
+        /// Nothing left to drive — the entire list is in
+        /// {Succeeded, Failed} terminal states. If we never reached
+        /// Connected, fail the session.
         state_.store(SessionState::Failed, std::memory_order_release);
         if (callbacks_.on_failed)
             callbacks_.on_failed(peer_id_, ETIMEDOUT);
         return;
     }
-
-    auto& pair = check_list_[current_check_];
-    if (pair.retries >= static_cast<uint8_t>(cfg_.max_check_retries)) {
-        current_check_++;
-        asio::post(strand_, [this, self = shared_from_this()] { run_next_check(); });
-        return;
-    }
-
-    send_check(pair);
 
     check_timer_.expires_after(std::chrono::milliseconds(cfg_.check_interval_ms));
     check_timer_.async_wait(asio::bind_executor(strand_,
@@ -1577,7 +1667,119 @@ void IceSession::run_next_check() {
         }));
 }
 
+std::size_t IceSession::in_progress_count() const noexcept {
+    std::size_t n = 0;
+    for (const auto& p : check_list_) {
+        if (p.state == PairState::InProgress) ++n;
+    }
+    return n;
+}
+
+void IceSession::unfreeze_siblings(const std::string& local_fnd,
+                                       const std::string& remote_fnd) {
+    /// RFC 8445 §6.1.2.4: when a check pair succeeds, every Frozen
+    /// pair sharing its `(local.foundation, remote.foundation)` tuple
+    /// becomes Waiting. Foundation strings are non-empty in pairs
+    /// built through `build_check_list` — but triggered-check pairs
+    /// minted by `maybe_trigger_check_from_peer` skip foundation
+    /// computation and start Waiting directly, so an empty foundation
+    /// here is a no-op rather than a global unfreeze.
+    if (local_fnd.empty() || remote_fnd.empty()) return;
+    for (auto& p : check_list_) {
+        if (p.state != PairState::Frozen) continue;
+        if (p.local.foundation == local_fnd
+            && p.remote.foundation == remote_fnd) {
+            p.state = PairState::Waiting;
+        }
+    }
+}
+
+void IceSession::assign_local_foundations() {
+    /// Foundations are derived from `(type, base_address,
+    /// server_address, transport)`. For host candidates the base IS
+    /// the interface IP; we lack the originating STUN/TURN server
+    /// here (the carrier learns the local mapped address from the
+    /// response, the candidate just records the local IP), so we
+    /// use the candidate IP as the base and leave the server side
+    /// empty for host candidates. Srflx/relay candidates ideally
+    /// carry their backing server — until the gather path threads
+    /// that through, all srflx candidates from the same STUN server
+    /// collapse to one foundation (which is the RFC-conforming
+    /// behaviour: two srflx candidates from the same STUN server
+    /// SHARE a foundation).
+    std::lock_guard lk(local_state_mu_);
+    for (auto& c : local_candidates_) {
+        if (!c.foundation.empty()) continue;
+        c.foundation = compute_foundation(
+            c.type, c.address_str(), /*server=*/{}, c.transport);
+    }
+}
+
+std::vector<PairState> IceSession::check_list_states_for_test() const {
+    /// Snapshot under the strand-side state mutex. Pairs live in
+    /// `check_list_` which is strand-only on the write path; we don't
+    /// add a dedicated mutex for it because production reads happen
+    /// only on the strand. Tests synchronise externally by waiting
+    /// for state transitions before sampling.
+    std::vector<PairState> out;
+    out.reserve(check_list_.size());
+    for (const auto& p : check_list_) out.push_back(p.state);
+    return out;
+}
+
+bool IceSession::handle_role_conflict_for_test(bool sender_controlling,
+                                                  uint64_t sender_tiebreaker) {
+    /// Forwarder — tests call this synchronously rather than forging
+    /// a STUN frame and waiting for the strand dispatch to land.
+    return handle_role_conflict(sender_controlling, sender_tiebreaker);
+}
+
+bool IceSession::handle_role_conflict(bool sender_controlling,
+                                          uint64_t sender_tiebreaker) {
+    /// RFC 8445 §7.3.1.1: only call this when the sender's role
+    /// attribute MATCHES our claimed role (both controlling, or both
+    /// controlled). Mismatched roles are the no-conflict path and
+    /// resolve without comparing tiebreakers.
+    if (sender_controlling != controlling_) return false;
+
+    /// Tie-break: receiver with the LARGER tie-breaker keeps its
+    /// role; the smaller-tie-breaker side switches. Equal values
+    /// can't happen unless the RNG repeats, which we treat as the
+    /// sender losing (deterministic resolution, no infinite ping-pong).
+    if (tiebreaker_ >= sender_tiebreaker) {
+        /// We win — sender loses, must switch. From our perspective
+        /// we keep `controlling_` as-is and the caller emits a 487
+        /// error response so the peer flips.
+        return false;
+    }
+
+    /// We lose — switch role + rebuild the check list under the new
+    /// role so the priority formula reflects the swap (controlling
+    /// vs controlled half of `pair_priority`).
+    controlling_ = !controlling_;
+    if (state_.load(std::memory_order_acquire) == SessionState::Checking
+        && !local_candidates_.empty()
+        && !remote_candidates_.empty()) {
+        build_check_list();
+        current_check_ = 0;
+        run_next_check();
+    }
+    return true;
+}
+
 void IceSession::send_check(CheckPair& pair) {
+    /// RFC 8445 §6.1.2.6 Failed state — a pair whose retry budget is
+    /// exhausted before any response arrives transitions out of
+    /// InProgress so `run_next_check` can promote a sibling. The
+    /// caller already flipped the state to InProgress before invoking
+    /// us; we only flip to Failed here when the budget is already
+    /// spent on entry (defensive — `run_next_check` filters this case
+    /// out, but `begin_checks` and `add_remote_candidates` reach
+    /// `send_check` directly and need the same guarantee).
+    if (pair.retries >= static_cast<uint8_t>(cfg_.max_check_retries)) {
+        pair.state = PairState::Failed;
+        return;
+    }
     pair.retries++;
     /// Record the most-recent send timestamp so the matching response
     /// gives us an RTT sample. STUN retransmits reuse the same txn id
@@ -1711,6 +1913,35 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
             return;
         }
 
+        if (parsed->msg_type == STUN_BINDING_ERROR) {
+            /// RFC 8445 §7.3.1.1: a 487 Role Conflict on a check we
+            /// sent tells us the peer rejected our role claim. Flip
+            /// the local role + rebuild the check list so subsequent
+            /// checks ride the new role's STUN attributes. Other
+            /// error codes mark just THIS pair as failed; sibling
+            /// foundation members stay in their existing state.
+            if (parsed->error_code && *parsed->error_code == 487) {
+                controlling_ = !controlling_;
+                if (state_.load(std::memory_order_acquire)
+                        == SessionState::Checking
+                    && !local_candidates_.empty()
+                    && !remote_candidates_.empty()) {
+                    build_check_list();
+                    current_check_ = 0;
+                    run_next_check();
+                }
+                return;
+            }
+            /// Generic error — mark the originating pair as Failed
+            /// so `run_next_check` can advance.
+            for (auto& pair : check_list_) {
+                if (pair.txn_id == parsed->txn_id) {
+                    pair.state = PairState::Failed;
+                    break;
+                }
+            }
+            return;
+        }
         if (parsed->msg_type == STUN_BINDING_RESPONSE) {
             /// DPLPMTUD probe correlation. A response whose txid
             /// matches the most recent probe is the wire ACK for the
@@ -1738,6 +1969,56 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
                 handle_check_response(*parsed);
             }
         } else if (parsed->msg_type == STUN_BINDING_REQUEST) {
+            /// RFC 8445 §7.3.1.1 role-conflict check. The sender's
+            /// role attribute (ICE-CONTROLLING / ICE-CONTROLLED) MUST
+            /// be the opposite of ours; otherwise we have to break the
+            /// tie via tiebreaker comparison.
+            const bool sender_controlling = parsed->ice_controlling.has_value();
+            const bool sender_controlled  = parsed->ice_controlled.has_value();
+            const uint64_t sender_tb = sender_controlling
+                ? *parsed->ice_controlling
+                : (sender_controlled ? *parsed->ice_controlled : 0);
+            const bool role_attr_present = sender_controlling || sender_controlled;
+            const bool same_role =
+                role_attr_present
+                && ((sender_controlling && controlling_)
+                    || (sender_controlled && !controlling_));
+            if (same_role) {
+                const bool we_switched =
+                    handle_role_conflict(sender_controlling, sender_tb);
+                if (!we_switched) {
+                    /// We won the tie-break: emit a 487 Role Conflict
+                    /// error response so the peer switches. Encode
+                    /// with our local pwd integrity so they verify
+                    /// the response against the same key they used
+                    /// to integrity-protect their request.
+                    auto err = StunBuilder(STUN_BINDING_ERROR)
+                        .set_txn_id(parsed->txn_id)
+                        .add_error_code(487, kStunErrorReasonRoleConflict)
+                        .add_integrity(local_pwd_)
+                        .add_fingerprint()
+                        .build();
+                    TransportType cid_tx = TransportType::Udp;
+                    if (auto eit = cid_to_endpoint_.find(cid);
+                        eit != cid_to_endpoint_.end()) {
+                        cid_tx = eit->second.transport;
+                    }
+                    if (transport_is_tcp(cid_tx)) {
+                        if (carrier_tcp_) {
+                            const auto framed = frame_tcp_stun(err);
+                            (void)carrier_tcp_->send(cid, framed);
+                        }
+                    } else {
+                        if (carrier_) (void)carrier_->send(cid, err);
+                    }
+                    return;
+                }
+                /// We switched roles: fall through to send the
+                /// normal binding-response so the peer's request
+                /// still gets ack'd. The next outgoing check rides
+                /// the new role's ICE-CONTROLLED/CONTROLLING attribute.
+            }
+
             auto resp = StunBuilder(STUN_BINDING_RESPONSE)
                 .set_txn_id(parsed->txn_id)
                 .add_integrity(local_pwd_)
@@ -1851,6 +2132,12 @@ void IceSession::handle_check_response(const StunMessage& msg) {
 
             const bool was_valid_before = pair.valid;
             pair.valid = true;
+            /// RFC 8445 §6.1.2.4 pair state on success: InProgress →
+            /// Succeeded, then unfreeze every Frozen pair sharing the
+            /// foundation tuple so dependent pairs can run.
+            pair.state = PairState::Succeeded;
+            unfreeze_siblings(pair.local.foundation,
+                                pair.remote.foundation);
 
             if (controlling_) {
                 if (cfg_.aggressive_nomination
@@ -1919,6 +2206,23 @@ void IceSession::maybe_trigger_check_from_peer(
     pair.priority = pair_priority(pair.local.priority,
                                     pair.remote.priority, controlling_);
     pair.txn_id = generate_txn_id();
+    /// RFC 8445 §7.3.1.4 triggered checks bypass the Frozen → Waiting
+    /// pacing — they ride InProgress directly because we fire them
+    /// immediately below. A foundation hash isn't strictly required
+    /// for them (they will never have siblings to unfreeze), but
+    /// computing one keeps the future possibility of foundation-based
+    /// dedup open.
+    pair.state = PairState::InProgress;
+    if (pair.local.foundation.empty()) {
+        pair.local.foundation = compute_foundation(
+            pair.local.type, pair.local.address_str(),
+            /*server=*/{}, pair.local.transport);
+    }
+    if (pair.remote.foundation.empty()) {
+        pair.remote.foundation = compute_foundation(
+            pair.remote.type, pair.remote.address_str(),
+            /*server=*/{}, pair.remote.transport);
+    }
     check_list_.push_back(pair);
 
     /// Fire the check immediately so this triggered pair doesn't have

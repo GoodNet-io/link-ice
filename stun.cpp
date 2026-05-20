@@ -386,6 +386,24 @@ std::optional<StunMessage> parse_stun(std::span<const uint8_t> data) {
         case STUN_ATTR_USE_CANDIDATE:
             msg.use_candidate = true;
             break;
+        case STUN_ATTR_ICE_CONTROLLING:
+            /// RFC 8445 §7.3.1.1 tie-breaker comparison requires the
+            /// numeric value, not just attribute presence. Carry the
+            /// 64-bit int verbatim — the FSM compares against its own
+            /// tiebreaker to decide which side wins a role conflict.
+            if (attr_len >= 8) {
+                const uint64_t hi = read32(attr_data);
+                const uint64_t lo = read32(attr_data + 4);
+                msg.ice_controlling = (hi << 32) | lo;
+            }
+            break;
+        case STUN_ATTR_ICE_CONTROLLED:
+            if (attr_len >= 8) {
+                const uint64_t hi = read32(attr_data);
+                const uint64_t lo = read32(attr_data + 4);
+                msg.ice_controlled = (hi << 32) | lo;
+            }
+            break;
         case STUN_ATTR_ERROR_CODE:
             if (attr_len >= 4) {
                 uint16_t code = static_cast<uint16_t>(

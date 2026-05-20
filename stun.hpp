@@ -190,9 +190,24 @@ struct StunMessage {
     std::vector<uint8_t>         data;
     bool use_candidate = false;
 
+    /// RFC 8445 §7.3.1.1 role attributes. Each is the int64 tie-breaker
+    /// the sender generated at startup. The presence of one or the
+    /// other tells the receiver the sender's claimed role; the value
+    /// is consulted only when both agents claim the same role and the
+    /// receiver has to decide who keeps controlling vs switches to
+    /// controlled (see role-conflict resolution in
+    /// `IceSession::handle_role_conflict`).
+    std::optional<uint64_t>      ice_controlling;
+    std::optional<uint64_t>      ice_controlled;
+
     bool has_integrity  = false;
     bool has_fingerprint = false;
 };
+
+/// RFC 5389 §15.4 reason phrase for the canonical error codes the ICE
+/// FSM emits. Keeps wire-format reason strings interned at one site so
+/// peer-side string matching stays predictable.
+inline constexpr const char* kStunErrorReasonRoleConflict = "Role Conflict";
 
 /// Parse a STUN/TURN message. Returns nullopt if invalid.
 std::optional<StunMessage> parse_stun(std::span<const uint8_t> data);

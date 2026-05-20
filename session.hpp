@@ -274,6 +274,35 @@ struct IceConfig {
     return true;
 }
 
+/// RFC 8445 §6.1.2.6 candidate pair state. Pacing transitions:
+/// - `Frozen`     : pair exists but has not been picked up yet because
+///                   another pair sharing its foundation tuple
+///                   `(local.foundation, remote.foundation)` is still
+///                   the active representative; promoted to `Waiting`
+///                   when that representative succeeds.
+/// - `Waiting`    : ready to be scheduled by `run_next_check`.
+/// - `InProgress` : a STUN binding-request is on the wire; counted
+///                   against `kCheckConcurrencyCap` per RFC §6.1.2.5.
+/// - `Succeeded`  : matching binding-response with valid integrity.
+///                   Triggers sibling unfreeze on the foundation
+///                   tuple so dependent pairs can run.
+/// - `Failed`     : retries exhausted, ICMP unreachable, or
+///                   integrity mismatch. Pair stays out of rotation
+///                   but its sibling foundation members keep going.
+enum class PairState : uint8_t {
+    Frozen     = 0,
+    Waiting    = 1,
+    InProgress = 2,
+    Succeeded  = 3,
+    Failed     = 4,
+};
+
+/// RFC 8445 §6.1.2.5 concurrent-check cap. The reference value is
+/// "around 5" and the FSM honours it strictly so a check list with
+/// dozens of pairs doesn't burst-storm STUN probes onto the wire
+/// (sender-side rate clamp on top of the retry-driven pacing).
+inline constexpr std::size_t kCheckConcurrencyCap = 5;
+
 /// @brief ICE candidate pair under connectivity check.
 struct CheckPair {
     Candidate local;
@@ -281,6 +310,9 @@ struct CheckPair {
     uint64_t  priority;
     uint8_t   retries   = 0;
     bool      nominated = false;
+    /// RFC 8445 §6.1.2.6 pair state. Drives `run_next_check`'s
+    /// Frozen → Waiting → InProgress pacing; see PairState above.
+    PairState state     = PairState::Frozen;
     /// RFC 8445 §7.3 valid pair: set true when the matching binding
     /// response arrives and integrity verifies. The controller's
     /// regular-nomination logic walks the check list looking at this
@@ -432,6 +464,30 @@ public:
     SessionState state() const { return state_.load(std::memory_order_acquire); }
     const std::string& peer_id() const { return peer_id_; }
     bool is_controlling() const { return controlling_; }
+
+    /// RFC 8445 §7.3.1.1 tie-breaker exposed for diagnostics + tests.
+    /// Generated once at construction via libsodium `randombytes_buf`
+    /// and never rotated for the lifetime of the session; an ICE
+    /// restart (`restart()`) keeps the same value so a concurrent peer
+    /// running in parallel still resolves the same conflict ordering.
+    uint64_t tie_breaker() const noexcept { return tiebreaker_; }
+
+    /// Test seam: lift the strand-only check list onto the calling
+    /// thread under `local_state_mu_`. Tests need this to assert the
+    /// initial Frozen / Waiting partition produced by `build_check_list`
+    /// without driving a full STUN exchange. Production callers must
+    /// not depend on this — the snapshot is taken under a lock and
+    /// reads of in-flight RTT / retries are intentionally lossy.
+    std::vector<PairState> check_list_states_for_test() const;
+
+    /// Test seam: same role-conflict path the STUN dispatcher exercises
+    /// on inbound BINDING_REQUEST, lifted to a synchronous call so a
+    /// fixture can assert the resolution without forging a full STUN
+    /// frame. Returns true when the local role flipped as a result of
+    /// the conflict, false when we kept our role (and would have
+    /// emitted a 487 response on the wire). Strand-safe.
+    bool handle_role_conflict_for_test(bool sender_controlling,
+                                         uint64_t sender_tiebreaker);
 
     /// Snapshots taken under `local_state_mu_`. The previous
     /// reference-returning form raced with strand-side mutators
@@ -696,6 +752,31 @@ private:
     void handle_check_response(const StunMessage& msg);
     void on_nominated(const std::string& ip, uint16_t port, bool relay,
                        gn_conn_id_t cid);
+
+    /// RFC 8445 §7.3.1.1 role-conflict resolution. Called from the
+    /// inbound BINDING_REQUEST path when the peer's role attribute
+    /// matches our own claimed role. Returns true when the local
+    /// agent switched role (sender wins, no 487 sent), false when we
+    /// kept our role (sender loses, caller must emit a 487 error
+    /// response). Strand-only.
+    bool handle_role_conflict(bool sender_controlling,
+                                uint64_t sender_tiebreaker);
+
+    /// Count of pairs currently in `PairState::InProgress`. Used by
+    /// `run_next_check` to clamp at `kCheckConcurrencyCap` (RFC §6.1.2.5).
+    std::size_t in_progress_count() const noexcept;
+
+    /// RFC 8445 §6.1.2.4 sibling unfreeze. After a pair sharing
+    /// foundation tuple `(local_fnd, remote_fnd)` transitions to
+    /// Succeeded, every Frozen pair with the same tuple flips to
+    /// Waiting so `run_next_check` can pick them up. Strand-only.
+    void unfreeze_siblings(const std::string& local_fnd,
+                             const std::string& remote_fnd);
+
+    /// Populate the foundation field on every local candidate from
+    /// `(type, base, server, transport)` so post-gather code paths
+    /// can look it up without recomputing. Strand-only.
+    void assign_local_foundations();
 
     /// Dispatch entry for bytes arriving on a per-endpoint cid. Called
     /// from the per-conn `on_data` callback installed by
