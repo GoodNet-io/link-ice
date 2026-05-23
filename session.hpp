@@ -796,12 +796,20 @@ private:
     /// `run_next_check` to clamp at `kCheckConcurrencyCap` (RFC §6.1.2.5).
     std::size_t in_progress_count() const noexcept;
 
-    /// RFC 8445 §6.1.2.4 sibling unfreeze. After a pair sharing
+    /// RFC 8445 §6.1.2.6 sibling unfreeze. After a pair sharing
     /// foundation tuple `(local_fnd, remote_fnd)` transitions to
-    /// Succeeded, every Frozen pair with the same tuple flips to
-    /// Waiting so `run_next_check` can pick them up. Strand-only.
+    /// Succeeded OR Failed, every Frozen pair with the same tuple
+    /// flips to Waiting so `run_next_check` can pick them up.
+    /// Strand-only.
     void unfreeze_siblings(const std::string& local_fnd,
                              const std::string& remote_fnd);
+
+    /// RFC 8445 §6.1.2.6 recompute-states fallback. Called from
+    /// `run_next_check` when the check list has no Waiting or
+    /// InProgress pair remaining but Frozen pairs are still parked.
+    /// Promotes one Frozen pair per remaining foundation tuple to
+    /// Waiting so progress is not stranded. Strand-only.
+    void unfreeze_stuck_pairs();
 
     /// Populate the foundation field on every local candidate from
     /// `(type, base, server, transport)` so post-gather code paths
@@ -876,6 +884,17 @@ private:
     /// need to wait the `session_timeout_s` ceiling. Set by
     /// `add_remote_candidates` when invoked with `end_of_candidates`.
     bool remote_end_of_candidates_ = false;
+
+    /// Guard: fire callbacks_.on_gathered at most once per gather cycle.
+    /// Reset by restart() so the next gather cycle can emit a fresh signal.
+    bool gathered_signal_fired_ = false;
+
+    /// Gather-coordination flags: STUN and TURN phases run concurrently.
+    /// on_gathering_complete() is held until both are resolved so the
+    /// offer/answer always includes relay candidates when a TURN server
+    /// is configured. Reset by restart().
+    bool stun_gathered_  = false;   ///< srflx arrived (or no STUN servers)
+    bool turn_gathering_ = false;   ///< TURN allocation in flight
 
     /// Peer-advertised wire flags from the most recent signal envelope.
     /// Atomic so `local_signal_flags()` style read sites stay

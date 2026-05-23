@@ -38,6 +38,9 @@ target_compile_options(goodnet_ice_objects PRIVATE
 target_include_directories(goodnet_ice_objects
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE ${SODIUM_INCLUDE_DIRS})
+if(SODIUM_CFLAGS)
+    target_compile_options(goodnet_ice_objects PRIVATE ${SODIUM_CFLAGS})
+endif()
 set_target_properties(goodnet_ice_objects PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 
@@ -48,6 +51,9 @@ target_link_libraries(goodnet_link_ice
     PRIVATE goodnet_ice_objects asio::asio Threads::Threads OpenSSL::Crypto PkgConfig::SODIUM)
 target_include_directories(goodnet_link_ice
     PRIVATE ${SODIUM_INCLUDE_DIRS})
+if(SODIUM_CFLAGS)
+    target_compile_options(goodnet_link_ice PRIVATE ${SODIUM_CFLAGS})
+endif()
 
 if(GOODNET_BUILD_TESTS)
     add_subdirectory(tests)

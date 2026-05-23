@@ -17,6 +17,7 @@
 /// parsing path.
 
 #include "session.hpp"
+#include "dbg.hpp"
 
 #include <asio/bind_executor.hpp>
 #include <asio/dispatch.hpp>
@@ -35,6 +36,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -183,10 +186,15 @@ IceSession::~IceSession() {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 void IceSession::gather() {
+    ICE_DBG("gather", "peer=%s controlling=%d stun_srvs=%zu",
+            peer_id_.c_str(), controlling_ ? 1 : 0,
+            cfg_.stun_servers.size());
     /// Synchronous prefix runs on the caller before any strand work is
     /// posted, so direct `local_candidates_` mutation is race-free.
     state_.store(SessionState::Gathering, std::memory_order_release);
     gather_host_candidates();
+    ICE_DBG("gather", "peer=%s after host_gather local_cands=%zu",
+            peer_id_.c_str(), local_candidates_.size());
 
     /// Optional NAT mapping via the `gn.link.portmap` extension. Runs
     /// after host gather so `local_port_` is known. The portmap
@@ -201,7 +209,11 @@ void IceSession::gather() {
     gather_relay();
 
     if (cfg_.stun_servers.empty()) {
-        on_gathering_complete();
+        if (!turn_gathering_) {
+            on_gathering_complete();
+        }
+        /// else: TURN allocation is in flight; it will call
+        /// on_gathering_complete() when done (or on its timeout).
     } else {
         asio::post(strand_, [this, self = shared_from_this()] {
             start_multi_stun_probes();
@@ -293,6 +305,18 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
                               ufrag, pwd,
                               cands = std::move(cands),
                               end_of_candidates]() mutable {
+        ICE_DBG("add-remote",
+                "peer=%s ufrag=%s incoming=%zu eoc=%d existing_remote=%zu",
+                self->peer_id_.c_str(), ufrag.c_str(), cands.size(),
+                end_of_candidates ? 1 : 0,
+                self->remote_candidates_.size());
+        for (const auto& c : cands) {
+            ICE_DBG("add-remote.cand",
+                    "peer=%s type=%d tx=%d %s:%u prio=%u",
+                    self->peer_id_.c_str(), static_cast<int>(c.type),
+                    static_cast<int>(c.transport),
+                    c.address_str().c_str(), c.port, c.priority);
+        }
         const bool creds_changed =
             !self->remote_ufrag_.empty() && self->remote_ufrag_ != ufrag;
         if (creds_changed) {
@@ -371,7 +395,19 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
                 /// check loop afterwards. srflx candidates trickle
                 /// out as later deltas under the same outbound
                 /// queue.
-                if (self->callbacks_.on_gathered) {
+                /// Only the responder (controlled agent) emits a signal
+                /// here — this produces the ANSWER.  The initiator
+                /// (controlling) must NOT re-emit; doing so would send
+                /// a second OFFER to the peer and restart their session.
+                ///
+                /// Send the answer immediately with whatever candidates
+                /// are available (host + srflx at minimum).  If a TURN
+                /// allocation is still in flight, the relay candidate
+                /// will be trickled once on_alloc fires (trickle ICE,
+                /// RFC 8838), so the peer's check list gets updated
+                /// without blocking the initial answer.
+                if (self->callbacks_.on_gathered && !self->controlling_) {
+                    self->gathered_signal_fired_ = true;
                     self->callbacks_.on_gathered(self->peer_id_);
                 }
                 self->state_.store(SessionState::Checking,
@@ -483,6 +519,9 @@ void IceSession::restart() {
         self->consent_recovery_attempts_ = 0;
         self->nominee_selected_ = false;
         self->remote_end_of_candidates_ = false;
+        self->gathered_signal_fired_ = false;
+        self->stun_gathered_  = false;
+        self->turn_gathering_ = false;
         self->nominated_cid_.store(0, std::memory_order_release);
         self->peer_signal_flags_.store(0, std::memory_order_release);
         self->symmetric_stride_.store(0, std::memory_order_release);
@@ -1040,6 +1079,10 @@ void IceSession::gather_tcp_server_reflexive() {
 }
 
 void IceSession::start_multi_stun_probes() {
+    ICE_DBG("stun-probe.start",
+            "peer=%s servers=%zu controlling=%d",
+            peer_id_.c_str(), cfg_.stun_servers.size(),
+            controlling_ ? 1 : 0);
     pending_stun_probes_.clear();
     /// Resolve + send one Binding Request per configured STUN server in
     /// a single batch. All probes share the same UDP source port (the
@@ -1060,6 +1103,9 @@ void IceSession::start_multi_stun_probes() {
         auto txn = generate_txn_id();
         auto msg = StunBuilder(STUN_BINDING_REQUEST).set_txn_id(txn).build();
         pending_stun_probes_.push_back(txn);
+        ICE_DBG("stun-probe.send", "peer=%s -> %s:%u cid=%llu",
+                peer_id_.c_str(), host.c_str(), port,
+                static_cast<unsigned long long>(cid));
         if (carrier_) (void)carrier_->send(cid, msg);
     }
 
@@ -1099,6 +1145,12 @@ void IceSession::start_multi_stun_probes() {
 
 void IceSession::handle_gather_response(const StunMessage& msg,
                                             TransportType src_transport) {
+    ICE_DBG("gather-resp",
+            "peer=%s src_tx=%d xor=%s:%u pending=%zu",
+            peer_id_.c_str(), static_cast<int>(src_transport),
+            msg.xor_mapped ? msg.xor_mapped->ip.c_str() : "(none)",
+            msg.xor_mapped ? msg.xor_mapped->port : 0,
+            pending_stun_probes_.size());
     /// Match by transaction id. Linear scan is fine — `cfg_.stun_servers`
     /// is operator-bounded (single-digit).
     auto it = std::find(pending_stun_probes_.begin(),
@@ -1175,11 +1227,26 @@ void IceSession::handle_gather_response(const StunMessage& msg,
         local_candidates_.push_back(c);
     }
 
-    /// Drive the FSM forward as soon as the first valid srflx lands —
-    /// the stride-detection batch fills in afterwards on the strand.
-    if (!already_have_srflx) {
+    /// Drive the FSM forward on the first STUN response — decouple
+    /// from already_have_srflx so a portmap-srflx added by gather_portmap()
+    /// before STUN completes doesn't suppress gather coordination.
+    /// If a TURN allocation is still in flight, arm a 500ms safety
+    /// fallback timer so a slow/unresponsive TURN server doesn't
+    /// stall the whole gather phase.
+    if (!stun_gathered_) {
         gather_timer_.cancel();
-        on_gathering_complete();
+        stun_gathered_ = true;
+        if (!turn_gathering_) {
+            on_gathering_complete();
+        } else {
+            gather_timer_.expires_after(std::chrono::milliseconds(500));
+            gather_timer_.async_wait(asio::bind_executor(strand_,
+                [this, self = shared_from_this()](
+                        const std::error_code& ec) {
+                    if (ec) return;
+                    on_gathering_complete();
+                }));
+        }
     }
 }
 
@@ -1202,6 +1269,7 @@ void IceSession::gather_relay() {
     }
     if (cfg_.turn_servers.empty()) return;
 
+    turn_gathering_ = true;
     turn_attempt_idx_ = 0;
     try_next_turn_attempt();
 }
@@ -1286,10 +1354,16 @@ void IceSession::try_next_turn_attempt() {
         turn_.reset();
     }
     if (turn_attempt_idx_ >= cfg_.turn_servers.size()) {
-        /// Last attempt failed and there are no more servers. The
-        /// gather phase has already moved on (host + STUN paths run
-        /// concurrently with TURN) so no further action needed beyond
-        /// surfacing the empty relay slot.
+        /// All TURN attempts exhausted without a successful allocation.
+        /// Clear the in-flight flag; if STUN already gathered (or there
+        /// is no STUN), fire on_gathering_complete so the offer goes
+        /// out with host + srflx only.  The safety gather_timer_ is
+        /// cancelled to prevent a duplicate on_gathering_complete call.
+        turn_gathering_ = false;
+        if (stun_gathered_ || cfg_.stun_servers.empty()) {
+            gather_timer_.cancel();
+            on_gathering_complete();
+        }
         return;
     }
 
@@ -1342,6 +1416,18 @@ void IceSession::try_next_turn_attempt() {
                         }));
             }
 
+            /// TURN allocation complete — clear the in-flight flag and
+            /// drive gathering forward.  If STUN has already resolved
+            /// (or there are no STUN servers), fire on_gathering_complete
+            /// now so the offer/answer includes the relay candidate.
+            /// The gather_timer_ (500ms safety timer) is cancelled first
+            /// to avoid a redundant on_gathering_complete() from it.
+            self->turn_gathering_ = false;
+            if (self->stun_gathered_ || self->cfg_.stun_servers.empty()) {
+                self->gather_timer_.cancel();
+                self->on_gathering_complete();
+            }
+
             /// If remote candidates already arrived and we are
             /// already in the checking phase, fold the freshly-
             /// minted relay candidate into the check list and
@@ -1352,6 +1438,16 @@ void IceSession::try_next_turn_attempt() {
                 self->build_check_list();
                 self->current_check_ = 0;
                 self->run_next_check();
+                /// Trickle the relay candidate to the peer (RFC 8838).
+                /// The initial answer was already sent in
+                /// add_remote_candidates; fire on_gathered again so
+                /// the peer's check list includes the relay endpoint.
+                /// Only the responder does this — the initiator's
+                /// gather coordination already delays the OFFER until
+                /// TURN resolves so the relay is in the initial offer.
+                if (!self->controlling_ && self->callbacks_.on_gathered) {
+                    self->callbacks_.on_gathered(self->peer_id_);
+                }
             }
         });
     };
@@ -1533,6 +1629,12 @@ void IceSession::promote_turn_backup(std::shared_ptr<TurnClient> client,
 }
 
 void IceSession::on_gathering_complete() {
+    ICE_DBG("gather-done",
+            "peer=%s state=%d local=%zu remote=%zu pending_stun=%zu",
+            peer_id_.c_str(),
+            static_cast<int>(state_.load(std::memory_order_acquire)),
+            local_candidates_.size(), remote_candidates_.size(),
+            pending_stun_probes_.size());
     /// Drop any still-pending STUN probes and cancel the umbrella
     /// timeout — irrelevant whether the gather succeeded (first
     /// XOR-MAPPED-ADDRESS arrived) or timed out / had no servers.
@@ -1541,13 +1643,21 @@ void IceSession::on_gathering_complete() {
 
     if (state_.load(std::memory_order_acquire) == SessionState::Gathering) {
         if (!remote_candidates_.empty()) {
+            ICE_DBG("state", "peer=%s Gathering -> Checking", peer_id_.c_str());
             state_.store(SessionState::Checking, std::memory_order_release);
             build_check_list();
             begin_checks();
         } else {
+            ICE_DBG("state", "peer=%s Gathering -> WaitingRemote",
+                    peer_id_.c_str());
             state_.store(SessionState::WaitingRemote, std::memory_order_release);
         }
     }
+    /// Always fire — each completion event may carry a new candidate
+    /// (srflx on STUN response, relay on TURN alloc) that the peer
+    /// hasn't seen yet.  Trickle ICE (RFC 8838) tolerates multiple
+    /// signals per session; duplicates are deduplicated by the
+    /// add_remote_candidates idempotency on the remote side.
     if (callbacks_.on_gathered)
         callbacks_.on_gathered(peer_id_);
 }
@@ -1555,6 +1665,20 @@ void IceSession::on_gathering_complete() {
 // ── Connectivity checks (strand) ────────────────────────────────────────────
 
 void IceSession::build_check_list() {
+    ICE_DBG("build-cl", "peer=%s local=%zu remote=%zu", peer_id_.c_str(),
+            local_candidates_.size(), remote_candidates_.size());
+    for (const auto& c : local_candidates_) {
+        ICE_DBG("build-cl.local", "peer=%s type=%d tx=%d %s:%u prio=%u",
+                peer_id_.c_str(), static_cast<int>(c.type),
+                static_cast<int>(c.transport),
+                c.address_str().c_str(), c.port, c.priority);
+    }
+    for (const auto& c : remote_candidates_) {
+        ICE_DBG("build-cl.remote", "peer=%s type=%d tx=%d %s:%u prio=%u",
+                peer_id_.c_str(), static_cast<int>(c.type),
+                static_cast<int>(c.transport),
+                c.address_str().c_str(), c.port, c.priority);
+    }
     check_list_.clear();
     /// Port-prediction precondition: peer advertised symmetric, and
     /// the operator left prediction on. Stride is taken from the
@@ -1758,7 +1882,21 @@ void IceSession::begin_checks() {
 }
 
 void IceSession::run_next_check() {
-    if (state_.load(std::memory_order_acquire) != SessionState::Checking) return;
+    const auto st_enter = state_.load(std::memory_order_acquire);
+    if (st_enter != SessionState::Checking) {
+        ICE_DBG("run-check", "peer=%s skip state=%d cl=%zu",
+                peer_id_.c_str(), static_cast<int>(st_enter),
+                check_list_.size());
+        return;
+    }
+    /// RFC 8445 §6.1.2.6 fallback: rescue any Frozen pair whose
+    /// foundation-tuple representative completed without unfreezing it
+    /// (defensive — every Failed/Succeeded transition site already
+    /// calls `unfreeze_siblings`, but a stuck Frozen pair would silently
+    /// dead-end the check list, so we recompute on every tick).
+    unfreeze_stuck_pairs();
+    ICE_DBG("run-check", "peer=%s cl=%zu inflight=%zu",
+            peer_id_.c_str(), check_list_.size(), in_progress_count());
 
     /// First pass: walk InProgress pairs. RFC 5389 §7.2.1 STUN
     /// retransmits keep firing on the same txn id until the response
@@ -1771,6 +1909,11 @@ void IceSession::run_next_check() {
         if (p.state != PairState::InProgress) continue;
         if (p.retries >= static_cast<uint8_t>(cfg_.max_check_retries)) {
             p.state = PairState::Failed;
+            ICE_DBG("pair-failed", "peer=%s lfnd=%s rfnd=%s retries=%u — unfreezing siblings",
+                    peer_id_.c_str(), p.local.foundation.c_str(),
+                    p.remote.foundation.c_str(),
+                    static_cast<unsigned>(p.retries));
+            unfreeze_siblings(p.local.foundation, p.remote.foundation);
         } else {
             send_check(p);
         }
@@ -1778,8 +1921,10 @@ void IceSession::run_next_check() {
 
     /// Second pass: promote Waiting pairs to InProgress until the
     /// concurrency cap (RFC §6.1.2.5) is hit. Frozen pairs stay
-    /// parked until a sibling on the same foundation tuple succeeds
-    /// (`unfreeze_siblings`). Succeeded / Failed are terminal.
+    /// parked until a sibling on the same foundation tuple completes
+    /// (`unfreeze_siblings` is called on both Succeeded AND Failed
+    /// transitions per RFC 8445 §6.1.2.6). Succeeded / Failed are
+    /// terminal.
     bool any_pending = false;
     for (auto& p : check_list_) {
         if (p.state == PairState::Frozen
@@ -1795,19 +1940,27 @@ void IceSession::run_next_check() {
         }
     }
 
+    ICE_DBG("run-check.exit", "peer=%s any_pending=%d cl=%zu inflight=%zu",
+            peer_id_.c_str(), any_pending ? 1 : 0,
+            check_list_.size(), in_progress_count());
     if (!any_pending) {
-        /// Nothing left to drive — the entire list is in
-        /// {Succeeded, Failed} terminal states. If we never reached
-        /// Connected, fail the session.
+        if (state_.load(std::memory_order_acquire) == SessionState::Connected)
+            return;
+        ICE_DBG("state", "peer=%s Checking -> Failed (no pending pairs)",
+                peer_id_.c_str());
         state_.store(SessionState::Failed, std::memory_order_release);
         if (callbacks_.on_failed)
             callbacks_.on_failed(peer_id_, ETIMEDOUT);
         return;
     }
 
+    ICE_DBG("check-timer", "peer=%s arm interval_ms=%d any_pending=1",
+            peer_id_.c_str(), cfg_.check_interval_ms);
     check_timer_.expires_after(std::chrono::milliseconds(cfg_.check_interval_ms));
     check_timer_.async_wait(asio::bind_executor(strand_,
         [this, self = shared_from_this()](const std::error_code& ec) {
+            ICE_DBG("check-timer", "peer=%s fire ec=%d",
+                    peer_id_.c_str(), ec.value());
             if (!ec) run_next_check();
         }));
 }
@@ -1822,19 +1975,54 @@ std::size_t IceSession::in_progress_count() const noexcept {
 
 void IceSession::unfreeze_siblings(const std::string& local_fnd,
                                        const std::string& remote_fnd) {
-    /// RFC 8445 §6.1.2.4: when a check pair succeeds, every Frozen
-    /// pair sharing its `(local.foundation, remote.foundation)` tuple
-    /// becomes Waiting. Foundation strings are non-empty in pairs
-    /// built through `build_check_list` — but triggered-check pairs
-    /// minted by `maybe_trigger_check_from_peer` skip foundation
-    /// computation and start Waiting directly, so an empty foundation
-    /// here is a no-op rather than a global unfreeze.
+    /// RFC 8445 §6.1.2.6: when a check pair COMPLETES (Succeeded OR
+    /// Failed), every Frozen pair sharing its `(local.foundation,
+    /// remote.foundation)` tuple becomes Waiting. Called from both the
+    /// success path AND every Failed-transition site so a dead-end
+    /// pair (e.g. cross-LAN-unreachable HOST candidate) doesn't strand
+    /// its siblings (the routable SRFLX sibling) in Frozen forever.
+    /// Foundation strings are non-empty in pairs built through
+    /// `build_check_list` — but triggered-check pairs minted by
+    /// `maybe_trigger_check_from_peer` skip foundation computation and
+    /// start Waiting directly, so an empty foundation here is a no-op
+    /// rather than a global unfreeze.
     if (local_fnd.empty() || remote_fnd.empty()) return;
     for (auto& p : check_list_) {
         if (p.state != PairState::Frozen) continue;
         if (p.local.foundation == local_fnd
             && p.remote.foundation == remote_fnd) {
             p.state = PairState::Waiting;
+        }
+    }
+}
+
+void IceSession::unfreeze_stuck_pairs() {
+    /// RFC 8445 §6.1.2.6 recompute-states fallback: when no Waiting
+    /// or InProgress pair remains but Frozen pairs are still parked,
+    /// the foundation-tuple representative they were waiting on must
+    /// have transitioned without matching this tuple. Promote one
+    /// representative per remaining foundation tuple so the check
+    /// list isn't stranded.
+    bool has_active = false;
+    for (const auto& p : check_list_) {
+        if (p.state == PairState::Waiting
+            || p.state == PairState::InProgress) {
+            has_active = true;
+            break;
+        }
+    }
+    if (has_active) return;
+    std::unordered_set<std::string> promoted;
+    for (auto& p : check_list_) {
+        if (p.state != PairState::Frozen) continue;
+        const std::string key = p.local.foundation + "|" + p.remote.foundation;
+        if (promoted.insert(key).second) {
+            p.state = PairState::Waiting;
+            ICE_DBG("unfreeze-stuck",
+                    "peer=%s lfnd=%s rfnd=%s — RFC 6.1.2.6 fallback promote",
+                    peer_id_.c_str(),
+                    p.local.foundation.c_str(),
+                    p.remote.foundation.c_str());
         }
     }
 }
@@ -1923,6 +2111,7 @@ void IceSession::send_check(CheckPair& pair) {
     /// `send_check` directly and need the same guarantee).
     if (pair.retries >= static_cast<uint8_t>(cfg_.max_check_retries)) {
         pair.state = PairState::Failed;
+        unfreeze_siblings(pair.local.foundation, pair.remote.foundation);
         return;
     }
     pair.retries++;
@@ -1985,6 +2174,12 @@ void IceSession::send_check(CheckPair& pair) {
     }
 
     auto cid = ensure_remote_cid(pair.remote.address_str(), pair.remote.port);
+    ICE_DBG("send-check",
+            "peer=%s -> %s:%u tx=%d cid=%llu retry=%u nominee=%d",
+            peer_id_.c_str(), pair.remote.address_str().c_str(),
+            pair.remote.port, static_cast<int>(pair.transport_type),
+            static_cast<unsigned long long>(cid), pair.retries,
+            pair.nominee_check_sent ? 1 : 0);
     if (cid == 0 || !carrier_) return;
     (void)carrier_->send(cid, msg);
 }
@@ -2006,6 +2201,11 @@ gn_conn_id_t IceSession::arm_tcp_so_connect(const std::string& ip,
 void IceSession::on_carrier_data(gn_conn_id_t cid,
                                     std::span<const std::uint8_t> data) {
     last_activity_.store(std::chrono::steady_clock::now(), std::memory_order_release);
+    ICE_DBG("rx-bytes", "peer=%s cid=%llu len=%zu controlling=%d",
+            peer_id_.c_str(),
+            static_cast<unsigned long long>(cid),
+            data.size(),
+            controlling_ ? 1 : 0);
 
     /// TURN owns its own server cid. Route every inbound byte from
     /// that cid straight into the TURN state machine — it deframes
@@ -2029,6 +2229,15 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
     auto parsed = parse_stun(data);
     if (parsed) {
         const auto st = state_.load(std::memory_order_acquire);
+        ICE_DBG("rx-stun", "peer=%s cid=%llu msg_type=0x%x has_integrity=%d "
+                "use_cand=%d xor_mapped=%d state=%d",
+                peer_id_.c_str(),
+                static_cast<unsigned long long>(cid),
+                static_cast<unsigned>(parsed->msg_type),
+                parsed->has_integrity ? 1 : 0,
+                parsed->use_candidate ? 1 : 0,
+                parsed->xor_mapped.has_value() ? 1 : 0,
+                static_cast<int>(st));
 
         /// Gather-phase responses come from operator-configured STUN
         /// servers that do NOT share our local pwd, so they carry no
@@ -2070,6 +2279,9 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
         /// nomination, and redirect post-handshake traffic. Drop
         /// anything that lacks integrity OR fails the HMAC.
         if (!parsed->has_integrity || !verify_integrity(data, local_pwd_)) {
+            ICE_DBG("rx-stun.drop",
+                    "peer=%s integrity_fail has=%d", peer_id_.c_str(),
+                    parsed->has_integrity ? 1 : 0);
             return;
         }
 
@@ -2093,10 +2305,13 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
                 return;
             }
             /// Generic error — mark the originating pair as Failed
-            /// so `run_next_check` can advance.
+            /// so `run_next_check` can advance, then unfreeze same-
+            /// foundation siblings per RFC 8445 §6.1.2.6.
             for (auto& pair : check_list_) {
                 if (pair.txn_id == parsed->txn_id) {
                     pair.state = PairState::Failed;
+                    unfreeze_siblings(pair.local.foundation,
+                                      pair.remote.foundation);
                     break;
                 }
             }
@@ -2242,10 +2457,22 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
 }
 
 void IceSession::handle_check_response(const StunMessage& msg) {
-    if (state_.load(std::memory_order_acquire) != SessionState::Checking) return;
-
+    if (state_.load(std::memory_order_acquire) != SessionState::Checking) {
+        ICE_DBG("check-resp", "peer=%s skip not-Checking state=%d",
+                peer_id_.c_str(),
+                static_cast<int>(state_.load(std::memory_order_acquire)));
+        return;
+    }
+    bool matched = false;
     for (auto& pair : check_list_) {
         if (pair.txn_id == msg.txn_id) {
+            matched = true;
+            ICE_DBG("check-resp.match",
+                    "peer=%s pair=%s:%u tx=%d valid=%d nominee=%d",
+                    peer_id_.c_str(), pair.remote.address_str().c_str(),
+                    pair.remote.port, static_cast<int>(pair.transport_type),
+                    pair.valid ? 1 : 0,
+                    pair.nominee_check_sent ? 1 : 0);
             /// Capture RTT sample if we have a recorded send time.
             /// EWMA alpha = 1/8 (RFC 6298 §2 SRTT default) — same
             /// curve the TCP stack uses; rapidly weights recent
@@ -2327,6 +2554,11 @@ void IceSession::handle_check_response(const StunMessage& msg) {
             }
             return;
         }
+    }
+    if (!matched) {
+        ICE_DBG("check-resp.nomatch",
+                "peer=%s no pair with txn cl_size=%zu",
+                peer_id_.c_str(), check_list_.size());
     }
 }
 
@@ -2418,6 +2650,9 @@ NominationMetrics IceSession::nomination_metrics() const noexcept {
 
 void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
                                  gn_conn_id_t cid) {
+    ICE_DBG("nominated", "peer=%s %s:%u relay=%d cid=%llu",
+            peer_id_.c_str(), ip.c_str(), port, relay ? 1 : 0,
+            static_cast<unsigned long long>(cid));
     check_timer_.cancel();
     state_.store(SessionState::Connected, std::memory_order_release);
     consent_missed_.store(0, std::memory_order_release);

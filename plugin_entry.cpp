@@ -184,7 +184,7 @@ gn_result_t link_ext_composer_connect(void* ctx, const char* uri,
     if (!ctx || !uri || !out_conn) return GN_ERR_NULL_ARG;
     try {
         auto* p = static_cast<IcePlugin*>(ctx);
-        return p->link->composer_connect(uri, out_conn);
+        return p->link->connect(uri, out_conn);
     } catch (...) { return GN_ERR_NULL_ARG; }
 }
 

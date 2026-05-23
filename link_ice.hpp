@@ -186,7 +186,8 @@ public:
     /// once the gather is posted; nomination completes asynchronously
     /// and surfaces through `notify_connect` once the first candidate
     /// pair succeeds.
-    [[nodiscard]] gn_result_t connect(std::string_view uri);
+    [[nodiscard]] gn_result_t connect(std::string_view uri,
+                                      gn_conn_id_t*   out_conn = nullptr);
 
     /// Send a single application frame through the nominated pair.
     [[nodiscard]] gn_result_t send(gn_conn_id_t conn,

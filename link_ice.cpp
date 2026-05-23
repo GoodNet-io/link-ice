@@ -858,7 +858,7 @@ gn_result_t IceLink::listen(std::string_view uri) {
     return GN_OK;
 }
 
-gn_result_t IceLink::connect(std::string_view uri) {
+gn_result_t IceLink::connect(std::string_view uri, gn_conn_id_t* out_conn) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
     if (!uri.starts_with("ice://")) {
         gn_log_warn(api_, "ice: connect reject malformed uri "
@@ -891,6 +891,7 @@ gn_result_t IceLink::connect(std::string_view uri) {
     {
         std::lock_guard lk(sessions_mu_);
         if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
+            if (out_conn) *out_conn = it->second;
             return GN_OK;
         }
 
@@ -953,6 +954,7 @@ gn_result_t IceLink::connect(std::string_view uri) {
         asio::post(ioc_, [session] { session->gather(); });
     }
 
+    if (out_conn) *out_conn = conn;
     if (api_->kick_handshake) {
         (void)api_->kick_handshake(api_->host_ctx, conn);
     }
@@ -991,6 +993,8 @@ gn_result_t IceLink::send(gn_conn_id_t conn,
         }
         session = it->second.session;
     }
+    if (session->state() != SessionState::Connected)
+        return GN_ERR_INVALID_STATE;
     session->send(bytes);
     bytes_out_.fetch_add(bytes.size(), std::memory_order_relaxed);
     frames_out_.fetch_add(1, std::memory_order_relaxed);
@@ -1138,6 +1142,9 @@ gn_result_t IceLink::deliver_signal(
     std::uint8_t kind,
     std::span<const std::uint8_t> blob) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
+    gn_log_info(api_,
+        "ice-dbg: deliver_signal kind=%u blob=%zu",
+        static_cast<unsigned>(kind), blob.size());
     /// RFC 8838 §10 end-of-candidates variants (`OFFER_EOC` /
     /// `ANSWER_EOC`) are wire-identical to their non-EOC counterparts;
     /// the difference is a sticky flag we forward into the session.
@@ -1346,6 +1353,12 @@ gn_result_t IceLink::deliver_signal(
 void IceLink::enqueue_local_signal(
     const std::shared_ptr<IceSession>& session) {
     if (!session) return;
+    gn_log_info(api_,
+        "ice-dbg: enqueue_local_signal peer=%s controlling=%d "
+        "local_cands=%zu",
+        session->peer_id().c_str(),
+        session->is_controlling() ? 1 : 0,
+        session->local_candidates().size());
     /// Snapshot under the session's `local_state_mu_` (accessors
     /// already hold it) so we serialise a consistent view without
     /// blocking the strand mid-write.
