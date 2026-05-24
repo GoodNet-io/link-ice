@@ -17,6 +17,7 @@
 #include "link_ice.hpp"
 
 #include "candidate.hpp"
+#include "dbg.hpp"
 #include "dns_ext_client.hpp"
 
 #include <sdk/conn_events.h>
@@ -25,7 +26,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -963,6 +963,11 @@ gn_result_t IceLink::connect(std::string_view uri, gn_conn_id_t* out_conn) {
 
 gn_result_t IceLink::send(gn_conn_id_t conn,
                             std::span<const std::uint8_t> bytes) {
+    ICE_DBG("link-send-entry", "conn=%llu len=%zu shutdown=%d composer=%d",
+            static_cast<unsigned long long>(conn),
+            bytes.size(),
+            (int)shutdown_.load(std::memory_order_acquire),
+            (int)((conn & kComposerIdBit) != 0));
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
     if (bytes.size() > mtu_.load(std::memory_order_relaxed)) {
         gn_log_warn(api_, "ice: send conn=%llu payload=%zu exceeds "
@@ -993,8 +998,19 @@ gn_result_t IceLink::send(gn_conn_id_t conn,
         }
         session = it->second.session;
     }
-    if (session->state() != SessionState::Connected)
-        return GN_ERR_INVALID_STATE;
+    /// `IceSession::send` is itself state-aware: bytes handed in
+    /// before nomination land in the session's `pending_app_data_`
+    /// FIFO and flush inline once `on_nominated` fires. Returning
+    /// INVALID_STATE here would let the kernel send-queue silently
+    /// drop the byte (the per-conn queue does not re-park on non-OK
+    /// non-LIMIT_REACHED rc). The byte-counters tick regardless so
+    /// `gn_link_stats_t.bytes_out` reflects what the L2 handed us,
+    /// not just what fit on the wire — the wire view is exposed
+    /// separately through the carrier's own counters.
+    ICE_DBG("link-send", "conn=%llu len=%zu composer=%d",
+            static_cast<unsigned long long>(conn),
+            bytes.size(),
+            (int)((conn & kComposerIdBit) != 0));
     session->send(bytes);
     bytes_out_.fetch_add(bytes.size(), std::memory_order_relaxed);
     frames_out_.fetch_add(1, std::memory_order_relaxed);
@@ -1071,6 +1087,23 @@ NominationMetrics IceLink::nomination_metrics(
     }
     if (!session) return NominationMetrics{};
     return session->nomination_metrics();
+}
+
+IceSession::CandidateCounts IceLink::candidate_counts(
+    gn_conn_id_t conn) const noexcept {
+    std::shared_ptr<IceSession> session;
+    {
+        std::lock_guard lk(sessions_mu_);
+        auto it = sessions_.find(conn);
+        if (it == sessions_.end()) return {};
+        session = it->second.session;
+    }
+    if (!session) return {};
+    try {
+        return session->candidate_counts();
+    } catch (...) {
+        return {};
+    }
 }
 
 std::uint32_t IceLink::effective_path_mtu(

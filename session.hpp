@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -41,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <sdk/cpp/link_carrier.hpp>
@@ -235,6 +237,14 @@ struct IceConfig {
     /// kernel's SYN-SYN exchange to land. Outside the window the
     /// check is abandoned and the next pair in the list runs.
     int  tcp_so_timeout_ms = 5000;
+    /// Per-socket TCP handshake deadline for connectivity-check
+    /// candidates. Linux kernel SYN-retry budget runs ~127 s on
+    /// defaults — far longer than the ICE pair-state machine wants
+    /// to wait on an unroutable cross-LAN candidate. When the timer
+    /// fires without an inbound byte, the session drops the L1
+    /// socket and marks every in-progress pair on this endpoint
+    /// Failed so a sibling pair can promote.
+    int  tcp_connect_timeout_ms = 3000;
 
     /// Auto-restart the ICE session when consent-freshness recovery is
     /// exhausted instead of transitioning to `Failed`. A transient
@@ -353,6 +363,7 @@ struct NominationMetrics {
     uint64_t      rtt_us       = 0;
     CandidateType local_type   = CandidateType::Host;
     CandidateType remote_type  = CandidateType::Host;
+    TransportType transport    = TransportType::Udp;
     bool          uses_relay   = false;
     bool          nominated    = false;
 };
@@ -520,6 +531,24 @@ public:
     /// `nominated == false`.
     NominationMetrics nomination_metrics() const noexcept;
 
+    /// Per-type candidate count snapshot. `local_candidates_` is
+    /// already serialised through `local_state_mu_` (see
+    /// `local_candidates()`); `remote_candidates_` is strand-only
+    /// so the count is gathered by posting onto the strand and
+    /// blocking on the future. Safe to call from any thread *except*
+    /// the strand itself — strand callers would deadlock.
+    struct CandidateCounts {
+        std::uint32_t local_host  = 0;
+        std::uint32_t local_srflx = 0;
+        std::uint32_t local_relay = 0;
+        std::uint32_t local_prflx = 0;
+        std::uint32_t remote_host  = 0;
+        std::uint32_t remote_srflx = 0;
+        std::uint32_t remote_relay = 0;
+        std::uint32_t remote_prflx = 0;
+    };
+    CandidateCounts candidate_counts() const;
+
     /// Largest MTU known to ride the nominated pair end-to-end. When
     /// `pmtu_active_probing` is on this reflects the latest probe
     /// outcome; otherwise it returns the static configured floor.
@@ -618,13 +647,53 @@ private:
         TransportType transport = TransportType::Udp;
     };
     std::unordered_map<std::string, gn_conn_id_t> endpoint_to_cid_;
-    std::unordered_map<gn_conn_id_t, EndpointInfo> cid_to_endpoint_;
+    /// Per-transport cid → endpoint maps. The two link plugins
+    /// (`gn.link.udp`, `gn.link.tcp`) assign cids from independent
+    /// counters so the same numeric cid can refer to a UDP connection
+    /// in one map and an unrelated TCP connection in the other. Keeping
+    /// them in separate maps is the only way to disambiguate carrier
+    /// ownership at the dispatch site.
+    std::unordered_map<gn_conn_id_t, EndpointInfo> cid_to_endpoint_udp_;
+    std::unordered_map<gn_conn_id_t, EndpointInfo> cid_to_endpoint_tcp_;
+    /// Synthetic cid map for TURN-mediated STUN dispatch. A relay-local
+    /// check pair sends its binding request via `turn_->send_indication`
+    /// instead of `carrier_->send`, so there is no real carrier cid the
+    /// receive path can use to route the inbound STUN response back to
+    /// `on_carrier_data`. We mint a synthetic cid keyed by the peer's
+    /// `(ip,port)` and stamp it into `cid_to_endpoint_udp_` so the
+    /// EndpointInfo lookup that the response handler / triggered-check
+    /// path performs continues to work.
+    ///
+    /// The UDP composer's `kComposerIdBit` is bit 63, so we cannot
+    /// disambiguate synthetic cids from real ones via a bit mask. The
+    /// `relay_cids_` set is the authoritative membership check used
+    /// by the response paths to decide between `carrier_->send` and
+    /// `turn_->send_indication`.
+    std::unordered_map<std::string, gn_conn_id_t> relay_endpoint_to_cid_;
+    std::unordered_set<gn_conn_id_t>              relay_cids_;
+    /// Counter starts well above any plausible composer cid stream
+    /// (the composer increments from 1 OR-ed with bit 63). Set membership
+    /// in `relay_cids_` is the actual disambiguation gate; this is just
+    /// the seed.
+    gn_conn_id_t next_relay_cid_ = 0xC000000000000000ULL;
     /// Reassembly buffer for inbound STUN-over-TCP bytes per cid.
     /// TCP carriers deliver arbitrary chunks; the 16-bit length
     /// prefix lets us slice them back into STUN messages without
     /// assuming one carrier read == one frame.
     std::unordered_map<gn_conn_id_t, std::vector<std::uint8_t>>
         tcp_rx_buffers_;
+    /// Per-cid TCP handshake deadline. Armed by
+    /// `ensure_remote_tcp_cid` at the moment a fresh L1 socket is
+    /// opened; cancelled by `on_tcp_carrier_data` on the first
+    /// inbound byte (proof TCP is alive and the peer is responsive).
+    /// On expiry, `on_tcp_connect_timeout` drops the L1 socket and
+    /// marks every in-progress pair using this endpoint as Failed.
+    /// `unique_ptr` so the timer object lives in a stable address —
+    /// the strand-bound async_wait callback holds a raw pointer
+    /// would race with map rehash.
+    std::unordered_map<gn_conn_id_t,
+                       std::unique_ptr<asio::steady_timer>>
+        tcp_connect_timers_;
     /// The cid currently selected as the nominated outbound path.
     /// Used by `send()` for application data and `on_keepalive`. Zero
     /// before nomination.
@@ -634,6 +703,15 @@ private:
     /// `carrier_tcp_`. Read-mostly: written once by `on_nominated`
     /// and sampled by `send` / `on_keepalive`.
     std::atomic<TransportType> nominated_transport_{TransportType::Udp};
+
+    /// Application payloads handed to `send()` before nomination
+    /// completes. Strand-only — pushed when `state_ != Connected` and
+    /// drained inline at the head of `on_nominated`. Cap is in frames
+    /// rather than bytes so a chatty L2 cannot OOM the session while
+    /// ICE is still negotiating; over-cap pushes drop the oldest
+    /// frame (the FIFO already saw the application accept that send).
+    std::deque<std::vector<uint8_t>> pending_app_data_;
+    static constexpr std::size_t     kPendingAppDataMaxFrames = 64;
 
     /// Multi-STUN parallel fallback (RFC 8445 §5.1.1.2). Instead of
     /// probing STUN servers sequentially with exponential backoff,
@@ -781,7 +859,20 @@ private:
                                       std::uint16_t port);
     void handle_check_response(const StunMessage& msg);
     void on_nominated(const std::string& ip, uint16_t port, bool relay,
-                       gn_conn_id_t cid);
+                       gn_conn_id_t cid, TransportType transport);
+
+    /// Strand-only carrier dispatch for one application payload.
+    /// Extracted out of `send()` so it can be reused by
+    /// `flush_pending_app_data()` after nomination completes; takes
+    /// the buf by const ref because the caller (`flush_*` /
+    /// `send_on_strand` lambda) already owns the storage.
+    void send_on_strand(const std::vector<std::uint8_t>& buf);
+
+    /// Drain `pending_app_data_` through `send_on_strand`. Called
+    /// from `on_nominated` once `state_` is set to Connected and the
+    /// nominated cid is published; safe-by-construction because the
+    /// FIFO is strand-only.
+    void flush_pending_app_data();
 
     /// RFC 8445 §7.3.1.1 role-conflict resolution. Called from the
     /// inbound BINDING_REQUEST path when the peer's role attribute
@@ -819,12 +910,32 @@ private:
     /// Dispatch entry for bytes arriving on a per-endpoint cid. Called
     /// from the per-conn `on_data` callback installed by
     /// `ensure_remote_cid`. Drives the STUN parsing / FSM.
+    ///
+    /// `from_tcp` distinguishes UDP- vs TCP-carrier delivery. UDP and
+    /// TCP carrier plugins issue cids from independent counters that
+    /// can numerically collide (both set high bit, start at 1); the
+    /// flag tells the FSM which carrier owns this cid so reply paths
+    /// don't route through the wrong vtable.
     void on_carrier_data(gn_conn_id_t cid,
-                          std::span<const std::uint8_t> bytes);
+                          std::span<const std::uint8_t> bytes,
+                          bool from_tcp = false);
 
     /// composer_connect → cid mapping; reuses an existing cid if the
     /// endpoint has been seen before. Returns 0 on failure. Strand-only.
     gn_conn_id_t ensure_remote_cid(const std::string& ip, uint16_t port);
+
+    /// Lazily mint a synthetic cid for a (peer_ip, peer_port) endpoint
+    /// reachable only through the TURN allocation. First call stamps
+    /// `cid_to_endpoint_udp_[cid] = {ip, port, Udp}` so the response
+    /// path in `on_carrier_data` can recover the peer endpoint via the
+    /// usual `ep_map.find(cid)` lookup. Subsequent calls for the same
+    /// endpoint return the same cid (idempotent). High bit is set so
+    /// the values do not collide with carrier-assigned cids — the
+    /// dispatch site checks `cid >= 0x8000000000000000ULL` to spot a
+    /// synthetic cid and route the response back via
+    /// `turn_->send_indication`. Strand-only.
+    gn_conn_id_t relay_cid_for_endpoint(const std::string& ip,
+                                          std::uint16_t port);
 
     /// TCP variant of `ensure_remote_cid` — opens the endpoint on the
     /// `gn.link.tcp` carrier (`carrier_tcp_`). Each invocation
@@ -848,6 +959,15 @@ private:
     /// boundaries without losing alignment.
     void on_tcp_carrier_data(gn_conn_id_t cid,
                               std::span<const std::uint8_t> bytes);
+
+    /// Application-level TCP handshake deadline expired for @p cid
+    /// without a single inbound byte arriving. Drops the L1 socket
+    /// (composer_disconnect closes the kernel descriptor), demotes
+    /// every in-progress pair using this endpoint to `Failed`, and
+    /// unfreezes their siblings so the FSM advances to the next
+    /// candidate without waiting out the kernel SYN-retry budget.
+    /// Strand-only.
+    void on_tcp_connect_timeout(gn_conn_id_t cid);
 
     /// Replace HostMdns entries in `remote_candidates_` with their
     /// resolved IP equivalents. For each `<uuid>.local` candidate,

@@ -65,6 +65,72 @@ inline constexpr std::uint32_t kIceSignalVersion = 0x00020000U;
 /// of `gn_link_ice_path_mtu_api_t` below.
 inline constexpr std::uint32_t kIcePathMtuVersion = 0x00010000U;
 
+/// `gn.link.ice.metrics` extension version. Bump on shape breakage
+/// of `gn_link_ice_metrics_api_t` below.
+inline constexpr std::uint32_t kIceMetricsVersion = 0x00010000U;
+
+/// Snapshot of the nominated pair, returned by the metrics extension.
+/// `local_type` / `remote_type` carry raw `CandidateType` (0=Host,
+/// 1=Srflx, 2=Relay, 3=Prflx, 4=HostMdns). `transport` carries raw
+/// `TransportType` (0=Udp, 1..3=TcpActive / TcpPassive /
+/// TcpSimultaneousOpen). Pre-nomination reads return `nominated=0`.
+extern "C" struct gn_ice_nomination_s {
+    std::uint32_t api_size;
+    std::uint8_t  nominated;
+    std::uint8_t  uses_relay;
+    std::uint8_t  local_type;
+    std::uint8_t  remote_type;
+    std::uint8_t  transport;
+    std::uint8_t  _pad[3];
+    std::uint64_t rtt_us;
+};
+using gn_ice_nomination_t = struct gn_ice_nomination_s;
+
+/// Per-type local + remote candidate counts surfaced by the metrics
+/// extension. `prflx` is post-nomination only — peer-reflexive
+/// candidates are learned from check responses, so the count is
+/// non-zero only when a STUN binding-request from an unknown source
+/// address was promoted to a candidate.
+extern "C" struct gn_ice_candidate_counts_s {
+    std::uint32_t api_size;
+    std::uint32_t local_host;
+    std::uint32_t local_srflx;
+    std::uint32_t local_relay;
+    std::uint32_t local_prflx;
+    std::uint32_t remote_host;
+    std::uint32_t remote_srflx;
+    std::uint32_t remote_relay;
+    std::uint32_t remote_prflx;
+};
+using gn_ice_candidate_counts_t = struct gn_ice_candidate_counts_s;
+
+/// `gn.link.ice.metrics` vtable. Exposes the post-nomination snapshot
+/// + gather summary for a given conn id. Used by tests, strategy
+/// plugins, and the docker harness to produce a structured per-peer
+/// report instead of a binary done/fail marker.
+extern "C" struct gn_link_ice_metrics_api_s {
+    std::uint32_t api_size;
+
+    /// Snapshot of nomination metrics for @p conn. Returns `GN_OK`
+    /// with `out->nominated=0` when the conn id is unknown or the
+    /// session has not reached `Connected`. `out->api_size` must be
+    /// set to `sizeof(gn_ice_nomination_t)` by the caller.
+    gn_result_t (*get_nomination)(void* ctx,
+                                    gn_conn_id_t conn,
+                                    gn_ice_nomination_t* out);
+
+    /// Per-type candidate counts. Returns `GN_OK` with zeroed counts
+    /// when conn id is unknown. `out->api_size` must be set to
+    /// `sizeof(gn_ice_candidate_counts_t)` by the caller.
+    gn_result_t (*get_candidate_counts)(void* ctx,
+                                          gn_conn_id_t conn,
+                                          gn_ice_candidate_counts_t* out);
+
+    void* ctx;
+    void* _reserved[2];
+};
+using gn_link_ice_metrics_api_t = struct gn_link_ice_metrics_api_s;
+
 /// Path-MTU query surface for the `gn.link.ice.path_mtu` extension.
 /// Upper layers (security session, gnet protocol, app framers) use
 /// it to size their outbound frames to the value DPLPMTUD has
@@ -240,6 +306,14 @@ public:
     /// the conn id is
     /// unknown or its FSM hasn't reached `Connected`.
     [[nodiscard]] NominationMetrics nomination_metrics(
+        gn_conn_id_t conn) const noexcept;
+
+    /// Per-type candidate counts for `conn`. Used by the
+    /// `gn.link.ice.metrics` extension. Returns all-zero counts when
+    /// the conn id is unknown. Safe to call from any thread except
+    /// the per-session strand (the session bounces through the strand
+    /// to snapshot `remote_candidates_`).
+    [[nodiscard]] IceSession::CandidateCounts candidate_counts(
         gn_conn_id_t conn) const noexcept;
 
     /// RFC 8445 §9 ICE restart for an already-tracked connection.

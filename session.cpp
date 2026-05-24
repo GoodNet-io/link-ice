@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -175,11 +176,15 @@ IceSession::~IceSession() {
     /// mapping out on its own once `lifetime_s` elapses without a
     /// renewal.
     release_portmap_mapping();
-    for (auto& [cid, ep] : cid_to_endpoint_) {
-        auto* c = transport_is_tcp(ep.transport) ? carrier_tcp_ : carrier_;
-        if (!c) continue;
-        (void)c->unsubscribe_data(cid);
-        (void)c->disconnect(cid);
+    for (auto& [cid, ep] : cid_to_endpoint_udp_) {
+        if (!carrier_) continue;
+        (void)carrier_->unsubscribe_data(cid);
+        (void)carrier_->disconnect(cid);
+    }
+    for (auto& [cid, ep] : cid_to_endpoint_tcp_) {
+        if (!carrier_tcp_) continue;
+        (void)carrier_tcp_->unsubscribe_data(cid);
+        (void)carrier_tcp_->disconnect(cid);
     }
 }
 
@@ -252,49 +257,81 @@ void IceSession::set_remote(const std::string& ufrag, const std::string& pwd,
 }
 
 void IceSession::send(std::span<const uint8_t> data) {
-    if (state_.load(std::memory_order_acquire) != SessionState::Connected) return;
     last_activity_.store(std::chrono::steady_clock::now(), std::memory_order_release);
 
     auto buf = std::make_shared<std::vector<uint8_t>>(data.begin(), data.end());
+    ICE_DBG("send-app-enq", "peer=%s len=%zu state=%d",
+            peer_id_.c_str(), buf->size(),
+            (int)state_.load(std::memory_order_acquire));
     asio::post(strand_, [this, self = shared_from_this(), buf] {
-        std::string ip;
-        uint16_t port;
-        bool relay;
-        {
-            std::lock_guard lk(nominated_mu_);
-            ip = nominated_ip_;
-            port = nominated_port_;
-            relay = uses_relay_;
-        }
-
-        if (relay && turn_) {
-            turn_->send_indication(ip, port, *buf);
+        const auto st = state_.load(std::memory_order_acquire);
+        if (st != SessionState::Connected) {
+            if (pending_app_data_.size() >= kPendingAppDataMaxFrames) {
+                pending_app_data_.pop_front();
+            }
+            pending_app_data_.push_back(std::move(*buf));
+            ICE_DBG("send-app-park", "peer=%s state=%d pending=%zu",
+                    peer_id_.c_str(), (int)st, pending_app_data_.size());
             return;
         }
-
-        auto cid = nominated_cid_.load(std::memory_order_acquire);
-        if (cid == 0) {
-            cid = ensure_remote_cid(ip, port);
-            if (cid == 0) return;
-            nominated_cid_.store(cid, std::memory_order_release);
-        }
-        const auto tx = nominated_transport_.load(std::memory_order_acquire);
-        if (transport_is_tcp(tx)) {
-            /// RFC 6544 §3 application data on a nominated TCP pair
-            /// rides the same 16-bit length-prefix framing as the
-            /// connectivity-check STUN traffic so the peer's
-            /// `on_tcp_carrier_data` can reassemble frames out of the
-            /// byte stream. Without the prefix two consecutive
-            /// `send()` calls would coalesce on the wire and the
-            /// receiver would have no boundary to slice on.
-            if (carrier_tcp_) {
-                const auto framed = frame_tcp_stun(*buf);
-                (void)carrier_tcp_->send(cid, framed);
-            }
-        } else {
-            if (carrier_) (void)carrier_->send(cid, *buf);
-        }
+        send_on_strand(*buf);
     });
+}
+
+void IceSession::send_on_strand(const std::vector<uint8_t>& buf) {
+    std::string ip;
+    uint16_t port;
+    bool relay;
+    {
+        std::lock_guard lk(nominated_mu_);
+        ip = nominated_ip_;
+        port = nominated_port_;
+        relay = uses_relay_;
+    }
+
+    if (relay && turn_) {
+        ICE_DBG("send-app-out", "peer=%s len=%zu dst=%s:%u relay=1",
+                peer_id_.c_str(), buf.size(), ip.c_str(), port);
+        turn_->send_indication(ip, port, buf);
+        return;
+    }
+
+    auto cid = nominated_cid_.load(std::memory_order_acquire);
+    if (cid == 0) {
+        cid = ensure_remote_cid(ip, port);
+        if (cid == 0) {
+            ICE_DBG("send-app-drop", "peer=%s reason=no-cid dst=%s:%u",
+                    peer_id_.c_str(), ip.c_str(), port);
+            return;
+        }
+        nominated_cid_.store(cid, std::memory_order_release);
+    }
+    const auto tx = nominated_transport_.load(std::memory_order_acquire);
+    ICE_DBG("send-app-out", "peer=%s len=%zu dst=%s:%u cid=%llu tcp=%d carrier=%d",
+            peer_id_.c_str(), buf.size(), ip.c_str(), port,
+            static_cast<unsigned long long>(cid),
+            (int)transport_is_tcp(tx),
+            (int)(transport_is_tcp(tx) ? (carrier_tcp_ != nullptr) : (carrier_ != nullptr)));
+    if (transport_is_tcp(tx)) {
+        if (carrier_tcp_) {
+            const auto framed = frame_tcp_stun(buf);
+            (void)carrier_tcp_->send(cid, framed);
+        }
+    } else {
+        if (carrier_) (void)carrier_->send(cid, buf);
+    }
+}
+
+void IceSession::flush_pending_app_data() {
+    if (!pending_app_data_.empty()) {
+        ICE_DBG("flush-app", "peer=%s count=%zu",
+                peer_id_.c_str(), pending_app_data_.size());
+    }
+    while (!pending_app_data_.empty()) {
+        auto buf = std::move(pending_app_data_.front());
+        pending_app_data_.pop_front();
+        send_on_strand(buf);
+    }
 }
 
 void IceSession::add_remote_candidates(const std::string& ufrag,
@@ -378,7 +415,22 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
                         && e.type == c.type
                         && e.transport == c.transport;
                 });
-            if (!dup) self->remote_candidates_.push_back(std::move(c));
+            if (!dup) {
+                /// Install a TURN CreatePermission entry for the peer
+                /// IP before the merge so the relay-local check pair
+                /// produced by the next `build_check_list` can fire
+                /// SendIndication packets at this peer without the
+                /// server dropping them as "no permission". The
+                /// TurnClient dedupes via `permissions_`, so duplicate
+                /// calls (same IP across multiple candidates) are
+                /// harmless. When the allocation isn't up yet the
+                /// `on_alloc` callback in `gather_relay` does the
+                /// same sweep across the current remote set.
+                if (self->turn_ && self->turn_->is_allocated()) {
+                    self->turn_->create_permission(ip);
+                }
+                self->remote_candidates_.push_back(std::move(c));
+            }
         }
 
         const auto cur = self->state_.load(std::memory_order_acquire);
@@ -539,15 +591,23 @@ void IceSession::restart() {
         /// IceLink's other sessions) stays bound — only the per-peer
         /// mappings are torn down so the next gather negotiates fresh
         /// composer_connect's for the new candidate set.
-        for (auto& [cid, ep] : self->cid_to_endpoint_) {
-            auto* c = transport_is_tcp(ep.transport)
-                ? self->carrier_tcp_ : self->carrier_;
-            if (!c) continue;
-            (void)c->unsubscribe_data(cid);
-            (void)c->disconnect(cid);
+        for (auto& [cid, t] : self->tcp_connect_timers_) {
+            if (t) t->cancel();
+        }
+        self->tcp_connect_timers_.clear();
+        for (auto& [cid, ep] : self->cid_to_endpoint_udp_) {
+            if (!self->carrier_) continue;
+            (void)self->carrier_->unsubscribe_data(cid);
+            (void)self->carrier_->disconnect(cid);
+        }
+        for (auto& [cid, ep] : self->cid_to_endpoint_tcp_) {
+            if (!self->carrier_tcp_) continue;
+            (void)self->carrier_tcp_->unsubscribe_data(cid);
+            (void)self->carrier_tcp_->disconnect(cid);
         }
         self->endpoint_to_cid_.clear();
-        self->cid_to_endpoint_.clear();
+        self->cid_to_endpoint_udp_.clear();
+        self->cid_to_endpoint_tcp_.clear();
         self->tcp_rx_buffers_.clear();
         self->carrier_initialized_ = false;
         self->local_port_ = 0;
@@ -581,15 +641,23 @@ void IceSession::close() {
         /// the renewal table inside the portmap plugin clears even
         /// when the router's reply never arrives.
         self->release_portmap_mapping();
-        for (auto& [cid, ep] : self->cid_to_endpoint_) {
-            auto* c = transport_is_tcp(ep.transport)
-                ? self->carrier_tcp_ : self->carrier_;
-            if (!c) continue;
-            (void)c->unsubscribe_data(cid);
-            (void)c->disconnect(cid);
+        for (auto& [cid, t] : self->tcp_connect_timers_) {
+            if (t) t->cancel();
+        }
+        self->tcp_connect_timers_.clear();
+        for (auto& [cid, ep] : self->cid_to_endpoint_udp_) {
+            if (!self->carrier_) continue;
+            (void)self->carrier_->unsubscribe_data(cid);
+            (void)self->carrier_->disconnect(cid);
+        }
+        for (auto& [cid, ep] : self->cid_to_endpoint_tcp_) {
+            if (!self->carrier_tcp_) continue;
+            (void)self->carrier_tcp_->unsubscribe_data(cid);
+            (void)self->carrier_tcp_->disconnect(cid);
         }
         self->endpoint_to_cid_.clear();
-        self->cid_to_endpoint_.clear();
+        self->cid_to_endpoint_udp_.clear();
+        self->cid_to_endpoint_tcp_.clear();
         self->tcp_rx_buffers_.clear();
         self->nominated_cid_.store(0, std::memory_order_release);
     });
@@ -979,7 +1047,24 @@ gn_conn_id_t IceSession::ensure_remote_cid(const std::string& ip,
                 });
         });
     endpoint_to_cid_[key] = cid;
-    cid_to_endpoint_[cid] = EndpointInfo{ip, port, TransportType::Udp};
+    cid_to_endpoint_udp_[cid] = EndpointInfo{ip, port, TransportType::Udp};
+    return cid;
+}
+
+gn_conn_id_t IceSession::relay_cid_for_endpoint(const std::string& ip,
+                                                    std::uint16_t port) {
+    const auto key = endpoint_key(ip, port);
+    if (auto it = relay_endpoint_to_cid_.find(key);
+        it != relay_endpoint_to_cid_.end()) {
+        return it->second;
+    }
+    const auto cid = next_relay_cid_++;
+    relay_endpoint_to_cid_[key] = cid;
+    relay_cids_.insert(cid);
+    /// Stamp the synthetic cid into the UDP endpoint map so the
+    /// response/triggered-check path in `on_carrier_data` recovers the
+    /// peer (ip, port) via the existing `ep_map.find(cid)` lookup.
+    cid_to_endpoint_udp_[cid] = EndpointInfo{ip, port, TransportType::Udp};
     return cid;
 }
 
@@ -1009,7 +1094,18 @@ gn_conn_id_t IceSession::ensure_remote_tcp_cid(const std::string& ip,
                     self->on_tcp_carrier_data(c, copy);
                 });
         });
-    cid_to_endpoint_[cid] = EndpointInfo{ip, port, TransportType::TcpActive};
+    cid_to_endpoint_tcp_[cid] = EndpointInfo{ip, port, TransportType::TcpActive};
+    auto timer = std::make_unique<asio::steady_timer>(io_);
+    timer->expires_after(
+        std::chrono::milliseconds(cfg_.tcp_connect_timeout_ms));
+    timer->async_wait(asio::bind_executor(strand_,
+        [weak_self, cid](const std::error_code& ec) {
+            if (ec == asio::error::operation_aborted) return;
+            auto self = weak_self.lock();
+            if (!self) return;
+            self->on_tcp_connect_timeout(cid);
+        }));
+    tcp_connect_timers_[cid] = std::move(timer);
     return cid;
 }
 
@@ -1035,6 +1131,11 @@ void IceSession::on_tcp_carrier_data(gn_conn_id_t cid,
     /// buffer currently holds before returning. Underflow on the
     /// length prefix or the body simply leaves the bytes in place
     /// for the next callback.
+    if (auto it = tcp_connect_timers_.find(cid);
+        it != tcp_connect_timers_.end()) {
+        if (it->second) it->second->cancel();
+        tcp_connect_timers_.erase(it);
+    }
     auto& buf = tcp_rx_buffers_[cid];
     buf.insert(buf.end(), bytes.begin(), bytes.end());
     while (buf.size() >= 2) {
@@ -1045,7 +1146,35 @@ void IceSession::on_tcp_carrier_data(gn_conn_id_t cid,
         std::vector<std::uint8_t> frame(buf.begin() + 2,
                                           buf.begin() + 2 + len);
         buf.erase(buf.begin(), buf.begin() + 2 + len);
-        on_carrier_data(cid, frame);
+        on_carrier_data(cid, frame, /*from_tcp=*/true);
+    }
+}
+
+void IceSession::on_tcp_connect_timeout(gn_conn_id_t cid) {
+    tcp_connect_timers_.erase(cid);
+    auto ep_it = cid_to_endpoint_tcp_.find(cid);
+    if (ep_it == cid_to_endpoint_tcp_.end()) return;
+    const auto ep = ep_it->second;
+    if (!transport_is_tcp(ep.transport)) return;
+    if (carrier_tcp_) {
+        (void)carrier_tcp_->unsubscribe_data(cid);
+        (void)carrier_tcp_->disconnect(cid);
+    }
+    cid_to_endpoint_tcp_.erase(ep_it);
+    tcp_rx_buffers_.erase(cid);
+    for (auto& p : check_list_) {
+        if (p.state != PairState::InProgress) continue;
+        if (!transport_is_tcp(p.transport_type)) continue;
+        if (p.remote.address_str() != ep.ip
+            || p.remote.port      != ep.port) continue;
+        p.state = PairState::Failed;
+        ICE_DBG("pair-failed-tcp-timeout",
+                "peer=%s lfnd=%s rfnd=%s cid=%llu",
+                peer_id_.c_str(),
+                p.local.foundation.c_str(),
+                p.remote.foundation.c_str(),
+                static_cast<unsigned long long>(cid));
+        unfreeze_siblings(p.local.foundation, p.remote.foundation);
     }
 }
 
@@ -1396,6 +1525,22 @@ void IceSession::try_next_turn_attempt() {
                 std::lock_guard lk(self->local_state_mu_);
                 self->local_candidates_.push_back(std::move(c));
             }
+
+            /// TURN allocation just came up — install CreatePermission
+            /// entries for every remote candidate already known. The
+            /// server drops Send-Indications targeting peers without
+            /// a permission; without this, the very first connectivity
+            /// check fired through the relay never reaches the peer
+            /// and the FSM times out. The TurnClient internally
+            /// dedupes via its `permissions_` set, so this is safe to
+            /// call before later remote-candidate arrivals trigger
+            /// their own create_permission in `add_remote_candidates`.
+            if (self->turn_) {
+                for (const auto& rc : self->remote_candidates_) {
+                    self->turn_->create_permission(rc.address_str());
+                }
+            }
+
             /// Successful attempt — stash the remaining entries as
             /// backups and arm the periodic probe.
             self->turn_backups_.clear();
@@ -1452,13 +1597,38 @@ void IceSession::try_next_turn_attempt() {
         });
     };
 
-    auto on_data = [weak_self](const std::string& /*ip*/,
-                                uint16_t /*port*/,
+    auto on_data = [weak_self](const std::string& ip,
+                                uint16_t port,
                                 std::span<const uint8_t> data) {
         auto self = weak_self.lock();
         if (!self) return;
         self->last_activity_.store(std::chrono::steady_clock::now(),
                                      std::memory_order_release);
+        /// Peek at the payload to distinguish a STUN connectivity
+        /// check / response from raw application bytes. RFC 5389 §6:
+        /// every STUN message starts with two zero bits in the first
+        /// byte and carries the 4-byte magic cookie 0x2112A442 at
+        /// offset [4..8). Application data is forwarded straight to
+        /// the upper layer; STUN messages are re-injected into the
+        /// regular per-cid dispatch path through a synthetic relay
+        /// cid keyed by (peer_ip, peer_port) so the existing FSM
+        /// (response correlation, integrity check, triggered-check)
+        /// works unmodified.
+        const bool is_stun = data.size() >= 20
+            && (data[0] & 0xC0) == 0
+            && data[4] == 0x21 && data[5] == 0x12
+            && data[6] == 0xA4 && data[7] == 0x42;
+        if (is_stun) {
+            std::vector<std::uint8_t> copy(data.begin(), data.end());
+            asio::post(self->strand_,
+                [self, ip, port, copy = std::move(copy)] {
+                    const auto synth_cid =
+                        self->relay_cid_for_endpoint(ip, port);
+                    self->on_carrier_data(synth_cid, copy,
+                                              /*from_tcp=*/false);
+                });
+            return;
+        }
         if (self->callbacks_.on_data)
             self->callbacks_.on_data(self->peer_id_, data);
     };
@@ -1905,18 +2075,39 @@ void IceSession::run_next_check() {
     /// concurrency cap doesn't gate them. A pair whose retries are
     /// exhausted transitions to Failed and yields its slot to a
     /// Waiting sibling.
+    ///
+    /// RFC 5389 §7.2.1 RTO backoff: a retransmit only fires once the
+    /// per-attempt RTO has elapsed since the last send, with RTO
+    /// doubling per retry. Pacing tick (`check_interval_ms`) is the
+    /// FSM heartbeat; the base RTO is a small multiple of it so the
+    /// budget stays in the seconds range where real NAT RTTs live.
+    const auto now_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint64_t base_rto_us =
+        static_cast<uint64_t>(cfg_.check_interval_ms) * 5 * 1000ull;
     for (auto& p : check_list_) {
         if (p.state != PairState::InProgress) continue;
         if (p.retries >= static_cast<uint8_t>(cfg_.max_check_retries)) {
+            if (p.txn_send_us != 0
+                && (now_us - p.txn_send_us)
+                       < (base_rto_us << (cfg_.max_check_retries - 1))) {
+                continue;
+            }
             p.state = PairState::Failed;
             ICE_DBG("pair-failed", "peer=%s lfnd=%s rfnd=%s retries=%u — unfreezing siblings",
                     peer_id_.c_str(), p.local.foundation.c_str(),
                     p.remote.foundation.c_str(),
                     static_cast<unsigned>(p.retries));
             unfreeze_siblings(p.local.foundation, p.remote.foundation);
-        } else {
-            send_check(p);
+            continue;
         }
+        if (p.txn_send_us != 0) {
+            const uint64_t rto_us = base_rto_us
+                << std::min<uint8_t>(p.retries, 5);
+            if ((now_us - p.txn_send_us) < rto_us) continue;
+        }
+        send_check(p);
     }
 
     /// Second pass: promote Waiting pairs to InProgress until the
@@ -2173,6 +2364,34 @@ void IceSession::send_check(CheckPair& pair) {
         return;
     }
 
+    /// Relay-local UDP pair: route the connectivity check through the
+    /// TURN allocation. The STUN payload is identical to the direct-
+    /// carrier case — only the wire path changes. `send_indication`
+    /// wraps the STUN message in a TURN Send-Indication envelope; the
+    /// server unwraps and forwards it as a Data-Indication to the
+    /// peer's allocation. Without this, the binding request would land
+    /// at the TURN-server's allocated port directly, which discards
+    /// non-TURN traffic and the check never reaches the peer. The
+    /// synthetic relay cid is stamped so the inbound response (which
+    /// surfaces through `TurnDataCallback` → `on_carrier_data` with the
+    /// synthetic cid) can recover the peer endpoint via the standard
+    /// `cid_to_endpoint_udp_` lookup.
+    if (pair.local.type == CandidateType::Relay
+        && pair.transport_type == TransportType::Udp
+        && turn_ && turn_->is_allocated()) {
+        const auto synth_cid = relay_cid_for_endpoint(
+            pair.remote.address_str(), pair.remote.port);
+        ICE_DBG("send-check.relay",
+                "peer=%s -> %s:%u via TURN cid=%llu retry=%u nominee=%d",
+                peer_id_.c_str(), pair.remote.address_str().c_str(),
+                pair.remote.port,
+                static_cast<unsigned long long>(synth_cid),
+                pair.retries, pair.nominee_check_sent ? 1 : 0);
+        turn_->send_indication(pair.remote.address_str(),
+                                  pair.remote.port, msg);
+        return;
+    }
+
     auto cid = ensure_remote_cid(pair.remote.address_str(), pair.remote.port);
     ICE_DBG("send-check",
             "peer=%s -> %s:%u tx=%d cid=%llu retry=%u nominee=%d",
@@ -2199,13 +2418,16 @@ gn_conn_id_t IceSession::arm_tcp_so_connect(const std::string& ip,
 // ── Receive + dispatch (strand) ─────────────────────────────────────────────
 
 void IceSession::on_carrier_data(gn_conn_id_t cid,
-                                    std::span<const std::uint8_t> data) {
+                                    std::span<const std::uint8_t> data,
+                                    bool from_tcp) {
     last_activity_.store(std::chrono::steady_clock::now(), std::memory_order_release);
-    ICE_DBG("rx-bytes", "peer=%s cid=%llu len=%zu controlling=%d",
+    ICE_DBG("rx-bytes", "peer=%s cid=%llu len=%zu controlling=%d from_tcp=%d",
             peer_id_.c_str(),
             static_cast<unsigned long long>(cid),
             data.size(),
-            controlling_ ? 1 : 0);
+            controlling_ ? 1 : 0,
+            from_tcp ? 1 : 0);
+    auto& ep_map = from_tcp ? cid_to_endpoint_tcp_ : cid_to_endpoint_udp_;
 
     /// TURN owns its own server cid. Route every inbound byte from
     /// that cid straight into the TURN state machine — it deframes
@@ -2263,8 +2485,7 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
                           parsed->txn_id)
                 != pending_stun_probes_.end()) {
             TransportType src_tx = TransportType::Udp;
-            if (auto eit = cid_to_endpoint_.find(cid);
-                eit != cid_to_endpoint_.end()) {
+            if (auto eit = ep_map.find(cid); eit != ep_map.end()) {
                 src_tx = eit->second.transport;
             }
             handle_gather_response(*parsed, src_tx);
@@ -2273,15 +2494,42 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
         (void)st;
 
         /// STUN messages from a peer must carry a MESSAGE-INTEGRITY
-        /// attribute and pass HMAC verification with our local pwd.
-        /// Without this an unauthenticated UDP attacker who knows the
-        /// ICE port can answer/initiate binding checks, hijack
-        /// nomination, and redirect post-handshake traffic. Drop
-        /// anything that lacks integrity OR fails the HMAC.
-        if (!parsed->has_integrity || !verify_integrity(data, local_pwd_)) {
+        /// attribute and pass HMAC verification. Without this an
+        /// unauthenticated UDP attacker who knows the ICE port can
+        /// answer/initiate binding checks, hijack nomination, and
+        /// redirect post-handshake traffic. Drop anything that lacks
+        /// integrity OR fails the HMAC.
+        ///
+        /// Key selection follows RFC 8489 §14.1.4 (short-term
+        /// credentials): a Response MUST use the same key as the
+        /// Request it answers. For ICE that resolves to:
+        ///   * inbound Request  → signed by peer with OUR pwd
+        ///                        (peer learned `local_pwd_` from
+        ///                        our OFFER) → verify with local_pwd_
+        ///   * inbound Response → answers a Request WE sent, which
+        ///                        we signed with `remote_pwd_`; per
+        ///                        the same-key rule, peer signed the
+        ///                        Response with the same remote_pwd_
+        ///                        → verify with remote_pwd_
+        ///   * inbound Error    → same rule as Response.
+        ///
+        /// The previous implementation verified everything with
+        /// local_pwd_ which silently dropped every Success/Error
+        /// Response to our own checks, stranding the FSM at
+        /// `inflight = N` until the RFC 5389 retry budget expired
+        /// and the pair was marked Failed.
+        const bool is_response =
+            (parsed->msg_type == STUN_BINDING_RESPONSE
+             || parsed->msg_type == STUN_BINDING_ERROR);
+        const std::string& integrity_key =
+            is_response ? remote_pwd_ : local_pwd_;
+        if (!parsed->has_integrity
+            || !verify_integrity(data, integrity_key)) {
             ICE_DBG("rx-stun.drop",
-                    "peer=%s integrity_fail has=%d", peer_id_.c_str(),
-                    parsed->has_integrity ? 1 : 0);
+                    "peer=%s integrity_fail has=%d msg_type=0x%x",
+                    peer_id_.c_str(),
+                    parsed->has_integrity ? 1 : 0,
+                    static_cast<unsigned>(parsed->msg_type));
             return;
         }
 
@@ -2373,15 +2621,29 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
                         .add_integrity(local_pwd_)
                         .add_fingerprint()
                         .build();
-                    TransportType cid_tx = TransportType::Udp;
-                    if (auto eit = cid_to_endpoint_.find(cid);
-                        eit != cid_to_endpoint_.end()) {
-                        cid_tx = eit->second.transport;
-                    }
-                    if (transport_is_tcp(cid_tx)) {
+                    /// Synthetic relay cid: route the error response
+                    /// back through TURN so the peer receives it via
+                    /// the same allocation path the request used.
+                    /// `relay_cids_` is the authoritative membership
+                    /// check — the carrier's own cids also have the
+                    /// high bit set so a bit-mask test would collide.
+                    const bool via_turn = !from_tcp && turn_
+                        && relay_cids_.contains(cid);
+                    if (from_tcp) {
                         if (carrier_tcp_) {
                             const auto framed = frame_tcp_stun(err);
                             (void)carrier_tcp_->send(cid, framed);
+                        }
+                    } else if (via_turn) {
+                        std::string rip;
+                        std::uint16_t rport = 0;
+                        if (auto eit = cid_to_endpoint_udp_.find(cid);
+                            eit != cid_to_endpoint_udp_.end()) {
+                            rip = eit->second.ip;
+                            rport = eit->second.port;
+                        }
+                        if (!rip.empty()) {
+                            turn_->send_indication(rip, rport, err);
                         }
                     } else {
                         if (carrier_) (void)carrier_->send(cid, err);
@@ -2404,34 +2666,67 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
             /// rewriting between announced candidate and actual src.
             /// TCP cids need the 16-bit length-prefix wrap before
             /// the byte stream hits the wire (RFC 5389 §7.2.2).
-            TransportType cid_tx = TransportType::Udp;
-            if (auto eit = cid_to_endpoint_.find(cid);
-                eit != cid_to_endpoint_.end()) {
-                cid_tx = eit->second.transport;
+            std::string resp_ip;
+            std::uint16_t resp_port = 0;
+            if (auto eit = ep_map.find(cid); eit != ep_map.end()) {
+                resp_ip = eit->second.ip;
+                resp_port = eit->second.port;
             }
-            if (transport_is_tcp(cid_tx)) {
+            int send_rc = -2;  // -2 = no carrier
+            /// Synthetic relay cid: the request arrived via the TURN
+            /// allocation, so the matching response goes back the same
+            /// way. `send_indication` wraps the STUN response in a
+            /// Send-Indication envelope; the server forwards it as a
+            /// Data-Indication to the peer's allocation.
+            const bool resp_via_turn = !from_tcp && turn_
+                && relay_cids_.contains(cid);
+            if (from_tcp) {
                 if (carrier_tcp_) {
                     const auto framed = frame_tcp_stun(resp);
-                    (void)carrier_tcp_->send(cid, framed);
+                    send_rc = static_cast<int>(
+                        carrier_tcp_->send(cid, framed));
+                }
+            } else if (resp_via_turn) {
+                if (!resp_ip.empty()) {
+                    turn_->send_indication(resp_ip, resp_port, resp);
+                    send_rc = 0;
                 }
             } else {
-                if (carrier_) (void)carrier_->send(cid, resp);
+                if (carrier_) {
+                    send_rc = static_cast<int>(
+                        carrier_->send(cid, resp));
+                }
             }
+            ICE_DBG("send-resp",
+                    "peer=%s cid=%llu dst=%s:%u from_tcp=%d "
+                    "via_turn=%d resp_bytes=%zu rc=%d",
+                    peer_id_.c_str(),
+                    static_cast<unsigned long long>(cid),
+                    resp_ip.c_str(), resp_port,
+                    from_tcp ? 1 : 0,
+                    resp_via_turn ? 1 : 0,
+                    resp.size(), send_rc);
 
-            std::string peer_ip;
-            std::uint16_t peer_port = 0;
-            if (auto eit = cid_to_endpoint_.find(cid);
-                eit != cid_to_endpoint_.end()) {
-                peer_ip   = eit->second.ip;
-                peer_port = eit->second.port;
-            }
+            std::string peer_ip = resp_ip;
+            std::uint16_t peer_port = resp_port;
 
             if (parsed->use_candidate && !controlling_) {
                 /// Use the endpoint info stashed by the per-cid map;
                 /// that is the address composer_connect was called
                 /// with, which matches the peer's announced candidate.
                 if (!peer_ip.empty()) {
-                    on_nominated(peer_ip, peer_port, /*relay=*/false, cid);
+                    const auto nom_tx = from_tcp
+                        ? TransportType::TcpActive
+                        : TransportType::Udp;
+                    /// Synthetic cid → the request arrived via TURN,
+                    /// so the nominated pair is relay-mediated.
+                    /// `send_on_strand` checks `uses_relay_` and falls
+                    /// through to `turn_->send_indication` instead of
+                    /// the direct carrier path.
+                    const bool nom_relay = !from_tcp
+                        && relay_cids_.contains(cid);
+                    on_nominated(peer_ip, peer_port, nom_relay, cid,
+                                 nom_tx);
                 }
             }
 
@@ -2495,7 +2790,15 @@ void IceSession::handle_check_response(const StunMessage& msg) {
             /// for symmetric NAT.
             std::string nom_ip = pair.remote.address_str();
             uint16_t nom_port = pair.remote.port;
-            bool nom_relay = pair.remote.type == CandidateType::Relay;
+            /// "uses_relay" gates the OUTBOUND send path. When the
+            /// LOCAL candidate is a Relay, outbound bytes must ride
+            /// `turn_->send_indication`; the remote's candidate type
+            /// only matters for picking the carrier on the remote
+            /// side, which is their decision. Either local or remote
+            /// being Relay forces the relay flag because the data
+            /// plane has at least one TURN hop in front of it.
+            bool nom_relay = pair.local.type == CandidateType::Relay
+                || pair.remote.type == CandidateType::Relay;
             nominated_local_type_  = pair.local.type;
             nominated_remote_type_ = pair.remote.type;
 
@@ -2531,8 +2834,29 @@ void IceSession::handle_check_response(const StunMessage& msg) {
                     || pair.nominee_check_sent) {
                     /// Aggressive: every successful check nominates.
                     /// Regular: only the nominee follow-up commits.
-                    const auto cid = ensure_remote_cid(nom_ip, nom_port);
-                    on_nominated(nom_ip, nom_port, nom_relay, cid);
+                    /// The nominated cid must match the pair's transport:
+                    /// a TCP pair needs a TCP cid (opened via
+                    /// `ensure_remote_tcp_cid`), a UDP pair needs the
+                    /// UDP one. Mixing the two leaves `send_on_strand`
+                    /// driving the wrong carrier.
+                    const bool nom_tcp = transport_is_tcp(pair.transport_type);
+                    /// Relay-local UDP pair: the synthetic relay cid is
+                    /// the right value to stamp into `nominated_cid_`
+                    /// so the receive-side `on_carrier_data` dispatch
+                    /// recovers the peer endpoint; outbound bytes route
+                    /// through `turn_->send_indication` based on
+                    /// `uses_relay_`, not the cid.
+                    const bool nom_via_turn =
+                        pair.local.type == CandidateType::Relay
+                        && pair.transport_type == TransportType::Udp
+                        && turn_ && turn_->is_allocated();
+                    const auto cid = nom_tcp
+                        ? ensure_remote_tcp_cid(nom_ip, nom_port)
+                        : (nom_via_turn
+                            ? relay_cid_for_endpoint(nom_ip, nom_port)
+                            : ensure_remote_cid(nom_ip, nom_port));
+                    on_nominated(nom_ip, nom_port, nom_relay, cid,
+                                 pair.transport_type);
                 } else if (!nominee_selected_ && !was_valid_before) {
                     /// Regular nomination: pick the highest-priority
                     /// valid pair as the nominee. Re-scan because the
@@ -2643,16 +2967,54 @@ NominationMetrics IceSession::nomination_metrics() const noexcept {
         m.local_type    = nominated_local_type_;
         m.remote_type   = nominated_remote_type_;
     }
+    m.transport = nominated_transport_.load(std::memory_order_acquire);
     m.rtt_us    = rtt_ewma_us_.load(std::memory_order_relaxed);
     m.nominated = true;
     return m;
 }
 
+IceSession::CandidateCounts IceSession::candidate_counts() const {
+    CandidateCounts c{};
+    /// Tally local under `local_state_mu_` (publishes strand-writes).
+    {
+        std::lock_guard lk(local_state_mu_);
+        for (const auto& cand : local_candidates_) {
+            switch (cand.type) {
+                case CandidateType::Host:
+                case CandidateType::HostMdns: ++c.local_host;  break;
+                case CandidateType::Srflx:    ++c.local_srflx; break;
+                case CandidateType::Relay:    ++c.local_relay; break;
+                case CandidateType::Prflx:    ++c.local_prflx; break;
+            }
+        }
+    }
+    /// `remote_candidates_` is strand-only; bounce a counting lambda
+    /// onto the strand and block on the future. Callers must not
+    /// invoke from the strand itself — see header doc.
+    std::promise<void> p;
+    auto fut = p.get_future();
+    asio::post(strand_, [&]() {
+        for (const auto& cand : remote_candidates_) {
+            switch (cand.type) {
+                case CandidateType::Host:
+                case CandidateType::HostMdns: ++c.remote_host;  break;
+                case CandidateType::Srflx:    ++c.remote_srflx; break;
+                case CandidateType::Relay:    ++c.remote_relay; break;
+                case CandidateType::Prflx:    ++c.remote_prflx; break;
+            }
+        }
+        p.set_value();
+    });
+    fut.wait();
+    return c;
+}
+
 void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
-                                 gn_conn_id_t cid) {
-    ICE_DBG("nominated", "peer=%s %s:%u relay=%d cid=%llu",
+                                 gn_conn_id_t cid, TransportType transport) {
+    ICE_DBG("nominated", "peer=%s %s:%u relay=%d cid=%llu tx=%d",
             peer_id_.c_str(), ip.c_str(), port, relay ? 1 : 0,
-            static_cast<unsigned long long>(cid));
+            static_cast<unsigned long long>(cid),
+            static_cast<int>(transport));
     check_timer_.cancel();
     state_.store(SessionState::Connected, std::memory_order_release);
     consent_missed_.store(0, std::memory_order_release);
@@ -2668,11 +3030,17 @@ void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
     /// by `ensure_remote_cid` or `ensure_remote_tcp_cid` during
     /// gather / checks; both stamp the transport into
     /// `cid_to_endpoint_`.
-    TransportType nominated_tx = TransportType::Udp;
-    if (auto eit = cid_to_endpoint_.find(cid); eit != cid_to_endpoint_.end()) {
-        nominated_tx = eit->second.transport;
-    }
-    nominated_transport_.store(nominated_tx, std::memory_order_release);
+    /// Transport is dictated by the winning CheckPair, not derived by
+    /// looking the cid up in `cid_to_endpoint_*_` maps. The composer
+    /// wrapping that owns `carrier_` and `carrier_tcp_` can hand the
+    /// same cid value back from both `connect()` paths — they are
+    /// composer-side ids tagged with the high bit, not the underlying
+    /// link's UDP/TCP socket id — so the lookup is ambiguous when both
+    /// maps have entries for the value. The caller (the per-pair
+    /// handler in `handle_check_response` / triggered-check / agressive-
+    /// nomination paths) has the unambiguous answer in
+    /// `pair.transport_type`.
+    nominated_transport_.store(transport, std::memory_order_release);
     {
         std::lock_guard lk(nominated_mu_);
         nominated_ip_ = ip;
@@ -2691,6 +3059,14 @@ void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
     if (relay && turn_) {
         turn_->bind_channel(ip, port);
     }
+
+    /// Drain any app payloads the L2 buffered through `send()` while
+    /// we were still gathering / checking. Must happen AFTER state_ is
+    /// flipped to Connected and `nominated_cid_` is stamped: the body
+    /// of `send_on_strand` reads both. Run BEFORE `on_connected` so
+    /// the L2's CONN_UP-driven traffic queues behind anything that
+    /// rode the initial connect surface.
+    flush_pending_app_data();
 
     if (callbacks_.on_connected)
         callbacks_.on_connected(peer_id_, ip, port);

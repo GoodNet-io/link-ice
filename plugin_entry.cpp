@@ -28,13 +28,18 @@ namespace {
 using ::gn::link::ice::IceLink;
 using ::gn::link::ice::gn_link_ice_signal_api_t;
 using ::gn::link::ice::gn_link_ice_path_mtu_api_t;
+using ::gn::link::ice::gn_link_ice_metrics_api_t;
+using ::gn::link::ice::gn_ice_nomination_t;
+using ::gn::link::ice::gn_ice_candidate_counts_t;
 using ::gn::link::ice::kIceSignalVersion;
 using ::gn::link::ice::kIcePathMtuVersion;
+using ::gn::link::ice::kIceMetricsVersion;
 
 constexpr const char* kIceScheme            = "ice";
 constexpr const char* kIceLinkExtensionName = "gn.link.ice";
 constexpr const char* kIceSignalExtensionName = "gn.link.ice.signal";
 constexpr const char* kIcePathMtuExtensionName = "gn.link.ice.path_mtu";
+constexpr const char* kIceMetricsExtensionName = "gn.link.ice.metrics";
 constexpr const char* kPluginName           = "goodnet_link_ice";
 
 struct IcePlugin {
@@ -47,9 +52,11 @@ struct IcePlugin {
     gn_link_api_t               link_extension_vtable     = {};
     gn_link_ice_signal_api_t    signal_extension_vtable   = {};
     gn_link_ice_path_mtu_api_t  path_mtu_extension_vtable = {};
+    gn_link_ice_metrics_api_t   metrics_extension_vtable  = {};
     bool                        link_extension_registered    = false;
     bool                        signal_extension_registered  = false;
     bool                        path_mtu_extension_registered = false;
+    bool                        metrics_extension_registered  = false;
 };
 
 // ── kernel-facing gn_link_vtable_t thunks ───────────────────────────────────
@@ -348,6 +355,56 @@ void install_path_mtu_extension(IcePlugin* p) {
     v.ctx      = p;
 }
 
+gn_result_t metrics_ext_get_nomination(void* ctx, gn_conn_id_t conn,
+                                          gn_ice_nomination_t* out) noexcept {
+    if (!ctx || !out) return GN_ERR_NULL_ARG;
+    if (out->api_size < sizeof(gn_ice_nomination_t)) {
+        return GN_ERR_OUT_OF_RANGE;
+    }
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        const auto m = p->link->nomination_metrics(conn);
+        out->nominated   = m.nominated ? 1 : 0;
+        out->uses_relay  = m.uses_relay ? 1 : 0;
+        out->local_type  = static_cast<std::uint8_t>(m.local_type);
+        out->remote_type = static_cast<std::uint8_t>(m.remote_type);
+        out->transport   = static_cast<std::uint8_t>(m.transport);
+        out->rtt_us      = m.rtt_us;
+        return GN_OK;
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
+gn_result_t metrics_ext_get_candidate_counts(
+    void* ctx, gn_conn_id_t conn,
+    gn_ice_candidate_counts_t* out) noexcept {
+    if (!ctx || !out) return GN_ERR_NULL_ARG;
+    if (out->api_size < sizeof(gn_ice_candidate_counts_t)) {
+        return GN_ERR_OUT_OF_RANGE;
+    }
+    try {
+        auto* p = static_cast<IcePlugin*>(ctx);
+        const auto c = p->link->candidate_counts(conn);
+        out->local_host   = c.local_host;
+        out->local_srflx  = c.local_srflx;
+        out->local_relay  = c.local_relay;
+        out->local_prflx  = c.local_prflx;
+        out->remote_host  = c.remote_host;
+        out->remote_srflx = c.remote_srflx;
+        out->remote_relay = c.remote_relay;
+        out->remote_prflx = c.remote_prflx;
+        return GN_OK;
+    } catch (...) { return GN_ERR_NULL_ARG; }
+}
+
+void install_metrics_extension(IcePlugin* p) {
+    auto& v = p->metrics_extension_vtable;
+    v                       = gn_link_ice_metrics_api_t{};
+    v.api_size              = sizeof(gn_link_ice_metrics_api_t);
+    v.get_nomination        = &metrics_ext_get_nomination;
+    v.get_candidate_counts  = &metrics_ext_get_candidate_counts;
+    v.ctx                   = p;
+}
+
 void install_signal_extension(IcePlugin* p) {
     auto& v = p->signal_extension_vtable;
     v               = gn_link_ice_signal_api_t{};
@@ -379,6 +436,7 @@ const char* const kProvidesList[] = {
     kIceLinkExtensionName,
     kIceSignalExtensionName,
     kIcePathMtuExtensionName,
+    kIceMetricsExtensionName,
     nullptr,
 };
 
@@ -418,6 +476,7 @@ GN_PLUGIN_EXPORT gn_result_t GN_PLUGIN_INIT_NAME(const host_api_t* api,
         install_link_extension(p);
         install_signal_extension(p);
         install_path_mtu_extension(p);
+        install_metrics_extension(p);
         install_link_vtable(p);
         *out_self = p;
         return GN_OK;
@@ -458,6 +517,11 @@ GN_PLUGIN_EXPORT gn_result_t GN_PLUGIN_REGISTER_NAME(void* self) {
                 kIcePathMtuVersion, &p->path_mtu_extension_vtable) == GN_OK) {
             p->path_mtu_extension_registered = true;
         }
+        if (p->api->register_extension(
+                p->host_ctx, kIceMetricsExtensionName,
+                kIceMetricsVersion, &p->metrics_extension_vtable) == GN_OK) {
+            p->metrics_extension_registered = true;
+        }
     }
     return GN_OK;
 }
@@ -465,6 +529,11 @@ GN_PLUGIN_EXPORT gn_result_t GN_PLUGIN_REGISTER_NAME(void* self) {
 GN_PLUGIN_EXPORT gn_result_t GN_PLUGIN_UNREGISTER_NAME(void* self) {
     if (!self) return GN_ERR_NULL_ARG;
     auto* p = static_cast<IcePlugin*>(self);
+    if (p->metrics_extension_registered &&
+        p->api && p->api->unregister_extension) {
+        (void)p->api->unregister_extension(p->host_ctx, kIceMetricsExtensionName);
+        p->metrics_extension_registered = false;
+    }
     if (p->path_mtu_extension_registered &&
         p->api && p->api->unregister_extension) {
         (void)p->api->unregister_extension(p->host_ctx, kIcePathMtuExtensionName);
