@@ -9,6 +9,8 @@
 
 #include "turn.hpp"
 
+#include "dbg.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -112,6 +114,11 @@ bool TurnClient::allocate() {
     auto msg = StunBuilder(TURN_ALLOCATE_REQUEST)
         .add_requested_transport(cfg_.requested_transport)
         .build();
+    ICE_DBG("turn.allocate.send", "server=%s:%u cid=%llu req_transport=%u tcp=%d tls=%d msg_len=%zu",
+            cfg_.server.c_str(), cfg_.port,
+            static_cast<unsigned long long>(server_cid_),
+            cfg_.requested_transport,
+            cfg_.tcp_transport, cfg_.tls_transport, msg.size());
     send_to_server(msg);
     return true;
 }
@@ -123,6 +130,10 @@ void TurnClient::on_inbound(std::span<const uint8_t> bytes) {
     /// messages whenever we have enough bytes. UDP transport
     /// delivers whole datagrams in a single callback; no reassembly
     /// needed.
+    ICE_DBG("turn.on_inbound", "cid=%llu len=%zu tcp=%d tls=%d",
+            static_cast<unsigned long long>(server_cid_),
+            bytes.size(),
+            cfg_.tcp_transport, cfg_.tls_transport);
     const bool stream_framing = cfg_.tcp_transport || cfg_.tls_transport;
     if (stream_framing) {
         rx_buffer_.insert(rx_buffer_.end(), bytes.begin(), bytes.end());
@@ -140,12 +151,22 @@ void TurnClient::dispatch_inbound_message(std::span<const std::uint8_t> bytes) {
     /// transport — demux on the first byte's top nibble (RFC 5766
     /// §11.5). ChannelData has 0x4-0x7 in the top nibble; STUN is
     /// 0x0-0x3. The check rejects ambiguous buffers without parsing.
+    ICE_DBG("turn.dispatch", "len=%zu first=0x%02x channel_data=%d",
+            bytes.size(),
+            bytes.empty() ? 0u : static_cast<unsigned>(bytes[0]),
+            is_channel_data(bytes));
     if (is_channel_data(bytes)) {
         handle_channel_data(bytes);
         return;
     }
     auto parsed = parse_stun(bytes);
+    ICE_DBG("turn.dispatch.parsed", "ok=%d", parsed.has_value());
     if (!parsed) return;
+    ICE_DBG("turn.dispatch.msg", "msg_type=0x%04x error_code=%d realm=%d nonce=%d",
+            parsed->msg_type,
+            parsed->error_code,
+            parsed->realm.has_value(),
+            parsed->nonce.has_value());
 
     if (parsed->msg_type == TURN_ALLOCATE_ERROR) {
         if (parsed->error_code == 401 || parsed->error_code == 438) {

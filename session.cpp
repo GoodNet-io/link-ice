@@ -1419,6 +1419,15 @@ std::shared_ptr<TurnClient> IceSession::build_turn_client(
     const bool want_tcp = !want_tls
                             && cfg.tcp_transport
                             && carrier_tcp_ != nullptr;
+    ICE_DBG("turn-build", "peer=%s server=%s:%u cfg.tcp=%d cfg.tls=%d want_tcp=%d want_tls=%d carrier_tcp=%d",
+            peer_id_.c_str(),
+            cfg.server.c_str(),
+            cfg.port,
+            cfg.tcp_transport,
+            cfg.tls_transport,
+            want_tcp,
+            want_tls,
+            carrier_tcp_ != nullptr);
     const bool want_stream = want_tls || want_tcp;
     auto* turn_carrier = want_tls ? carrier_tls_
                           : want_tcp ? carrier_tcp_
@@ -1438,9 +1447,22 @@ std::shared_ptr<TurnClient> IceSession::build_turn_client(
         /// between carriers (each composer allocates from its own
         /// counter), so a shared dispatcher would risk collision
         /// with UDP cids.
-        const auto uri = endpoint_uri(cfg.server, cfg.port);
-        if (turn_carrier->connect(uri, &turn_cid) != GN_OK
-            || turn_cid == GN_INVALID_ID) {
+        ///
+        /// URI scheme must match the carrier's composer kind — both
+        /// gn.link.tcp and gn.link.tls reject foreign schemes through
+        /// gn::parse_uri rejection at connect time. tls reuses the
+        /// `tls://` scheme via the same SDK parser.
+        const auto uri = want_tls
+                           ? std::string("tls://") + cfg.server + ":"
+                                 + std::to_string(cfg.port)
+                           : endpoint_uri_tcp(cfg.server, cfg.port);
+        const auto rc = turn_carrier->connect(uri, &turn_cid);
+        ICE_DBG("turn.connect", "peer=%s uri=%s rc=%d cid=%llu",
+                peer_id_.c_str(),
+                uri.c_str(),
+                static_cast<int>(rc),
+                static_cast<unsigned long long>(turn_cid));
+        if (rc != GN_OK || turn_cid == GN_INVALID_ID) {
             return nullptr;
         }
     }
@@ -1477,6 +1499,13 @@ void IceSession::try_next_turn_attempt() {
     /// failure the FSM advances to the next entry. List exhaustion
     /// leaves `turn_` null — the session proceeds with host + srflx
     /// candidates only.
+    ICE_DBG("turn-attempt", "peer=%s idx=%zu of=%zu carrier_udp=%d carrier_tcp=%d carrier_tls=%d",
+            peer_id_.c_str(),
+            turn_attempt_idx_,
+            cfg_.turn_servers.size(),
+            carrier_ != nullptr,
+            carrier_tcp_ != nullptr,
+            carrier_tls_ != nullptr);
     turn_allocate_timer_.cancel();
     if (turn_) {
         turn_->close();

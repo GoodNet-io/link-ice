@@ -375,9 +375,17 @@ void IceLink::apply_config() noexcept {
     /// resolve `gn.link.tcp` for the TURN server endpoint and apply
     /// length-prefix framing on STUN messages. Useful behind UDP-
     /// blocked firewalls.
-    if (gn_config_get_int64(api_, "ice.turn_tcp", &v) == GN_OK) {
-        const bool b = (v != 0);
-        apply_to_all_turns([&](TurnConfig& t) { t.tcp_transport = b; });
+    ///
+    /// JSON boolean → `gn_config_get_bool`; the kernel's typed reader
+    /// rejects bool literals against an int64 query (`get_int64`
+    /// short-circuits on `!is_number_integer`), so a `"turn_tcp": true`
+    /// in the operator's config silently no-ops if the int64 form is
+    /// used. The same applies to every other boolean knob below.
+    {
+        bool b = false;
+        if (gn_config_get_bool(api_, "ice.turn_tcp", &b) == GN_OK) {
+            apply_to_all_turns([&](TurnConfig& t) { t.tcp_transport = b; });
+        }
     }
     /// Per-attempt deadline for TURN ALLOCATE during the sequential
     /// walk of `turn_servers`. The session abandons an entry that
