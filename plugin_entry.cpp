@@ -447,6 +447,7 @@ const gn_plugin_descriptor_t kDescriptor = {
     /* ext_requires      */ nullptr,
     /* ext_provides      */ kProvidesList,
     /* kind              */ GN_PLUGIN_KIND_LINK,
+    /* inject_targets    */ nullptr,
     /* _reserved         */ {nullptr, nullptr, nullptr, nullptr},
 };
 
