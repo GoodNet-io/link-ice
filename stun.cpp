@@ -463,7 +463,6 @@ bool verify_integrity(std::span<const uint8_t> raw, const std::string& key) {
     if (mi_offset == 0) return false;
 
     // Rewrite length to include up to MESSAGE-INTEGRITY
-    std::vector<uint8_t> tmp(raw.begin(), raw.begin() + mi_offset);
     // Temporarily set length
     std::vector<uint8_t> hdr(raw.begin(), raw.begin() + 20);
     write16(hdr.data() + 2, static_cast<uint16_t>(mi_offset - 20 + 24));

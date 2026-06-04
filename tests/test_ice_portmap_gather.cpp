@@ -257,6 +257,7 @@ struct SessionFixture {
     PortmapHarness                                  harness;
     std::optional<gn::sdk::LinkCarrier>             carrier;
     std::optional<IcePortmapClient>                 portmap;
+    std::optional<exec::timed_thread_context>        timer_ctx_p2300{std::in_place};
     std::shared_ptr<IceSession>                     session;
 
     SessionFixture() {
@@ -267,6 +268,7 @@ struct SessionFixture {
 
     ~SessionFixture() {
         if (session) session->close();
+        timer_ctx_p2300.reset();
         /// Drain any teardown work the strand may have posted before
         /// joining the worker.
         std::this_thread::sleep_for(10ms);
@@ -289,8 +291,8 @@ struct SessionFixture {
             ioc, carrier_ptr, /*tcp=*/nullptr, /*tls=*/nullptr,
             cfg, /*peer_id=*/"abcdef0123456789",
             /*controlling=*/true, cbs,
-            /*mdns=*/nullptr,
-            pm_ptr);
+            /*mdns=*/nullptr, pm_ptr,
+            &*timer_ctx_p2300);
         session->gather();
     }
 };

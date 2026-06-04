@@ -22,6 +22,7 @@
 
 #include <sdk/conn_events.h>
 #include <sdk/convenience.h>
+#include <sdk/cpp/log.hpp>
 #include <sdk/cpp/uri.hpp>
 
 #include <algorithm>
@@ -66,6 +67,7 @@ IceLink::IceLink()
     /// the first `set_host_api`. The worker thread spins immediately
     /// because it does not need `shared_from_this()`.
     worker_ = std::thread([this] { ioc_.run(); });
+    timer_ctx_.emplace();
 }
 
 IceLink::~IceLink() {
@@ -301,6 +303,14 @@ void IceLink::apply_config() noexcept {
         && v > 0 && v < 60000) {
         cfg.check_interval_ms = static_cast<int>(v);
     }
+    if (gn_config_get_int64(api_, "ice.max_check_retries", &v) == GN_OK
+        && v >= 1 && v <= 16) {
+        cfg.max_check_retries = static_cast<int>(v);
+    }
+    if (gn_config_get_int64(api_, "ice.nomination_wait_ms", &v) == GN_OK
+        && v >= 0 && v <= 10000) {
+        cfg.nomination_wait_ms = static_cast<int>(v);
+    }
     /// Operator override for the per-path MTU advertised to senders.
     /// RFC 8899 PMTUD-style probing is future work; for now this is
     /// a static knob — operators in known network environments
@@ -528,6 +538,21 @@ void IceLink::apply_config() noexcept {
 
     std::lock_guard lk(cfg_mu_);
     cfg_ = std::move(cfg);
+}
+
+void IceLink::set_prefer_turn_tcp(bool val) noexcept {
+    std::lock_guard lk(cfg_mu_);
+    cfg_.prefer_turn_tcp = val;
+}
+
+void IceLink::set_security_overhead(int overhead) noexcept {
+    std::lock_guard lk(cfg_mu_);
+    cfg_.security_overhead = overhead;
+}
+
+void IceLink::set_ordered_delivery(bool val) noexcept {
+    std::lock_guard lk(cfg_mu_);
+    cfg_.ordered_delivery = val;
 }
 
 void IceLink::set_host_api(const host_api_t* api) noexcept {
@@ -771,10 +796,10 @@ IceSessionCallbacks IceLink::make_composer_callbacks(
                                               std::uint32_t max_attempts) {
             auto self = weak_self.lock();
             if (!self || self->shutdown_.load(std::memory_order_acquire)) return;
-            gn_log_info(self->api_,
-                "ice: auto-restart on %.*s (attempt %u/%u, "
-                "composer-cid=%llu)",
-                static_cast<int>(reason.size()), reason.data(),
+            gn::log::info(self->api_,
+                "ice: auto-restart on {} (attempt {}/{}, "
+                "composer-cid={})",
+                reason,
                 attempt, max_attempts,
                 static_cast<unsigned long long>(cid));
         },
@@ -844,9 +869,9 @@ IceSessionCallbacks IceLink::make_callbacks(gn_conn_id_t id) {
             /// `GN_PATH_EVENT_AUTO_RESTART` kernel-side enum would
             /// let us emit a richer event without invalidating the
             /// conn — out of scope for this sub-repo change.
-            gn_log_info(self->api_,
-                "ice: auto-restart on %.*s (attempt %u/%u, conn=%llu)",
-                static_cast<int>(reason.size()), reason.data(),
+            gn::log::info(self->api_,
+                "ice: auto-restart on {} (attempt {}/{}, conn={})",
+                reason,
                 attempt, max_attempts,
                 static_cast<unsigned long long>(id));
         },
@@ -858,20 +883,29 @@ gn_result_t IceLink::listen(std::string_view uri) {
     /// anything that does not parse as `ice://...` so a malformed URI
     /// fails fast instead of silently succeeding.
     if (!uri.starts_with("ice://")) {
-        gn_log_warn(api_, "ice: listen reject malformed uri "
-                          "(expected ice://, got %.*s)",
-                    static_cast<int>(uri.size()), uri.data());
+        gn::log::warn(api_, "ice: listen reject malformed uri "
+                           "(expected ice://, got {})",
+                     uri);
         return GN_ERR_INVALID_ENVELOPE;
     }
     return GN_OK;
 }
 
+void IceLink::erase_peer_id(const std::string& peer_hex,
+                             gn_conn_id_t conn) noexcept {
+    auto it = peer_to_ids_.find(peer_hex);
+    if (it == peer_to_ids_.end()) return;
+    auto& v = it->second;
+    v.erase(std::remove(v.begin(), v.end(), conn), v.end());
+    if (v.empty()) peer_to_ids_.erase(it);
+}
+
 gn_result_t IceLink::connect(std::string_view uri, gn_conn_id_t* out_conn) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
     if (!uri.starts_with("ice://")) {
-        gn_log_warn(api_, "ice: connect reject malformed uri "
-                          "(expected ice://, got %.*s)",
-                    static_cast<int>(uri.size()), uri.data());
+        gn::log::warn(api_, "ice: connect reject malformed uri "
+                           "(expected ice://, got {})",
+                     uri);
         return GN_ERR_INVALID_ENVELOPE;
     }
     auto suffix = uri.substr(6);
@@ -882,27 +916,22 @@ gn_result_t IceLink::connect(std::string_view uri, gn_conn_id_t* out_conn) {
 
     std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES] = {};
     if (!parse_peer_pk_hex(suffix, peer_pk)) {
-        gn_log_warn(api_, "ice: connect peer-pk hex parse failed "
-                          "(suffix len=%zu, expected %d hex chars)",
-                    suffix.size(), GN_PUBLIC_KEY_BYTES * 2);
+        gn::log::warn(api_, "ice: connect peer-pk hex parse failed "
+                           "(suffix len={}, expected {} hex chars)",
+                     suffix.size(), GN_PUBLIC_KEY_BYTES * 2);
         return GN_ERR_INVALID_ENVELOPE;
     }
     const auto peer_hex = std::string(suffix);
 
     if (!api_ || !api_->notify_connect) {
-        gn_log_warn(api_, "ice: connect host_api missing notify_connect "
-                          "slot — kernel not bound?");
+        gn::log::warn(api_, "ice: connect host_api missing notify_connect "
+                           "slot — kernel not bound?");
         return GN_ERR_NOT_IMPLEMENTED;
     }
 
     gn_conn_id_t conn = GN_INVALID_ID;
     {
         std::lock_guard lk(sessions_mu_);
-        if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
-            if (out_conn) *out_conn = it->second;
-            return GN_OK;
-        }
-
         const std::string canonical = "ice://" + peer_hex;
         const auto rc = api_->notify_connect(
             api_->host_ctx, peer_pk, canonical.c_str(),
@@ -954,9 +983,11 @@ gn_result_t IceLink::connect(std::string_view uri, gn_conn_id_t* out_conn) {
         auto session = std::make_shared<IceSession>(
             ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
             /*controlling=*/true, make_callbacks(conn),
-            std::move(mdns_snap), portmap_ptr);
+            std::move(mdns_snap), portmap_ptr
+            , timer_ctx_ ? &*timer_ctx_ : nullptr
+            );
         sessions_[conn] = {conn, session, peer_hex};
-        peer_to_id_[peer_hex] = conn;
+        peer_to_ids_[peer_hex].push_back(conn);
         published_ids_.push_back(conn);
 
         asio::post(ioc_, [session] { session->gather(); });
@@ -978,11 +1009,11 @@ gn_result_t IceLink::send(gn_conn_id_t conn,
             (int)((conn & kComposerIdBit) != 0));
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
     if (bytes.size() > mtu_.load(std::memory_order_relaxed)) {
-        gn_log_warn(api_, "ice: send conn=%llu payload=%zu exceeds "
-                          "mtu=%u",
-                    static_cast<unsigned long long>(conn),
-                    bytes.size(),
-                    mtu_.load(std::memory_order_relaxed));
+        gn::log::warn(api_, "ice: send conn={} payload={} exceeds "
+                           "mtu={}",
+                     static_cast<unsigned long long>(conn),
+                     bytes.size(),
+                     mtu_.load(std::memory_order_relaxed));
         return GN_ERR_PAYLOAD_TOO_LARGE;
     }
     std::shared_ptr<IceSession> session;
@@ -990,8 +1021,8 @@ gn_result_t IceLink::send(gn_conn_id_t conn,
         std::lock_guard lk(composer_mu_);
         auto it = composer_sessions_.find(conn);
         if (it == composer_sessions_.end()) {
-            gn_log_warn(api_, "ice: composer send conn=%llu not found",
-                        static_cast<unsigned long long>(conn));
+            gn::log::warn(api_, "ice: composer send conn={} not found",
+                          static_cast<unsigned long long>(conn));
             return GN_ERR_NOT_FOUND;
         }
         session = it->second.session;
@@ -999,9 +1030,9 @@ gn_result_t IceLink::send(gn_conn_id_t conn,
         std::lock_guard lk(sessions_mu_);
         auto it = sessions_.find(conn);
         if (it == sessions_.end()) {
-            gn_log_warn(api_, "ice: send conn=%llu not found "
-                              "(disconnected or never allocated)",
-                        static_cast<unsigned long long>(conn));
+            gn::log::warn(api_, "ice: send conn={} not found "
+                               "(disconnected or never allocated)",
+                          static_cast<unsigned long long>(conn));
             return GN_ERR_NOT_FOUND;
         }
         session = it->second.session;
@@ -1063,7 +1094,7 @@ gn_result_t IceLink::disconnect(gn_conn_id_t conn) {
         auto it = sessions_.find(conn);
         if (it == sessions_.end()) return GN_OK;
         session = it->second.session;
-        peer_to_id_.erase(it->second.peer_pk_hex);
+        erase_peer_id(it->second.peer_pk_hex, conn);
         sessions_.erase(it);
         erased = true;
     }
@@ -1079,7 +1110,7 @@ bool IceLink::claim_disconnect(gn_conn_id_t id) {
     if (shutdown_.load(std::memory_order_acquire)) return false;
     auto it = sessions_.find(id);
     if (it == sessions_.end()) return false;
-    peer_to_id_.erase(it->second.peer_pk_hex);
+    erase_peer_id(it->second.peer_pk_hex, id);
     sessions_.erase(it);
     return true;
 }
@@ -1183,8 +1214,8 @@ gn_result_t IceLink::deliver_signal(
     std::uint8_t kind,
     std::span<const std::uint8_t> blob) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
-    gn_log_info(api_,
-        "ice-dbg: deliver_signal kind=%u blob=%zu",
+    gn::log::info(api_,
+        "ice-dbg: deliver_signal kind={} blob={}",
         static_cast<unsigned>(kind), blob.size());
     /// RFC 8838 §10 end-of-candidates variants (`OFFER_EOC` /
     /// `ANSWER_EOC`) are wire-identical to their non-EOC counterparts;
@@ -1222,10 +1253,10 @@ gn_result_t IceLink::deliver_signal(
     {
         std::lock_guard cfg_lk(cfg_mu_);
         if (cfg_.lite_mode && peer_is_lite) {
-            gn_log_warn(api_,
+            gn::log::warn(api_,
                 "ice: reject signal — both sides are ICE-lite, no agent "
-                "can drive connectivity checks (peer=%s)",
-                peer_hex.c_str());
+                "can drive connectivity checks (peer={})",
+                peer_hex);
             return GN_ERR_INVALID_STATE;
         }
     }
@@ -1253,11 +1284,13 @@ gn_result_t IceLink::deliver_signal(
         {
             std::lock_guard lk(sessions_mu_);
             if (!session) {
-                if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
-                    /// Already gathering / checking against this peer —
-                    /// fold the freshly arrived candidates into the
-                    /// existing session.
-                    auto sit = sessions_.find(it->second);
+                /// Trickle fold: if exactly one pre-nomination session
+                /// exists for this peer, route candidates into it.
+                /// With multiple sessions (multi-connect) we skip the
+                /// fold and fall through to create a fresh session.
+                if (auto it = peer_to_ids_.find(peer_hex);
+                    it != peer_to_ids_.end() && it->second.size() == 1) {
+                    auto sit = sessions_.find(it->second.front());
                     if (sit != sessions_.end()) {
                         session = sit->second.session;
                     }
@@ -1308,9 +1341,11 @@ gn_result_t IceLink::deliver_signal(
                     ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
                     /*controlling=*/false,
                     make_callbacks(conn),
-                    std::move(mdns_snap), portmap_ptr);
+                    std::move(mdns_snap), portmap_ptr
+                    , timer_ctx_ ? &*timer_ctx_ : nullptr
+                    );
                 sessions_[conn] = {conn, session, peer_hex};
-                peer_to_id_[peer_hex] = conn;
+                peer_to_ids_[peer_hex].push_back(conn);
                 published_ids_.push_back(conn);
             }
         }
@@ -1360,8 +1395,9 @@ gn_result_t IceLink::deliver_signal(
     std::shared_ptr<IceSession> session;
     {
         std::lock_guard lk(sessions_mu_);
-        if (auto it = peer_to_id_.find(peer_hex); it != peer_to_id_.end()) {
-            auto sit = sessions_.find(it->second);
+        if (auto it = peer_to_ids_.find(peer_hex);
+            it != peer_to_ids_.end() && !it->second.empty()) {
+            auto sit = sessions_.find(it->second.front());
             if (sit != sessions_.end()) session = sit->second.session;
         }
     }
@@ -1394,10 +1430,10 @@ gn_result_t IceLink::deliver_signal(
 void IceLink::enqueue_local_signal(
     const std::shared_ptr<IceSession>& session) {
     if (!session) return;
-    gn_log_info(api_,
-        "ice-dbg: enqueue_local_signal peer=%s controlling=%d "
-        "local_cands=%zu",
-        session->peer_id().c_str(),
+    gn::log::info(api_,
+        "ice-dbg: enqueue_local_signal peer={} controlling={} "
+        "local_cands={}",
+        session->peer_id(),
         session->is_controlling() ? 1 : 0,
         session->local_candidates().size());
     /// Snapshot under the session's `local_state_mu_` (accessors
@@ -1414,10 +1450,10 @@ void IceLink::enqueue_local_signal(
     /// (not skip) so production operators can spot a gather that
     /// produced nothing usable.
     if (cands.empty()) {
-        gn_log_info(api_,
+        gn::log::info(api_,
             "ice: on_gathered with empty local candidate set "
-            "(peer=%s) — publishing ufrag/pwd-only signal",
-            session->peer_id().c_str());
+            "(peer={}) — publishing ufrag/pwd-only signal",
+            session->peer_id());
     }
     auto blob = serialize_signal(ufrag.c_str(), pwd.c_str(), cands, flags);
     /// Controlling = we issued the OFFER, so the local-side blob
@@ -1503,9 +1539,9 @@ void IceLink::reap_sessions() {
 gn_result_t IceLink::composer_listen(std::string_view uri) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
     if (!uri.starts_with("ice://")) {
-        gn_log_warn(api_, "ice: composer_listen reject malformed uri "
-                          "(expected ice://, got %.*s)",
-                    static_cast<int>(uri.size()), uri.data());
+        gn::log::warn(api_, "ice: composer_listen reject malformed uri "
+                           "(expected ice://, got {})",
+                     uri);
         return GN_ERR_INVALID_ENVELOPE;
     }
     return GN_OK;
@@ -1516,9 +1552,9 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
     if (!out_conn) return GN_ERR_NULL_ARG;
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
     if (!uri.starts_with("ice://")) {
-        gn_log_warn(api_, "ice: composer_connect reject malformed uri "
-                          "(expected ice://, got %.*s)",
-                    static_cast<int>(uri.size()), uri.data());
+        gn::log::warn(api_, "ice: composer_connect reject malformed uri "
+                           "(expected ice://, got {})",
+                     uri);
         return GN_ERR_INVALID_ENVELOPE;
     }
     auto suffix = uri.substr(6);
@@ -1527,9 +1563,9 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
     }
     std::uint8_t peer_pk[GN_PUBLIC_KEY_BYTES] = {};
     if (!parse_peer_pk_hex(suffix, peer_pk)) {
-        gn_log_warn(api_, "ice: composer_connect peer-pk hex parse "
-                          "failed (suffix len=%zu)",
-                    suffix.size());
+        gn::log::warn(api_, "ice: composer_connect peer-pk hex parse "
+                           "failed (suffix len={})",
+                     suffix.size());
         return GN_ERR_INVALID_ENVELOPE;
     }
     const auto peer_hex = std::string(suffix);
@@ -1589,7 +1625,9 @@ gn_result_t IceLink::composer_connect(std::string_view uri,
             ioc_, carrier_ptr, carrier_tcp_ptr, carrier_tls_ptr, cfg_snap, peer_hex,
             /*controlling=*/true,
             make_composer_callbacks(cid, canonical),
-            std::move(mdns_snap), portmap_ptr);
+            std::move(mdns_snap), portmap_ptr
+            , timer_ctx_ ? &*timer_ctx_ : nullptr
+            );
 
         ComposerEntry entry{};
         entry.session       = session;
@@ -1641,8 +1679,8 @@ gn_result_t IceLink::composer_subscribe_accept(
 gn_result_t IceLink::composer_unsubscribe_accept(
     gn_subscription_id_t token) {
     std::lock_guard lk(composer_mu_);
-    auto it = std::find_if(
-        composer_accept_subs_.begin(), composer_accept_subs_.end(),
+    auto it = std::ranges::find_if(
+        composer_accept_subs_,
         [token](const ComposerAcceptSub& s) { return s.token == token; });
     if (it == composer_accept_subs_.end()) return GN_OK;
     composer_accept_subs_.erase(it);
@@ -1682,7 +1720,7 @@ void IceLink::shutdown() {
             live_sessions.push_back(entry.session);
         }
         sessions_.clear();
-        peer_to_id_.clear();
+        peer_to_ids_.clear();
     }
     {
         std::lock_guard lk(composer_mu_);
@@ -1704,6 +1742,7 @@ void IceLink::shutdown() {
         }
     }
 
+    timer_ctx_.reset();  // joins P2300 thread; IceSession lambdas release while ioc_ is live
     work_.reset();
     ioc_.stop();
     if (worker_.joinable()) worker_.join();

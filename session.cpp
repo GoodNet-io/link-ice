@@ -19,6 +19,11 @@
 #include "session.hpp"
 #include "dbg.hpp"
 
+#include <stdexec/execution.hpp>
+#include <exec/timed_thread_scheduler.hpp>
+#include <exec/start_detached.hpp>
+namespace exec = experimental::execution;
+
 #include <asio/bind_executor.hpp>
 #include <asio/dispatch.hpp>
 #include <asio/post.hpp>
@@ -117,22 +122,20 @@ IceSession::IceSession(asio::io_context& io,
                          const std::string& peer_id, bool controlling,
                          IceSessionCallbacks callbacks,
                          std::shared_ptr<MdnsManager> mdns,
-                         IcePortmapClient* portmap_ext)
+                         IcePortmapClient* portmap_ext,
+                         exec::timed_thread_context* timer_ctx
+                         )
     : io_(io), strand_(asio::make_strand(io.get_executor())),
+      timer_ctx_(timer_ctx),
       carrier_(carrier), carrier_tcp_(carrier_tcp),
       carrier_tls_(carrier_tls),
       portmap_ext_(portmap_ext), cfg_(cfg),
       peer_id_(peer_id),
       controlling_(cfg.lite_mode ? false : controlling),
       callbacks_(std::move(callbacks)),
-      check_timer_(strand_),
-      gather_timer_(strand_),
-      keepalive_timer_(strand_),
-      turn_allocate_timer_(strand_),
-      turn_backup_timer_(strand_),
       mdns_(std::move(mdns)),
-      last_activity_(std::chrono::steady_clock::now()),
-      pmtu_probe_timer_(strand_) {
+      last_activity_(std::chrono::steady_clock::now())
+      {
     /// Constructor: no observers exist yet, so the mutex isn't
     /// strictly required, but locking keeps the publication pattern
     /// uniform and lets TSan reason about all writes through the
@@ -158,13 +161,13 @@ IceSession::~IceSession() {
     /// calls are safe even if the session is being unwound after the
     /// io_context has stopped.
     state_.store(SessionState::Failed, std::memory_order_release);
-    std::error_code ec;
-    check_timer_.cancel();
-    keepalive_timer_.cancel();
-    gather_timer_.cancel();
-    turn_allocate_timer_.cancel();
-    turn_backup_timer_.cancel();
-    pmtu_probe_timer_.cancel();
+    ++check_gen_;
+    ++keepalive_gen_;
+    ++gather_gen_;
+    ++turn_allocate_gen_;
+    ++turn_backup_gen_;
+    ++nomination_wait_gen_;
+    ++pmtu_probe_gen_;
     if (turn_) turn_->close();
     if (turn_backup_probe_) turn_backup_probe_->close();
     if (mdns_ && !mdns_local_hostname_.empty()) {
@@ -278,6 +281,44 @@ void IceSession::send(std::span<const uint8_t> data) {
     });
 }
 
+void IceSession::deliver_in_order(std::span<const uint8_t> raw) {
+    if (raw.size() < 4) return;
+    const std::uint32_t seq = (std::uint32_t(raw[0]) << 24)
+                            | (std::uint32_t(raw[1]) << 16)
+                            | (std::uint32_t(raw[2]) << 8)
+                            |  std::uint32_t(raw[3]);
+    const auto data = raw.subspan(4);
+
+    if (seq < recv_data_seq_) return; // duplicate / replay
+
+    if (seq == recv_data_seq_) {
+        if (callbacks_.on_data)
+            callbacks_.on_data(peer_id_, data);
+        ++recv_data_seq_;
+        while (true) {
+            auto it = recv_reorder_buf_.find(recv_data_seq_);
+            if (it == recv_reorder_buf_.end()) break;
+            if (callbacks_.on_data)
+                callbacks_.on_data(peer_id_, std::span{it->second});
+            recv_reorder_buf_.erase(it);
+            ++recv_data_seq_;
+        }
+        return;
+    }
+
+    // Out-of-order: buffer up to kReorderWindow entries
+    static constexpr std::size_t kReorderWindow = 64;
+    if (recv_reorder_buf_.size() >= kReorderWindow) {
+        // Advance past the gap to avoid deadlock on window overflow
+        recv_data_seq_ = recv_reorder_buf_.begin()->first;
+        ICE_DBG("ordered-rx-flush",
+                "peer=%s window overflow at seq=%u",
+                peer_id_.c_str(), recv_data_seq_);
+    }
+    recv_reorder_buf_[seq] =
+        std::vector<uint8_t>(data.begin(), data.end());
+}
+
 void IceSession::send_on_strand(const std::vector<uint8_t>& buf) {
     std::string ip;
     uint16_t port;
@@ -289,10 +330,31 @@ void IceSession::send_on_strand(const std::vector<uint8_t>& buf) {
         relay = uses_relay_;
     }
 
+    const auto tx = nominated_transport_.load(std::memory_order_acquire);
+    const bool use_tcp = transport_is_tcp(tx);
+
+    // When ordered delivery is active, prepend a 4-byte big-endian sequence
+    // number to every outbound app-data frame on the UDP path (TCP is already
+    // ordered by the transport; adding a seqno there wastes 4 bytes/frame).
+    const bool add_seqno = cfg_.ordered_delivery && !use_tcp;
+    std::vector<uint8_t> framed_buf;
+    const std::vector<uint8_t>* send_ptr = &buf;
+    if (add_seqno) {
+        const auto seq = send_data_seq_.fetch_add(1, std::memory_order_relaxed);
+        framed_buf.reserve(4 + buf.size());
+        framed_buf.push_back(static_cast<uint8_t>((seq >> 24) & 0xFF));
+        framed_buf.push_back(static_cast<uint8_t>((seq >> 16) & 0xFF));
+        framed_buf.push_back(static_cast<uint8_t>((seq >> 8)  & 0xFF));
+        framed_buf.push_back(static_cast<uint8_t>( seq        & 0xFF));
+        framed_buf.insert(framed_buf.end(), buf.begin(), buf.end());
+        send_ptr = &framed_buf;
+    }
+
     if (relay && turn_) {
-        ICE_DBG("send-app-out", "peer=%s len=%zu dst=%s:%u relay=1",
-                peer_id_.c_str(), buf.size(), ip.c_str(), port);
-        turn_->send_indication(ip, port, buf);
+        ICE_DBG("send-app-out", "peer=%s len=%zu dst=%s:%u relay=1 seqno=%d",
+                peer_id_.c_str(), send_ptr->size(), ip.c_str(), port,
+                add_seqno ? 1 : 0);
+        turn_->send_indication(ip, port, *send_ptr);
         return;
     }
 
@@ -306,19 +368,17 @@ void IceSession::send_on_strand(const std::vector<uint8_t>& buf) {
         }
         nominated_cid_.store(cid, std::memory_order_release);
     }
-    const auto tx = nominated_transport_.load(std::memory_order_acquire);
-    ICE_DBG("send-app-out", "peer=%s len=%zu dst=%s:%u cid=%llu tcp=%d carrier=%d",
-            peer_id_.c_str(), buf.size(), ip.c_str(), port,
+    ICE_DBG("send-app-out", "peer=%s len=%zu dst=%s:%u cid=%llu tcp=%d seqno=%d",
+            peer_id_.c_str(), send_ptr->size(), ip.c_str(), port,
             static_cast<unsigned long long>(cid),
-            (int)transport_is_tcp(tx),
-            (int)(transport_is_tcp(tx) ? (carrier_tcp_ != nullptr) : (carrier_ != nullptr)));
-    if (transport_is_tcp(tx)) {
+            use_tcp ? 1 : 0, add_seqno ? 1 : 0);
+    if (use_tcp) {
         if (carrier_tcp_) {
-            const auto framed = frame_tcp_stun(buf);
-            (void)carrier_tcp_->send(cid, framed);
+            const auto tcp_framed = frame_tcp_stun(*send_ptr);
+            (void)carrier_tcp_->send(cid, tcp_framed);
         }
     } else {
-        if (carrier_) (void)carrier_->send(cid, buf);
+        if (carrier_) (void)carrier_->send(cid, *send_ptr);
     }
 }
 
@@ -406,9 +466,8 @@ void IceSession::add_remote_candidates(const std::string& ufrag,
         /// to keep IPv4 / IPv6 logic in one place.
         for (auto& c : cands) {
             const auto ip = c.address_str();
-            const bool dup = std::any_of(
-                self->remote_candidates_.begin(),
-                self->remote_candidates_.end(),
+            const bool dup = std::ranges::any_of(
+                self->remote_candidates_,
                 [&](const Candidate& e) {
                     return e.address_str() == ip
                         && e.port == c.port
@@ -528,11 +587,13 @@ void IceSession::restart() {
         /// Cancel all in-flight timers + drop pending state. The
         /// keepalive on a Connected session also stops because it
         /// short-circuits on state != Connected.
-        self->check_timer_.cancel();
-        self->keepalive_timer_.cancel();
-        self->gather_timer_.cancel();
-        self->turn_allocate_timer_.cancel();
-        self->turn_backup_timer_.cancel();
+        ++self->check_gen_;
+        ++self->keepalive_gen_;
+        ++self->gather_gen_;
+        ++self->turn_allocate_gen_;
+        ++self->turn_backup_gen_;
+        ++self->nomination_wait_gen_;
+        self->nomination_wait_armed_ = false;
         if (self->turn_) self->turn_->close();
         if (self->turn_backup_probe_) self->turn_backup_probe_->close();
         self->turn_.reset();
@@ -591,24 +652,7 @@ void IceSession::restart() {
         /// IceLink's other sessions) stays bound — only the per-peer
         /// mappings are torn down so the next gather negotiates fresh
         /// composer_connect's for the new candidate set.
-        for (auto& [cid, t] : self->tcp_connect_timers_) {
-            if (t) t->cancel();
-        }
-        self->tcp_connect_timers_.clear();
-        for (auto& [cid, ep] : self->cid_to_endpoint_udp_) {
-            if (!self->carrier_) continue;
-            (void)self->carrier_->unsubscribe_data(cid);
-            (void)self->carrier_->disconnect(cid);
-        }
-        for (auto& [cid, ep] : self->cid_to_endpoint_tcp_) {
-            if (!self->carrier_tcp_) continue;
-            (void)self->carrier_tcp_->unsubscribe_data(cid);
-            (void)self->carrier_tcp_->disconnect(cid);
-        }
-        self->endpoint_to_cid_.clear();
-        self->cid_to_endpoint_udp_.clear();
-        self->cid_to_endpoint_tcp_.clear();
-        self->tcp_rx_buffers_.clear();
+        self->tear_down_cids();
         self->carrier_initialized_ = false;
         self->local_port_ = 0;
 
@@ -624,11 +668,13 @@ void IceSession::close() {
     /// dispatcher with our own unsubscribe call.
     state_.store(SessionState::Failed, std::memory_order_release);
     asio::dispatch(strand_, [self = shared_from_this()] {
-        self->check_timer_.cancel();
-        self->keepalive_timer_.cancel();
-        self->gather_timer_.cancel();
-        self->turn_allocate_timer_.cancel();
-        self->turn_backup_timer_.cancel();
+        ++self->check_gen_;
+        ++self->keepalive_gen_;
+        ++self->gather_gen_;
+        ++self->turn_allocate_gen_;
+        ++self->turn_backup_gen_;
+        ++self->nomination_wait_gen_;
+        self->nomination_wait_armed_ = false;
         if (self->turn_) self->turn_->close();
         if (self->turn_backup_probe_) self->turn_backup_probe_->close();
         if (self->mdns_ && !self->mdns_local_hostname_.empty()) {
@@ -641,26 +687,30 @@ void IceSession::close() {
         /// the renewal table inside the portmap plugin clears even
         /// when the router's reply never arrives.
         self->release_portmap_mapping();
-        for (auto& [cid, t] : self->tcp_connect_timers_) {
-            if (t) t->cancel();
-        }
-        self->tcp_connect_timers_.clear();
-        for (auto& [cid, ep] : self->cid_to_endpoint_udp_) {
-            if (!self->carrier_) continue;
-            (void)self->carrier_->unsubscribe_data(cid);
-            (void)self->carrier_->disconnect(cid);
-        }
-        for (auto& [cid, ep] : self->cid_to_endpoint_tcp_) {
-            if (!self->carrier_tcp_) continue;
-            (void)self->carrier_tcp_->unsubscribe_data(cid);
-            (void)self->carrier_tcp_->disconnect(cid);
-        }
-        self->endpoint_to_cid_.clear();
-        self->cid_to_endpoint_udp_.clear();
-        self->cid_to_endpoint_tcp_.clear();
-        self->tcp_rx_buffers_.clear();
+        self->tear_down_cids();
         self->nominated_cid_.store(0, std::memory_order_release);
     });
+}
+
+void IceSession::tear_down_cids() {
+    for (auto& [cid, t] : tcp_connect_timers_) {
+        if (t) t->cancel();
+    }
+    tcp_connect_timers_.clear();
+    for (auto& [cid, ep] : cid_to_endpoint_udp_) {
+        if (!carrier_) continue;
+        (void)carrier_->unsubscribe_data(cid);
+        (void)carrier_->disconnect(cid);
+    }
+    for (auto& [cid, ep] : cid_to_endpoint_tcp_) {
+        if (!carrier_tcp_) continue;
+        (void)carrier_tcp_->unsubscribe_data(cid);
+        (void)carrier_tcp_->disconnect(cid);
+    }
+    endpoint_to_cid_.clear();
+    cid_to_endpoint_udp_.clear();
+    cid_to_endpoint_tcp_.clear();
+    tcp_rx_buffers_.clear();
 }
 
 // ── Gathering (strand or synchronous) ───────────────────────────────────────
@@ -1250,26 +1300,21 @@ void IceSession::start_multi_stun_probes() {
     /// 7 retries; we use `session_timeout_s` (default 10 s) as the
     /// hard ceiling — any probe that hasn't replied by then is treated
     /// as unreachable.
-    gather_timer_.expires_after(
-        std::chrono::seconds(cfg_.session_timeout_s));
-    gather_timer_.async_wait(asio::bind_executor(strand_,
-        [this, self = shared_from_this()](const std::error_code& ec) {
-            if (ec) return;
-            /// Every probe timed out — proceed without srflx. host +
-            /// relay candidates (if any) still drive connectivity
-            /// checks; nomination will succeed if peers can reach each
-            /// other directly or through TURN. We deliberately do NOT
-            /// short-circuit on `state != Gathering`: the responder
-            /// flow flips state to Checking the moment OFFER arrival
-            /// merges remote candidates, but the gather-side STUN
-            /// probes still need to fire `on_gathered` so the local
-            /// candidate set (host + any srflx that DID return) is
-            /// serialised into the outbound signal queue. Without
-            /// this, the peer never sees an ANSWER and the harness
-            /// stalls until its own deadline.
-            pending_stun_probes_.clear();
-            on_gathering_complete();
-        }));
+    if (timer_ctx_) {
+        const auto gen = ++gather_gen_;
+        exec::start_detached(
+            exec::schedule_after(timer_ctx_->get_scheduler(),
+                                  std::chrono::seconds{cfg_.session_timeout_s})
+            | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                asio::dispatch(strand_, [this, self, gen] {
+                    if (gather_gen_.load(std::memory_order_acquire) != gen) return;
+                    pending_stun_probes_.clear();
+                    on_gathering_complete();
+                });
+            })
+            | stdexec::upon_stopped([]() noexcept {})
+        );
+    }
 }
 
 void IceSession::handle_gather_response(const StunMessage& msg,
@@ -1363,18 +1408,25 @@ void IceSession::handle_gather_response(const StunMessage& msg,
     /// fallback timer so a slow/unresponsive TURN server doesn't
     /// stall the whole gather phase.
     if (!stun_gathered_) {
-        gather_timer_.cancel();
+        ++gather_gen_;
         stun_gathered_ = true;
         if (!turn_gathering_) {
             on_gathering_complete();
         } else {
-            gather_timer_.expires_after(std::chrono::milliseconds(500));
-            gather_timer_.async_wait(asio::bind_executor(strand_,
-                [this, self = shared_from_this()](
-                        const std::error_code& ec) {
-                    if (ec) return;
-                    on_gathering_complete();
-                }));
+            if (timer_ctx_) {
+                const auto gen = ++gather_gen_;
+                exec::start_detached(
+                    exec::schedule_after(timer_ctx_->get_scheduler(),
+                                         std::chrono::milliseconds{500})
+                    | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                        asio::dispatch(strand_, [this, self, gen] {
+                            if (gather_gen_.load(std::memory_order_acquire) != gen) return;
+                            on_gathering_complete();
+                        });
+                    })
+                    | stdexec::upon_stopped([]() noexcept {})
+                );
+            }
         }
     }
 }
@@ -1506,7 +1558,7 @@ void IceSession::try_next_turn_attempt() {
             carrier_ != nullptr,
             carrier_tcp_ != nullptr,
             carrier_tls_ != nullptr);
-    turn_allocate_timer_.cancel();
+    ++turn_allocate_gen_;
     if (turn_) {
         turn_->close();
         turn_.reset();
@@ -1515,17 +1567,17 @@ void IceSession::try_next_turn_attempt() {
         /// All TURN attempts exhausted without a successful allocation.
         /// Clear the in-flight flag; if STUN already gathered (or there
         /// is no STUN), fire on_gathering_complete so the offer goes
-        /// out with host + srflx only.  The safety gather_timer_ is
-        /// cancelled to prevent a duplicate on_gathering_complete call.
+        /// out with host + srflx only.
         turn_gathering_ = false;
         if (stun_gathered_ || cfg_.stun_servers.empty()) {
-            gather_timer_.cancel();
+            ++gather_gen_;
             on_gathering_complete();
         }
         return;
     }
 
-    const auto& attempt_cfg = cfg_.turn_servers[turn_attempt_idx_];
+    TurnConfig attempt_cfg = cfg_.turn_servers[turn_attempt_idx_];
+    if (cfg_.prefer_turn_tcp) attempt_cfg.tcp_transport = true;
     if (attempt_cfg.server.empty()) {
         ++turn_attempt_idx_;
         asio::post(strand_, [self = shared_from_this()] {
@@ -1545,7 +1597,7 @@ void IceSession::try_next_turn_attempt() {
         c.priority = compute_priority(CandidateType::Relay, 65535, 1);
 
         asio::post(self->strand_, [self, c = std::move(c)]() mutable {
-            self->turn_allocate_timer_.cancel();
+            ++self->turn_allocate_gen_;
             if (!candidate_allowed(c.type, c.family,
                                     self->cfg_.candidate_filter_flags)) {
                 return;
@@ -1555,23 +1607,12 @@ void IceSession::try_next_turn_attempt() {
                 self->local_candidates_.push_back(std::move(c));
             }
 
-            /// TURN allocation just came up — install CreatePermission
-            /// entries for every remote candidate already known. The
-            /// server drops Send-Indications targeting peers without
-            /// a permission; without this, the very first connectivity
-            /// check fired through the relay never reaches the peer
-            /// and the FSM times out. The TurnClient internally
-            /// dedupes via its `permissions_` set, so this is safe to
-            /// call before later remote-candidate arrivals trigger
-            /// their own create_permission in `add_remote_candidates`.
             if (self->turn_) {
                 for (const auto& rc : self->remote_candidates_) {
                     self->turn_->create_permission(rc.address_str());
                 }
             }
 
-            /// Successful attempt — stash the remaining entries as
-            /// backups and arm the periodic probe.
             self->turn_backups_.clear();
             for (std::size_t i = self->turn_attempt_idx_ + 1;
                  i < self->cfg_.turn_servers.size(); ++i) {
@@ -1580,25 +1621,26 @@ void IceSession::try_next_turn_attempt() {
             if (!self->turn_backups_.empty()
                 && self->cfg_.turn_backup_interval_s > 0) {
                 self->turn_backup_probe_idx_ = 0;
-                self->turn_backup_timer_.expires_after(
-                    std::chrono::seconds(self->cfg_.turn_backup_interval_s));
-                self->turn_backup_timer_.async_wait(
-                    asio::bind_executor(self->strand_,
-                        [self](const std::error_code& ec) {
-                            if (ec) return;
-                            self->on_turn_backup_tick();
-                        }));
+                if (self->timer_ctx_) {
+                    const auto gen = ++self->turn_backup_gen_;
+                    exec::start_detached(
+                        exec::schedule_after(self->timer_ctx_->get_scheduler(),
+                            std::chrono::seconds{self->cfg_.turn_backup_interval_s})
+                        | stdexec::then([self, gen]() noexcept {
+                            asio::dispatch(self->strand_, [self, gen] {
+                                if (self->turn_backup_gen_.load(
+                                        std::memory_order_acquire) != gen) return;
+                                self->on_turn_backup_tick();
+                            });
+                        })
+                        | stdexec::upon_stopped([]() noexcept {})
+                    );
+                }
             }
 
-            /// TURN allocation complete — clear the in-flight flag and
-            /// drive gathering forward.  If STUN has already resolved
-            /// (or there are no STUN servers), fire on_gathering_complete
-            /// now so the offer/answer includes the relay candidate.
-            /// The gather_timer_ (500ms safety timer) is cancelled first
-            /// to avoid a redundant on_gathering_complete() from it.
             self->turn_gathering_ = false;
             if (self->stun_gathered_ || self->cfg_.stun_servers.empty()) {
-                self->gather_timer_.cancel();
+                ++self->gather_gen_;
                 self->on_gathering_complete();
             }
 
@@ -1658,7 +1700,9 @@ void IceSession::try_next_turn_attempt() {
                 });
             return;
         }
-        if (self->callbacks_.on_data)
+        if (self->cfg_.ordered_delivery)
+            self->deliver_in_order(data);
+        else if (self->callbacks_.on_data)
             self->callbacks_.on_data(self->peer_id_, data);
     };
 
@@ -1678,16 +1722,22 @@ void IceSession::try_next_turn_attempt() {
 
     const int timeout_s = cfg_.turn_allocate_timeout_s > 0
                             ? cfg_.turn_allocate_timeout_s : 5;
-    turn_allocate_timer_.expires_after(std::chrono::seconds(timeout_s));
-    turn_allocate_timer_.async_wait(asio::bind_executor(strand_,
-        [self = shared_from_this()](const std::error_code& ec) {
-            if (ec) return;
-            /// Deadline elapsed without an alloc callback firing.
-            /// Discard this attempt and advance.
-            if (self->turn_ && self->turn_->is_allocated()) return;
-            ++self->turn_attempt_idx_;
-            self->try_next_turn_attempt();
-        }));
+    if (timer_ctx_) {
+        const auto gen = ++turn_allocate_gen_;
+        exec::start_detached(
+            exec::schedule_after(timer_ctx_->get_scheduler(),
+                                  std::chrono::seconds{timeout_s})
+            | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                asio::dispatch(strand_, [this, self, gen] {
+                    if (turn_allocate_gen_.load(std::memory_order_acquire) != gen) return;
+                    if (turn_ && turn_->is_allocated()) return;
+                    ++turn_attempt_idx_;
+                    try_next_turn_attempt();
+                });
+            })
+            | stdexec::upon_stopped([]() noexcept {})
+        );
+    }
 }
 
 void IceSession::on_turn_backup_tick() {
@@ -1715,13 +1765,20 @@ void IceSession::on_turn_backup_tick() {
 
     /// Re-arm the periodic timer up front so a slow ALLOCATE doesn't
     /// stretch the gap between ticks.
-    turn_backup_timer_.expires_after(
-        std::chrono::seconds(cfg_.turn_backup_interval_s));
-    turn_backup_timer_.async_wait(asio::bind_executor(strand_,
-        [self = shared_from_this()](const std::error_code& ec) {
-            if (ec) return;
-            self->on_turn_backup_tick();
-        }));
+    if (timer_ctx_) {
+        const auto gen = ++turn_backup_gen_;
+        exec::start_detached(
+            exec::schedule_after(timer_ctx_->get_scheduler(),
+                                  std::chrono::seconds{cfg_.turn_backup_interval_s})
+            | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                asio::dispatch(strand_, [this, self, gen] {
+                    if (turn_backup_gen_.load(std::memory_order_acquire) != gen) return;
+                    on_turn_backup_tick();
+                });
+            })
+            | stdexec::upon_stopped([]() noexcept {})
+        );
+    }
 
     auto weak_self = std::weak_ptr<IceSession>(shared_from_this());
     auto on_alloc = [weak_self, idx, probe_cfg](
@@ -1838,7 +1895,7 @@ void IceSession::on_gathering_complete() {
     /// timeout — irrelevant whether the gather succeeded (first
     /// XOR-MAPPED-ADDRESS arrived) or timed out / had no servers.
     pending_stun_probes_.clear();
-    gather_timer_.cancel();
+    ++gather_gen_;
 
     if (state_.load(std::memory_order_acquire) == SessionState::Gathering) {
         if (!remote_candidates_.empty()) {
@@ -1878,6 +1935,7 @@ void IceSession::build_check_list() {
                 static_cast<int>(c.transport),
                 c.address_str().c_str(), c.port, c.priority);
     }
+    std::lock_guard cl_lk(local_state_mu_);
     check_list_.clear();
     /// Port-prediction precondition: peer advertised symmetric, and
     /// the operator left prediction on. Stride is taken from the
@@ -2011,6 +2069,11 @@ void IceSession::build_check_list() {
         return a.priority > b.priority;
     });
 
+    assign_initial_pair_states();
+    current_check_ = 0;
+}
+
+void IceSession::assign_initial_pair_states() {
     /// RFC 8445 §6.1.2.6 initial states: per foundation tuple
     /// `(local.foundation, remote.foundation)`, the highest-priority
     /// pair starts in Waiting and the remaining pairs sharing that
@@ -2024,16 +2087,11 @@ void IceSession::build_check_list() {
         const std::string key = lfnd + "|" + rfnd;
         auto [it, inserted] = seen_tuple.try_emplace(key, true);
         if (inserted) {
-            /// First (highest-priority) pair for this foundation tuple
-            /// becomes the representative — Waiting from the start.
             p.state = PairState::Waiting;
         } else {
-            /// Sibling for an already-represented foundation tuple.
-            /// Frozen until the representative succeeds + unfreezes.
             p.state = PairState::Frozen;
         }
     }
-    current_check_ = 0;
 }
 
 void IceSession::begin_checks() {
@@ -2139,19 +2197,23 @@ void IceSession::run_next_check() {
         send_check(p);
     }
 
-    /// Second pass: promote Waiting pairs to InProgress until the
-    /// concurrency cap (RFC §6.1.2.5) is hit. Frozen pairs stay
-    /// parked until a sibling on the same foundation tuple completes
-    /// (`unfreeze_siblings` is called on both Succeeded AND Failed
-    /// transitions per RFC 8445 §6.1.2.6). Succeeded / Failed are
-    /// terminal.
+    /// Second pass: scan every pair to determine whether the check
+    /// list still has work (any_pending), then promote Waiting pairs to
+    /// InProgress up to the concurrency cap (RFC §6.1.2.5). These two
+    /// concerns must not share an early-exit: the cap `break` would
+    /// abort the scan before reaching lower-priority InProgress pairs
+    /// (e.g. relay-relay at the tail of a priority-sorted list), making
+    /// the session declare Failed while checks are still in flight.
     bool any_pending = false;
-    for (auto& p : check_list_) {
+    for (const auto& p : check_list_) {
         if (p.state == PairState::Frozen
             || p.state == PairState::Waiting
             || p.state == PairState::InProgress) {
             any_pending = true;
+            break;
         }
+    }
+    for (auto& p : check_list_) {
         if (in_progress_count() >= kCheckConcurrencyCap) break;
         if (p.state == PairState::Waiting
             && p.retries < static_cast<uint8_t>(cfg_.max_check_retries)) {
@@ -2166,6 +2228,49 @@ void IceSession::run_next_check() {
     if (!any_pending) {
         if (state_.load(std::memory_order_acquire) == SessionState::Connected)
             return;
+
+        /// RFC 8445 §8.1.2 nomination wait: controlled peer must not
+        /// declare Failed simply because the check list is exhausted —
+        /// the controlling peer's USE-CANDIDATE may still be in flight
+        /// (typical TURN relay delay is 50-150 ms).  Arm a one-shot
+        /// timer so we give it `nomination_wait_ms` before giving up.
+        if (!controlling_ && !nomination_wait_armed_
+                && cfg_.nomination_wait_ms > 0) {
+            const bool has_valid = std::ranges::any_of(
+                check_list_,
+                [](const CheckPair& p) { return p.valid; });
+            if (has_valid) {
+                nomination_wait_armed_ = true;
+                ICE_DBG("nomination-wait",
+                        "peer=%s arming %d ms wait for USE-CANDIDATE",
+                        peer_id_.c_str(), cfg_.nomination_wait_ms);
+                if (timer_ctx_) {
+                    const auto gen = ++nomination_wait_gen_;
+                    exec::start_detached(
+                        exec::schedule_after(timer_ctx_->get_scheduler(),
+                            std::chrono::milliseconds{cfg_.nomination_wait_ms})
+                        | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                            asio::dispatch(strand_, [this, self, gen] {
+                                if (nomination_wait_gen_.load(
+                                        std::memory_order_acquire) != gen) return;
+                                if (state_.load(std::memory_order_acquire)
+                                        == SessionState::Connected) return;
+                                ICE_DBG("nomination-wait-expired",
+                                        "peer=%s declaring Failed after wait",
+                                        peer_id_.c_str());
+                                state_.store(SessionState::Failed,
+                                             std::memory_order_release);
+                                if (callbacks_.on_failed)
+                                    callbacks_.on_failed(peer_id_, ETIMEDOUT);
+                            });
+                        })
+                        | stdexec::upon_stopped([]() noexcept {})
+                    );
+                }
+                return;
+            }
+        }
+
         ICE_DBG("state", "peer=%s Checking -> Failed (no pending pairs)",
                 peer_id_.c_str());
         state_.store(SessionState::Failed, std::memory_order_release);
@@ -2176,13 +2281,21 @@ void IceSession::run_next_check() {
 
     ICE_DBG("check-timer", "peer=%s arm interval_ms=%d any_pending=1",
             peer_id_.c_str(), cfg_.check_interval_ms);
-    check_timer_.expires_after(std::chrono::milliseconds(cfg_.check_interval_ms));
-    check_timer_.async_wait(asio::bind_executor(strand_,
-        [this, self = shared_from_this()](const std::error_code& ec) {
-            ICE_DBG("check-timer", "peer=%s fire ec=%d",
-                    peer_id_.c_str(), ec.value());
-            if (!ec) run_next_check();
-        }));
+    if (timer_ctx_) {
+        const auto gen = ++check_gen_;
+        exec::start_detached(
+            exec::schedule_after(timer_ctx_->get_scheduler(),
+                std::chrono::milliseconds{cfg_.check_interval_ms})
+            | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                asio::dispatch(strand_, [this, self, gen] {
+                    ICE_DBG("check-timer", "peer=%s fire (p2300)", peer_id_.c_str());
+                    if (check_gen_.load(std::memory_order_acquire) != gen) return;
+                    run_next_check();
+                });
+            })
+            | stdexec::upon_stopped([]() noexcept {})
+        );
+    }
 }
 
 std::size_t IceSession::in_progress_count() const noexcept {
@@ -2269,15 +2382,25 @@ void IceSession::assign_local_foundations() {
 }
 
 std::vector<PairState> IceSession::check_list_states_for_test() const {
-    /// Snapshot under the strand-side state mutex. Pairs live in
-    /// `check_list_` which is strand-only on the write path; we don't
-    /// add a dedicated mutex for it because production reads happen
-    /// only on the strand. Tests synchronise externally by waiting
-    /// for state transitions before sampling.
+    std::lock_guard lk(local_state_mu_);
     std::vector<PairState> out;
     out.reserve(check_list_.size());
     for (const auto& p : check_list_) out.push_back(p.state);
     return out;
+}
+
+void IceSession::set_pair_state_for_test(std::size_t idx, PairState s) {
+    std::lock_guard lk(local_state_mu_);
+    if (idx < check_list_.size()) check_list_[idx].state = s;
+}
+
+void IceSession::run_check_tick_for_test() {
+    std::promise<void> done;
+    asio::post(strand_, [this, &done] {
+        run_next_check();
+        done.set_value();
+    });
+    done.get_future().get();
 }
 
 bool IceSession::handle_role_conflict_for_test(bool sender_controlling,
@@ -2294,6 +2417,12 @@ bool IceSession::handle_role_conflict(bool sender_controlling,
     /// controlled). Mismatched roles are the no-conflict path and
     /// resolve without comparing tiebreakers.
     if (sender_controlling != controlling_) return false;
+
+    ICE_DBG("role-conflict",
+            "peer=%s sender_ctrl=%d our_ctrl=%d sender_tb=%llu our_tb=%llu",
+            peer_id_.c_str(), sender_controlling ? 1 : 0, controlling_ ? 1 : 0,
+            static_cast<unsigned long long>(sender_tiebreaker),
+            static_cast<unsigned long long>(tiebreaker_));
 
     /// Tie-break: receiver with the LARGER tie-breaker keeps its
     /// role; the smaller-tie-breaker side switches. Equal values
@@ -2602,7 +2731,7 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
             /// consent, so the keepalive counter resets alongside.
             if (pmtu_inflight_ && parsed->txn_id == pmtu_inflight_txn_) {
                 pmtu_inflight_ = false;
-                pmtu_probe_timer_.cancel();
+                ++pmtu_probe_gen_;
                 if (pmtu_probe_) {
                     pmtu_probe_->on_probe_ack();
                     effective_mtu_.store(
@@ -2621,162 +2750,17 @@ void IceSession::on_carrier_data(gn_conn_id_t cid,
                 handle_check_response(*parsed);
             }
         } else if (parsed->msg_type == STUN_BINDING_REQUEST) {
-            /// RFC 8445 §7.3.1.1 role-conflict check. The sender's
-            /// role attribute (ICE-CONTROLLING / ICE-CONTROLLED) MUST
-            /// be the opposite of ours; otherwise we have to break the
-            /// tie via tiebreaker comparison.
-            const bool sender_controlling = parsed->ice_controlling.has_value();
-            const bool sender_controlled  = parsed->ice_controlled.has_value();
-            const uint64_t sender_tb = sender_controlling
-                ? *parsed->ice_controlling
-                : (sender_controlled ? *parsed->ice_controlled : 0);
-            const bool role_attr_present = sender_controlling || sender_controlled;
-            const bool same_role =
-                role_attr_present
-                && ((sender_controlling && controlling_)
-                    || (sender_controlled && !controlling_));
-            if (same_role) {
-                const bool we_switched =
-                    handle_role_conflict(sender_controlling, sender_tb);
-                if (!we_switched) {
-                    /// We won the tie-break: emit a 487 Role Conflict
-                    /// error response so the peer switches. Encode
-                    /// with our local pwd integrity so they verify
-                    /// the response against the same key they used
-                    /// to integrity-protect their request.
-                    auto err = StunBuilder(STUN_BINDING_ERROR)
-                        .set_txn_id(parsed->txn_id)
-                        .add_error_code(487, kStunErrorReasonRoleConflict)
-                        .add_integrity(local_pwd_)
-                        .add_fingerprint()
-                        .build();
-                    /// Synthetic relay cid: route the error response
-                    /// back through TURN so the peer receives it via
-                    /// the same allocation path the request used.
-                    /// `relay_cids_` is the authoritative membership
-                    /// check — the carrier's own cids also have the
-                    /// high bit set so a bit-mask test would collide.
-                    const bool via_turn = !from_tcp && turn_
-                        && relay_cids_.contains(cid);
-                    if (from_tcp) {
-                        if (carrier_tcp_) {
-                            const auto framed = frame_tcp_stun(err);
-                            (void)carrier_tcp_->send(cid, framed);
-                        }
-                    } else if (via_turn) {
-                        std::string rip;
-                        std::uint16_t rport = 0;
-                        if (auto eit = cid_to_endpoint_udp_.find(cid);
-                            eit != cid_to_endpoint_udp_.end()) {
-                            rip = eit->second.ip;
-                            rport = eit->second.port;
-                        }
-                        if (!rip.empty()) {
-                            turn_->send_indication(rip, rport, err);
-                        }
-                    } else {
-                        if (carrier_) (void)carrier_->send(cid, err);
-                    }
-                    return;
-                }
-                /// We switched roles: fall through to send the
-                /// normal binding-response so the peer's request
-                /// still gets ack'd. The next outgoing check rides
-                /// the new role's ICE-CONTROLLED/CONTROLLING attribute.
-            }
-
-            auto resp = StunBuilder(STUN_BINDING_RESPONSE)
-                .set_txn_id(parsed->txn_id)
-                .add_integrity(local_pwd_)
-                .add_fingerprint()
-                .build();
-            /// Reply rides the same cid the request arrived on — that
-            /// is exactly the peer's endpoint regardless of NAT
-            /// rewriting between announced candidate and actual src.
-            /// TCP cids need the 16-bit length-prefix wrap before
-            /// the byte stream hits the wire (RFC 5389 §7.2.2).
-            std::string resp_ip;
-            std::uint16_t resp_port = 0;
-            if (auto eit = ep_map.find(cid); eit != ep_map.end()) {
-                resp_ip = eit->second.ip;
-                resp_port = eit->second.port;
-            }
-            int send_rc = -2;  // -2 = no carrier
-            /// Synthetic relay cid: the request arrived via the TURN
-            /// allocation, so the matching response goes back the same
-            /// way. `send_indication` wraps the STUN response in a
-            /// Send-Indication envelope; the server forwards it as a
-            /// Data-Indication to the peer's allocation.
-            const bool resp_via_turn = !from_tcp && turn_
-                && relay_cids_.contains(cid);
-            if (from_tcp) {
-                if (carrier_tcp_) {
-                    const auto framed = frame_tcp_stun(resp);
-                    send_rc = static_cast<int>(
-                        carrier_tcp_->send(cid, framed));
-                }
-            } else if (resp_via_turn) {
-                if (!resp_ip.empty()) {
-                    turn_->send_indication(resp_ip, resp_port, resp);
-                    send_rc = 0;
-                }
-            } else {
-                if (carrier_) {
-                    send_rc = static_cast<int>(
-                        carrier_->send(cid, resp));
-                }
-            }
-            ICE_DBG("send-resp",
-                    "peer=%s cid=%llu dst=%s:%u from_tcp=%d "
-                    "via_turn=%d resp_bytes=%zu rc=%d",
-                    peer_id_.c_str(),
-                    static_cast<unsigned long long>(cid),
-                    resp_ip.c_str(), resp_port,
-                    from_tcp ? 1 : 0,
-                    resp_via_turn ? 1 : 0,
-                    resp.size(), send_rc);
-
-            std::string peer_ip = resp_ip;
-            std::uint16_t peer_port = resp_port;
-
-            if (parsed->use_candidate && !controlling_) {
-                /// Use the endpoint info stashed by the per-cid map;
-                /// that is the address composer_connect was called
-                /// with, which matches the peer's announced candidate.
-                if (!peer_ip.empty()) {
-                    const auto nom_tx = from_tcp
-                        ? TransportType::TcpActive
-                        : TransportType::Udp;
-                    /// Synthetic cid → the request arrived via TURN,
-                    /// so the nominated pair is relay-mediated.
-                    /// `send_on_strand` checks `uses_relay_` and falls
-                    /// through to `turn_->send_indication` instead of
-                    /// the direct carrier path.
-                    const bool nom_relay = !from_tcp
-                        && relay_cids_.contains(cid);
-                    on_nominated(peer_ip, peer_port, nom_relay, cid,
-                                 nom_tx);
-                }
-            }
-
-            /// RFC 8445 §7.3.1.4 triggered check. The inbound binding
-            /// request proves the peer can reach us at this (local,
-            /// peer) tuple; we mirror that by checking the path back
-            /// even if our gathered candidate list never produced
-            /// that pair (typically because the peer sees us through
-            /// a NAT we didn't probe via STUN). Triggered checks
-            /// short-cut nomination on the controlled side too —
-            /// without them a one-sided NAT'd flow would only succeed
-            /// when our own scheduled checks rotate around to the
-            /// same pair, costing several `check_interval_ms` ticks.
-            maybe_trigger_check_from_peer(peer_ip, peer_port);
+            handle_binding_request(*parsed, cid, from_tcp);
         }
         return;
     }
 
     if (state_.load(std::memory_order_acquire) == SessionState::Connected
         && callbacks_.on_data) {
-        callbacks_.on_data(peer_id_, data);
+        if (cfg_.ordered_delivery && !from_tcp)
+            deliver_in_order(data);
+        else
+            callbacks_.on_data(peer_id_, data);
     }
 }
 
@@ -2855,8 +2839,37 @@ void IceSession::handle_check_response(const StunMessage& msg) {
             /// Succeeded, then unfreeze every Frozen pair sharing the
             /// foundation tuple so dependent pairs can run.
             pair.state = PairState::Succeeded;
+            ICE_DBG("pair-succeeded",
+                    "peer=%s pair=%s:%u controlling=%d agg=%d "
+                    "nominee_sent=%d local_type=%d",
+                    peer_id_.c_str(),
+                    pair.remote.address_str().c_str(), pair.remote.port,
+                    controlling_ ? 1 : 0,
+                    cfg_.aggressive_nomination ? 1 : 0,
+                    pair.nominee_check_sent ? 1 : 0,
+                    static_cast<int>(pair.local.type));
             unfreeze_siblings(pair.local.foundation,
                                 pair.remote.foundation);
+
+            /// RFC 8445 §8.1.2: controlled agent deferred nomination.
+            /// If the controller sent USE-CANDIDATE for this pair
+            /// while it was still Frozen/Waiting/InProgress, the
+            /// `pending_nomination` flag was set and the nomination
+            /// context stashed.  Now that the check succeeded we can
+            /// safely call on_nominated.
+            if (!controlling_ && pair.pending_nomination) {
+                pair.pending_nomination = false;
+                ICE_DBG("use-cand-deferred-nominate",
+                        "peer=%s pair=%s:%u check succeeded — "
+                        "completing deferred §8.1.2 nomination",
+                        peer_id_.c_str(),
+                        pair.remote.address_str().c_str(),
+                        pair.remote.port);
+                on_nominated(pending_nom_ip_, pending_nom_port_,
+                             pending_nom_relay_, pending_nom_cid_,
+                             pending_nom_tx_);
+                return;
+            }
 
             if (controlling_) {
                 if (cfg_.aggressive_nomination
@@ -2915,6 +2928,218 @@ void IceSession::handle_check_response(const StunMessage& msg) {
     }
 }
 
+void IceSession::handle_binding_request(const StunMessage& parsed,
+                                         gn_conn_id_t cid,
+                                         bool from_tcp) {
+    auto& ep_map = from_tcp ? cid_to_endpoint_tcp_ : cid_to_endpoint_udp_;
+
+    /// RFC 8445 §7.3.1.1 role-conflict check. The sender's
+    /// role attribute (ICE-CONTROLLING / ICE-CONTROLLED) MUST
+    /// be the opposite of ours; otherwise we have to break the
+    /// tie via tiebreaker comparison.
+    const bool sender_controlling = parsed.ice_controlling.has_value();
+    const bool sender_controlled  = parsed.ice_controlled.has_value();
+    const uint64_t sender_tb = sender_controlling
+        ? *parsed.ice_controlling
+        : (sender_controlled ? *parsed.ice_controlled : 0);
+    const bool role_attr_present = sender_controlling || sender_controlled;
+    const bool same_role =
+        role_attr_present
+        && ((sender_controlling && controlling_)
+            || (sender_controlled && !controlling_));
+    if (same_role) {
+        const bool we_switched =
+            handle_role_conflict(sender_controlling, sender_tb);
+        if (!we_switched) {
+            /// We won the tie-break: emit a 487 Role Conflict
+            /// error response so the peer switches. Encode
+            /// with our local pwd integrity so they verify
+            /// the response against the same key they used
+            /// to integrity-protect their request.
+            auto err = StunBuilder(STUN_BINDING_ERROR)
+                .set_txn_id(parsed.txn_id)
+                .add_error_code(487, kStunErrorReasonRoleConflict)
+                .add_integrity(local_pwd_)
+                .add_fingerprint()
+                .build();
+            /// Synthetic relay cid: route the error response
+            /// back through TURN so the peer receives it via
+            /// the same allocation path the request used.
+            /// `relay_cids_` is the authoritative membership
+            /// check — the carrier's own cids also have the
+            /// high bit set so a bit-mask test would collide.
+            const bool via_turn = !from_tcp && turn_
+                && relay_cids_.contains(cid);
+            if (from_tcp) {
+                if (carrier_tcp_) {
+                    const auto framed = frame_tcp_stun(err);
+                    (void)carrier_tcp_->send(cid, framed);
+                }
+            } else if (via_turn) {
+                std::string rip;
+                std::uint16_t rport = 0;
+                if (auto eit = cid_to_endpoint_udp_.find(cid);
+                    eit != cid_to_endpoint_udp_.end()) {
+                    rip = eit->second.ip;
+                    rport = eit->second.port;
+                }
+                if (!rip.empty()) {
+                    turn_->send_indication(rip, rport, err);
+                }
+            } else {
+                if (carrier_) (void)carrier_->send(cid, err);
+            }
+            return;
+        }
+        /// We switched roles: fall through to send the
+        /// normal binding-response so the peer's request
+        /// still gets ack'd. The next outgoing check rides
+        /// the new role's ICE-CONTROLLED/CONTROLLING attribute.
+    }
+
+    auto resp = StunBuilder(STUN_BINDING_RESPONSE)
+        .set_txn_id(parsed.txn_id)
+        .add_integrity(local_pwd_)
+        .add_fingerprint()
+        .build();
+    /// Reply rides the same cid the request arrived on — that
+    /// is exactly the peer's endpoint regardless of NAT
+    /// rewriting between announced candidate and actual src.
+    /// TCP cids need the 16-bit length-prefix wrap before
+    /// the byte stream hits the wire (RFC 5389 §7.2.2).
+    std::string resp_ip;
+    std::uint16_t resp_port = 0;
+    if (auto eit = ep_map.find(cid); eit != ep_map.end()) {
+        resp_ip = eit->second.ip;
+        resp_port = eit->second.port;
+    }
+    int send_rc = -2;  // -2 = no carrier
+    /// Synthetic relay cid: the request arrived via the TURN
+    /// allocation, so the matching response goes back the same
+    /// way. `send_indication` wraps the STUN response in a
+    /// Send-Indication envelope; the server forwards it as a
+    /// Data-Indication to the peer's allocation.
+    const bool resp_via_turn = !from_tcp && turn_
+        && relay_cids_.contains(cid);
+    if (from_tcp) {
+        if (carrier_tcp_) {
+            const auto framed = frame_tcp_stun(resp);
+            send_rc = static_cast<int>(
+                carrier_tcp_->send(cid, framed));
+        }
+    } else if (resp_via_turn) {
+        if (!resp_ip.empty()) {
+            turn_->send_indication(resp_ip, resp_port, resp);
+            send_rc = 0;
+        }
+    } else {
+        if (carrier_) {
+            send_rc = static_cast<int>(
+                carrier_->send(cid, resp));
+        }
+    }
+    ICE_DBG("send-resp",
+            "peer=%s cid=%llu dst=%s:%u from_tcp=%d "
+            "via_turn=%d resp_bytes=%zu rc=%d",
+            peer_id_.c_str(),
+            static_cast<unsigned long long>(cid),
+            resp_ip.c_str(), resp_port,
+            from_tcp ? 1 : 0,
+            resp_via_turn ? 1 : 0,
+            resp.size(), send_rc);
+
+    std::string peer_ip = resp_ip;
+    std::uint16_t peer_port = resp_port;
+
+    if (parsed.use_candidate && !controlling_) {
+        /// RFC 8445 §8.1.2: controlled agent must not
+        /// transition to Connected until the nominated pair's
+        /// connectivity check succeeds.  If the pair is
+        /// already Succeeded we nominate immediately (common
+        /// fast path).  Otherwise we promote it from Frozen →
+        /// Waiting so `run_next_check` fires a check, and
+        /// defer the `on_nominated` call to
+        /// `handle_check_response` via `pending_nomination`.
+        if (!peer_ip.empty()) {
+            const auto nom_tx = from_tcp
+                ? TransportType::TcpActive
+                : TransportType::Udp;
+            const bool nom_relay = !from_tcp
+                && relay_cids_.contains(cid);
+
+            /// Find the matching pair in the check list.
+            CheckPair* nom_pair = nullptr;
+            for (auto& p : check_list_) {
+                if (p.remote.address_str() == peer_ip
+                    && p.remote.port == peer_port
+                    && p.transport_type == nom_tx) {
+                    nom_pair = &p;
+                    break;
+                }
+            }
+
+            if (nom_pair && nom_pair->state == PairState::Succeeded) {
+                /// Already verified — nominate immediately.
+                ICE_DBG("use-cand-rx",
+                        "peer=%s from=%s:%u cid=%llu state=%d",
+                        peer_id_.c_str(), peer_ip.c_str(), peer_port,
+                        static_cast<unsigned long long>(cid),
+                        static_cast<int>(state_.load(
+                            std::memory_order_acquire)));
+                on_nominated(peer_ip, peer_port, nom_relay, cid, nom_tx);
+            } else {
+                /// §8.1.2: promote Frozen → Waiting so the
+                /// check scheduler picks it up, then wait for
+                /// the binding response before calling
+                /// on_nominated.
+                if (nom_pair) {
+                    if (nom_pair->state == PairState::Frozen) {
+                        nom_pair->state = PairState::Waiting;
+                        ICE_DBG("use-cand-unfreeze",
+                                "peer=%s pair=%s:%u promoted "
+                                "Frozen->Waiting per §8.1.2",
+                                peer_id_.c_str(),
+                                peer_ip.c_str(), peer_port);
+                    }
+                    nom_pair->pending_nomination = true;
+                    /// Store the nomination context so
+                    /// handle_check_response can call
+                    /// on_nominated with the right arguments.
+                    pending_nom_ip_    = peer_ip;
+                    pending_nom_port_  = peer_port;
+                    pending_nom_relay_ = nom_relay;
+                    pending_nom_cid_   = cid;
+                    pending_nom_tx_    = nom_tx;
+                } else {
+                    /// No matching pair yet (pair will be
+                    /// minted by maybe_trigger_check_from_peer
+                    /// below).  Store context; the triggered-
+                    /// check path will set pending_nomination
+                    /// when it inserts the new pair.
+                    pending_nom_ip_    = peer_ip;
+                    pending_nom_port_  = peer_port;
+                    pending_nom_relay_ = nom_relay;
+                    pending_nom_cid_   = cid;
+                    pending_nom_tx_    = nom_tx;
+                }
+                run_next_check();
+            }
+        }
+    }
+
+    /// RFC 8445 §7.3.1.4 triggered check. The inbound binding
+    /// request proves the peer can reach us at this (local,
+    /// peer) tuple; we mirror that by checking the path back
+    /// even if our gathered candidate list never produced
+    /// that pair (typically because the peer sees us through
+    /// a NAT we didn't probe via STUN). Triggered checks
+    /// short-cut nomination on the controlled side too —
+    /// without them a one-sided NAT'd flow would only succeed
+    /// when our own scheduled checks rotate around to the
+    /// same pair, costing several `check_interval_ms` ticks.
+    maybe_trigger_check_from_peer(peer_ip, peer_port);
+}
+
 void IceSession::maybe_trigger_check_from_peer(
     const std::string& peer_ip, std::uint16_t peer_port) {
     if (peer_ip.empty() || local_candidates_.empty()) return;
@@ -2943,8 +3168,8 @@ void IceSession::maybe_trigger_check_from_peer(
     /// pairs can't connect; without a match we silently skip — the
     /// peer's check will still get a response and they will fall
     /// back to a different candidate.
-    auto local_it = std::find_if(
-        local_candidates_.begin(), local_candidates_.end(),
+    auto local_it = std::ranges::find_if(
+        local_candidates_,
         [&](const Candidate& l) { return l.family == pair.remote.family; });
     if (local_it == local_candidates_.end()) return;
     pair.local = *local_it;
@@ -2969,6 +3194,21 @@ void IceSession::maybe_trigger_check_from_peer(
             /*server=*/{}, pair.remote.transport);
     }
     check_list_.push_back(pair);
+
+    /// RFC 8445 §8.1.2: if the controller already sent USE-CANDIDATE
+    /// for this endpoint (stored in pending_nom_ip_/port_) and no
+    /// matching pair existed at that time, mark the newly-minted
+    /// triggered pair so handle_check_response completes the deferred
+    /// nomination once the check succeeds.
+    if (!controlling_
+        && !pending_nom_ip_.empty()
+        && check_list_.back().remote.address_str() == pending_nom_ip_
+        && check_list_.back().remote.port == pending_nom_port_) {
+        check_list_.back().pending_nomination = true;
+        ICE_DBG("use-cand-triggered-pending",
+                "peer=%s triggered pair %s:%u marked pending_nomination",
+                peer_id_.c_str(), pending_nom_ip_.c_str(), pending_nom_port_);
+    }
 
     /// Fire the check immediately so this triggered pair doesn't have
     /// to wait for `run_next_check` to drain whatever is ahead of it
@@ -3040,11 +3280,14 @@ IceSession::CandidateCounts IceSession::candidate_counts() const {
 
 void IceSession::on_nominated(const std::string& ip, uint16_t port, bool relay,
                                  gn_conn_id_t cid, TransportType transport) {
-    ICE_DBG("nominated", "peer=%s %s:%u relay=%d cid=%llu tx=%d",
+    ICE_DBG("nominated",
+            "peer=%s %s:%u relay=%d cid=%llu tx=%d controlling=%d",
             peer_id_.c_str(), ip.c_str(), port, relay ? 1 : 0,
             static_cast<unsigned long long>(cid),
-            static_cast<int>(transport));
-    check_timer_.cancel();
+            static_cast<int>(transport), controlling_ ? 1 : 0);
+    ++check_gen_;
+    ++nomination_wait_gen_;
+    nomination_wait_armed_ = false;
     state_.store(SessionState::Connected, std::memory_order_release);
     consent_missed_.store(0, std::memory_order_release);
     consent_recovery_attempts_ = 0;
@@ -3150,13 +3393,20 @@ void IceSession::start_path_mtu_probe() {
     auto msg = builder.build();
     (void)carrier_->send(cid, msg);
 
-    pmtu_probe_timer_.expires_after(
-        std::chrono::milliseconds(cfg_.pmtu_probe_timeout_ms));
-    pmtu_probe_timer_.async_wait(asio::bind_executor(strand_,
-        [this, self = shared_from_this()](const std::error_code& ec) {
-            if (ec) return;
-            on_path_mtu_probe_timeout();
-        }));
+    if (timer_ctx_) {
+        const auto gen = ++pmtu_probe_gen_;
+        exec::start_detached(
+            exec::schedule_after(timer_ctx_->get_scheduler(),
+                std::chrono::milliseconds{cfg_.pmtu_probe_timeout_ms})
+            | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                asio::dispatch(strand_, [this, self, gen] {
+                    if (pmtu_probe_gen_.load(std::memory_order_acquire) != gen) return;
+                    on_path_mtu_probe_timeout();
+                });
+            })
+            | stdexec::upon_stopped([]() noexcept {})
+        );
+    }
 }
 
 void IceSession::on_path_mtu_probe_timeout() {
@@ -3266,12 +3516,20 @@ void IceSession::on_keepalive() {
         }
     }
 
-    keepalive_timer_.expires_after(std::chrono::seconds(cfg_.keepalive_interval_s));
-    auto self = shared_from_this();
-    keepalive_timer_.async_wait(asio::bind_executor(strand_,
-        [this, self](const std::error_code& ec) {
-            if (!ec) on_keepalive();
-        }));
+    if (timer_ctx_) {
+        const auto gen = ++keepalive_gen_;
+        exec::start_detached(
+            exec::schedule_after(timer_ctx_->get_scheduler(),
+                std::chrono::seconds{cfg_.keepalive_interval_s})
+            | stdexec::then([this, self = shared_from_this(), gen]() noexcept {
+                asio::dispatch(strand_, [this, self, gen] {
+                    if (keepalive_gen_.load(std::memory_order_acquire) != gen) return;
+                    on_keepalive();
+                });
+            })
+            | stdexec::upon_stopped([]() noexcept {})
+        );
+    }
 }
 
 // ── Candidate address helpers ───────────────────────────────────────────────

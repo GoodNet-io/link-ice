@@ -10,13 +10,19 @@
 #include "link_ice.hpp"
 
 #include <sdk/abi.h>
+#include <sdk/convenience.h>
+#include <sdk/cpp/log.hpp>
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
 #include <sdk/link.h>
 #include <sdk/plugin.h>
+#include <sdk/security.h>
+#include <sdk/topology.h>
+#include <sdk/trust.h>
 #include <sdk/types.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -417,19 +423,59 @@ void install_signal_extension(IcePlugin* p) {
     v.ctx           = p;
 }
 
+void link_on_topology_sealed(void* self,
+                              const struct gn_topology_s* topo) noexcept {
+    if (!self || !topo) return;
+    auto* p = static_cast<IcePlugin*>(self);
+    const bool contour_open =
+        (topo->contour_gaps & ((1u << GN_TRUST_UNTRUSTED) |
+                               (1u << GN_TRUST_PEER))) != 0;
+    p->link->set_prefer_turn_tcp(contour_open);
+
+    char fp[65] = {};
+    for (int i = 0; i < 32; ++i)
+        std::snprintf(fp + i * 2, 3, "%02x",
+                      static_cast<unsigned>(topo->fingerprint[i]));
+
+    bool e2e_present = false;
+    for (std::uint32_t i = 0; i < topo->security_count; ++i) {
+        const auto& s = topo->security[i];
+        gn::log::info(p->api,
+                      "ice: topology security provider={} trust_mask={:#x} "
+                      "provides={:#x} e2e={}",
+                      s.provider_id ? s.provider_id : "(null)",
+                      s.allowed_trust_mask,
+                      s.provides_flags,
+                      (s.provides_flags & GN_SEC_PROVIDES_E2E_ENCRYPTION) ? 1 : 0);
+        if (s.provides_flags & GN_SEC_PROVIDES_E2E_ENCRYPTION)
+            e2e_present = true;
+    }
+
+    // 16 bytes AEAD tag + 4 bytes seqno header = 20 bytes total overhead
+    p->link->set_security_overhead(e2e_present ? 20 : 0);
+    p->link->set_ordered_delivery(e2e_present);
+
+    gn::log::info(p->api,
+                  "ice: topology sealed fingerprint={} contour_gaps={:#x} "
+                  "prefer_turn_tcp={} e2e_present={}",
+                  std::string_view{fp}, topo->contour_gaps,
+                  contour_open ? 1 : 0, e2e_present ? 1 : 0);
+}
+
 void install_link_vtable(IcePlugin* p) {
     auto& v = p->link_vtable;
-    v                 = gn_link_vtable_t{};
-    v.api_size        = sizeof(gn_link_vtable_t);
-    v.scheme          = &link_scheme;
-    v.listen          = &link_listen;
-    v.connect         = &link_connect;
-    v.send            = &link_send;
-    v.send_batch      = &link_send_batch;
-    v.disconnect      = &link_disconnect;
-    v.extension_name  = &link_extension_name;
-    v.extension_vtable = &link_extension_vtable;
-    v.destroy         = &link_destroy;
+    v                   = gn_link_vtable_t{};
+    v.api_size          = sizeof(gn_link_vtable_t);
+    v.scheme            = &link_scheme;
+    v.listen            = &link_listen;
+    v.connect           = &link_connect;
+    v.send              = &link_send;
+    v.send_batch        = &link_send_batch;
+    v.disconnect        = &link_disconnect;
+    v.extension_name    = &link_extension_name;
+    v.extension_vtable  = &link_extension_vtable;
+    v.destroy           = &link_destroy;
+    v.on_topology_sealed = &link_on_topology_sealed;
 }
 
 const char* const kProvidesList[] = {

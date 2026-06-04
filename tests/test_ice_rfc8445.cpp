@@ -59,6 +59,7 @@ struct BareSessionFixture {
     asio::executor_work_guard<asio::io_context::executor_type> work{
         asio::make_work_guard(ioc)};
     std::thread worker;
+    std::optional<exec::timed_thread_context> timer_ctx_p2300{std::in_place};
     std::shared_ptr<IceSession> session;
 
     BareSessionFixture() {
@@ -67,6 +68,7 @@ struct BareSessionFixture {
 
     ~BareSessionFixture() {
         if (session) session->close();
+        timer_ctx_p2300.reset();
         work.reset();
         ioc.stop();
         if (worker.joinable()) worker.join();
@@ -77,7 +79,8 @@ struct BareSessionFixture {
         session = std::make_shared<IceSession>(
             ioc, /*carrier=*/nullptr, /*tcp=*/nullptr, /*tls=*/nullptr,
             cfg, /*peer_id=*/"abcdef0123456789", controlling,
-            cbs, /*mdns=*/nullptr);
+            cbs, /*mdns=*/nullptr, /*portmap=*/nullptr,
+            &*timer_ctx_p2300);
     }
 };
 
@@ -161,7 +164,8 @@ struct CarrierSessionFixture {
     TinyCarrier carrier;
     host_api_t api{};
     std::optional<gn::sdk::LinkCarrier> link_carrier;
-    std::shared_ptr<IceSession> session;
+    std::optional<exec::timed_thread_context> timer_ctx_p2300{std::in_place};
+    std::shared_ptr<IceSession>         session;
 
     CarrierSessionFixture() {
         worker = std::thread([this] { ioc.run(); });
@@ -172,6 +176,7 @@ struct CarrierSessionFixture {
     }
     ~CarrierSessionFixture() {
         if (session) session->close();
+        timer_ctx_p2300.reset();
         work.reset();
         ioc.stop();
         if (worker.joinable()) worker.join();
@@ -194,7 +199,8 @@ struct CarrierSessionFixture {
         IceSessionCallbacks cbs;
         session = std::make_shared<IceSession>(
             ioc, cp, nullptr, nullptr, cfg,
-            /*peer_id=*/"abcdef0123456789", controlling, cbs, nullptr);
+            /*peer_id=*/"abcdef0123456789", controlling, cbs, nullptr,
+            /*portmap=*/nullptr, &*timer_ctx_p2300);
         session->gather();
     }
 };
@@ -529,6 +535,75 @@ TEST(IceFrozenPacing, SuccessUnfreezesSiblings) {
         << "expected at least one Frozen sibling pair";
     EXPECT_GT(active, 0u)
         << "expected at least one active representative pair";
+}
+
+TEST(IceFrozenPacing, AnyPendingNotMissedWhenCapExhaustedAtHead) {
+    /// Regression: run_next_check() used a combined loop that both
+    /// computed any_pending AND promoted Waiting pairs. The loop had
+    /// an early break when in_progress_count() >= kCheckConcurrencyCap.
+    /// If the first pair(s) in the priority-sorted list were in a
+    /// terminal state (Failed), the break fired before any_pending was
+    /// set — even though InProgress pairs existed at the tail — causing
+    /// the session to enter Failed while checks were still in flight.
+    ///
+    /// Concretely: all_relay scenario peer B had high-priority host/srflx
+    /// pairs at the head (all Failed) and relay-relay pairs at the tail
+    /// (InProgress), triggering the premature failure.
+    ///
+    /// Fix: separate the any_pending scan from the promotion loop so
+    /// the break only gates promotion, never the scan.
+    CarrierSessionFixture fx;
+    IceConfig cfg;
+    cfg.stun_servers.clear();
+    cfg.check_interval_ms = 10000;  // keep the FSM timer quiet
+    cfg.max_check_retries = 4;
+    fx.start(cfg, /*controlling=*/true);
+
+    // Provision enough remote candidates to exceed kCheckConcurrencyCap.
+    // Different ports, same IP — each gets a distinct pair in the list.
+    const int n_remotes = static_cast<int>(kCheckConcurrencyCap) + 2;
+    std::vector<Candidate> remotes;
+    for (int i = 0; i < n_remotes; ++i) {
+        Candidate r{};
+        r.type = CandidateType::Host;
+        r.family = AddressFamily::IPv4;
+        r.port = static_cast<std::uint16_t>(54000 + i);
+        // Descending priority so higher-index candidates are lower-priority
+        // and end up at the tail of the sorted checklist.
+        r.priority = compute_priority(CandidateType::Host,
+                                       static_cast<std::uint16_t>(65535 - i), 1);
+        r.set_address("192.0.2.200");
+        remotes.push_back(r);
+    }
+    fx.session->add_remote_candidates(
+        "remoteu", "remotepwdremotepwdremotepwd", remotes, /*eoc=*/true);
+
+    const bool checking = wait_until(
+        [&] { return fx.session->state() == SessionState::Checking; }, 3s);
+    ASSERT_TRUE(checking) << "session never entered Checking";
+
+    const auto n = fx.session->check_list_states_for_test().size();
+    ASSERT_GE(n, kCheckConcurrencyCap + 1)
+        << "checklist too small to exercise the bug";
+
+    // Arrange the bug-triggering layout:
+    //   [0]          → Failed (terminal, at head/highest-priority)
+    //   [n-cap .. n) → InProgress (at tail/lowest-priority)
+    // Old code: first iteration sees pair[0]=Failed, any_pending not set,
+    //   in_progress_count()=cap >= cap → break → any_pending=false → Failed.
+    // New code: scan loop is separate, reaches InProgress at tail,
+    //   any_pending=true → session stays Checking.
+    fx.session->set_pair_state_for_test(0, PairState::Failed);
+    for (std::size_t i = n - kCheckConcurrencyCap; i < n; ++i) {
+        fx.session->set_pair_state_for_test(i, PairState::InProgress);
+    }
+
+    fx.session->run_check_tick_for_test();
+
+    EXPECT_NE(fx.session->state(), SessionState::Failed)
+        << "session prematurely entered Failed; InProgress pairs at checklist "
+           "tail were not counted in any_pending (regression of the cap-break bug)";
+    EXPECT_EQ(fx.session->state(), SessionState::Checking);
 }
 
 }  // namespace gn::link::ice::test

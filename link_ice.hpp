@@ -33,6 +33,7 @@
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
+#include <exec/timed_thread_scheduler.hpp>
 
 #include <sdk/cpp/link_carrier.hpp>
 #include <sdk/extensions/link.h>
@@ -269,6 +270,22 @@ public:
 
     void set_host_api(const host_api_t* api) noexcept;
 
+    /// Called by `on_topology_sealed`. When `val` is true, all future
+    /// TURN allocations request TCP relay regardless of operator config.
+    void set_prefer_turn_tcp(bool val) noexcept;
+
+    /// Called by `on_topology_sealed` when the topology reveals an
+    /// active E2E security provider (e.g. Noise). `overhead` bytes are
+    /// subtracted from the configured `path_mtu` floor so ICE sessions
+    /// never produce frames that exceed the path after encryption.
+    void set_security_overhead(int overhead) noexcept;
+
+    /// Enable ordered delivery for UDP data frames. Must be set when
+    /// InlineCrypto is active (Noise): counter nonces require in-order
+    /// delivery; out-of-order UDP datagrams cause AEAD authentication
+    /// failures at the kernel security layer.
+    void set_ordered_delivery(bool val) noexcept;
+
     /// Idempotent. Stops every session, fires `notify_disconnect`
     /// on the caller thread for every published id, and quiesces
     /// the worker.
@@ -432,6 +449,9 @@ private:
     asio::executor_work_guard<asio::io_context::executor_type> work_;
     std::thread                                                      worker_;
     asio::steady_timer                                                reaper_timer_;
+    // Must be last: destroyed in shutdown() before ioc_ stops, so that P2300
+    // sender-chain lambdas release IceSession shared_ptrs while ioc_ is live.
+    std::optional<exec::timed_thread_context>                          timer_ctx_;
 
     std::atomic<bool>                            shutdown_{false};
     std::atomic<std::uint32_t>                   mtu_{kDefaultMtu};
@@ -445,7 +465,10 @@ private:
 
     mutable std::mutex                            sessions_mu_;
     std::unordered_map<gn_conn_id_t, PeerEntry>   sessions_;
-    std::unordered_map<std::string, gn_conn_id_t> peer_to_id_;
+    std::unordered_map<std::string, std::vector<gn_conn_id_t>> peer_to_ids_;
+    /// Erase one conn_id from peer_to_ids_; removes the key when the
+    /// vector becomes empty. Must be called under sessions_mu_.
+    void erase_peer_id(const std::string& peer_hex, gn_conn_id_t conn) noexcept;
     std::vector<gn_conn_id_t>                     published_ids_;
 
     std::atomic<std::uint64_t> bytes_in_{0};

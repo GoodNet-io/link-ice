@@ -279,6 +279,7 @@ struct SessionFixture {
     TcpHarness                                    harness;
     std::optional<gn::sdk::LinkCarrier>           udp_carrier;
     std::optional<gn::sdk::LinkCarrier>           tcp_carrier;
+    std::optional<exec::timed_thread_context>      timer_ctx_p2300{std::in_place};
     std::shared_ptr<IceSession>                   session;
 
     SessionFixture() {
@@ -289,6 +290,7 @@ struct SessionFixture {
 
     ~SessionFixture() {
         if (session) session->close();
+        timer_ctx_p2300.reset();
         work.reset();
         ioc.stop();
         if (worker.joinable()) worker.join();
@@ -305,7 +307,8 @@ struct SessionFixture {
         session = std::make_shared<IceSession>(
             ioc, udp_ptr, tcp_ptr, /*tls=*/nullptr,
             cfg, /*peer_id=*/"abcdef0123456789", controlling,
-            cbs, /*mdns=*/nullptr);
+            cbs, /*mdns=*/nullptr, /*portmap=*/nullptr,
+            &*timer_ctx_p2300);
         session->gather();
     }
 };

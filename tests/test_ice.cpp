@@ -139,7 +139,7 @@ TEST(IceLink, ConnectAllocatesConnRecord) {
     EXPECT_EQ(h.disconnects.load(), 1);
 }
 
-TEST(IceLink, ConnectIsIdempotentForSamePeer) {
+TEST(IceLink, ConnectToSamePeerCreatesMultipleSessions) {
     auto t = std::make_shared<IceLink>();
     StubHost h;
     auto api = make_stub_api(h);
@@ -148,12 +148,11 @@ TEST(IceLink, ConnectIsIdempotentForSamePeer) {
     const std::string uri = std::string("ice://") + kPeerPkHex;
     ASSERT_EQ(t->connect(uri), GN_OK);
     wait_for([&] { return h.connects.load() >= 1; }, 1s,
-              "initiator notify_connect");
-    ASSERT_EQ(t->connect(uri), GN_OK);  // dedup, no new record
-    /// Give scheduler a chance — second connect must NOT mint a
-    /// second conn record.
-    std::this_thread::sleep_for(50ms);
-    EXPECT_EQ(h.connects.load(), 1);
+              "first notify_connect");
+    ASSERT_EQ(t->connect(uri), GN_OK);
+    wait_for([&] { return h.connects.load() >= 2; }, 1s,
+              "second notify_connect");
+    EXPECT_EQ(h.connects.load(), 2);
 
     t->shutdown();
 }

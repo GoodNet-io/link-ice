@@ -195,6 +195,8 @@ void TurnClient::dispatch_inbound_message(std::span<const std::uint8_t> bytes) {
         /// `peer_to_channel_` from `bind_channel`. Nothing to do here
         /// besides accept the response; future sends on that peer will
         /// take the ChannelData fast path automatically.
+        ICE_DBG("turn.channel-bind", "server=%s:%u ok=1",
+                cfg_.server.c_str(), cfg_.port);
     } else if (parsed->msg_type == TURN_CHANNEL_BIND_ERROR) {
         /// Bind error — we leave the optimistic mapping in place
         /// because (a) we don't track pending binds by txn_id, and
@@ -202,6 +204,8 @@ void TurnClient::dispatch_inbound_message(std::span<const std::uint8_t> bytes) {
         /// turns out unusable. Real-world bind failures are rare
         /// (channel space exhaustion or stale nonce); v1 trades
         /// strict bookkeeping for simpler code.
+        ICE_DBG("turn.channel-bind", "server=%s:%u ok=0",
+                cfg_.server.c_str(), cfg_.port);
     } else if (parsed->msg_type == TURN_CONNECTION_ATTEMPT_INDICATION) {
         handle_connection_attempt(*parsed);
     } else if (parsed->msg_type == TURN_CONNECT_RESPONSE) {
@@ -230,6 +234,10 @@ void TurnClient::handle_allocate_response(const StunMessage& msg) {
         relayed_ = *msg.xor_relayed;
         allocated_ = true;
         if (msg.lifetime) lifetime_ = *msg.lifetime;
+        ICE_DBG("turn.allocated",
+                "server=%s:%u relayed=%s:%u lifetime=%u",
+                cfg_.server.c_str(), cfg_.port,
+                relayed_.ip.c_str(), relayed_.port, lifetime_);
         schedule_refresh();
 
         // Notify session that relay address is available.

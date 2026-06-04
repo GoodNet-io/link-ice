@@ -12,6 +12,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <string_view>
 
 namespace gn::link::ice {
 
@@ -26,8 +28,18 @@ inline bool ice_dbg_enabled() {
     return v == 1;
 }
 
+inline bool ice_dbg_tag_enabled(const char* tag) {
+    static const std::string tags = []() -> std::string {
+        const char* s = std::getenv("ICE_DEBUG_TAGS");
+        return s ? s : "";
+    }();
+    if (tags.empty()) return true;
+    return std::string_view{tags}.find(tag) != std::string_view::npos;
+}
+
 inline void ice_dbg_emit(const char* tag, const char* fmt, ...) {
     if (!ice_dbg_enabled()) return;
+    if (!ice_dbg_tag_enabled(tag)) return;
     using clock = std::chrono::steady_clock;
     static const auto t0 = clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -31,11 +31,14 @@
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/strand.hpp>
+#include <exec/timed_thread_scheduler.hpp>
+namespace exec = experimental::execution;
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -266,6 +269,35 @@ struct IceConfig {
     /// in-flight restart — the FSM does not re-enter Gathering twice
     /// for the same network blip.
     int  auto_restart_backoff_ms = 500;
+    /// RFC 8445 §8.1.2 controlled-peer nomination wait.
+    /// When the check list is exhausted (no pending pairs) but valid
+    /// pairs exist, the controlled peer arms this timer instead of
+    /// immediately declaring Failed.  The controlling peer's USE-CANDIDATE
+    /// typically arrives within a few RTTs; 500 ms covers even a 400 ms
+    /// TURN relay path with room to spare.  Set to 0 to disable and
+    /// declare Failed immediately (pre-fix behaviour).
+    int  nomination_wait_ms = 500;
+
+    /// When true, override `TurnConfig::tcp_transport` to `true` for
+    /// every TURN allocation regardless of operator config. Set by
+    /// `on_topology_sealed` when the security contour is open for
+    /// external trust classes (contour_gaps bits 0 or 1 set), so relay
+    /// candidates use TCP and add path confidentiality.
+    bool prefer_turn_tcp = false;
+
+    /// Per-frame overhead (bytes) deducted from `path_mtu` when
+    /// computing the effective MTU floor. Set to 20 when the topology
+    /// confirms an E2E-capable security provider (16-byte
+    /// ChaCha20-Poly1305 AEAD tag + 4-byte seqno header).
+    int  security_overhead = 0;
+
+    /// When true, prepend a 4-byte big-endian sequence number to every
+    /// outbound application data frame on the UDP path, and reorder
+    /// inbound frames before delivery. Required by Noise: InlineCrypto
+    /// uses a counter nonce — out-of-order UDP delivery causes AEAD
+    /// authentication failure. TCP candidates are already ordered and
+    /// are unaffected by this flag.
+    bool ordered_delivery = false;
 };
 
 /// Decide whether a candidate of `(type, family)` survives the
@@ -312,7 +344,7 @@ enum class PairState : uint8_t {
 /// "around 5" and the FSM honours it strictly so a check list with
 /// dozens of pairs doesn't burst-storm STUN probes onto the wire
 /// (sender-side rate clamp on top of the retry-driven pacing).
-inline constexpr std::size_t kCheckConcurrencyCap = 5;
+inline constexpr std::size_t kCheckConcurrencyCap = 10;
 
 /// @brief ICE candidate pair under connectivity check.
 struct CheckPair {
@@ -342,6 +374,13 @@ struct CheckPair {
     /// We still record them in the check list so the response routes
     /// back through `handle_check_response`.
     bool      triggered = false;
+    /// RFC 8445 §8.1.2 (controlled agent): set when the controller
+    /// sent USE-CANDIDATE for this pair while it was still
+    /// Frozen / Waiting / InProgress.  `handle_check_response` calls
+    /// `on_nominated` once the binding response arrives successfully.
+    /// If the pair is already Succeeded when USE-CANDIDATE arrives,
+    /// `on_nominated` is called immediately and this flag is never set.
+    bool      pending_nomination = false;
     TransactionId txn_id;
     /// Monotonic microseconds at most-recent `send_check` call. Used
     /// to derive per-check RTT when the matching response arrives.
@@ -402,7 +441,9 @@ public:
                const std::string& peer_id, bool controlling,
                IceSessionCallbacks callbacks,
                std::shared_ptr<MdnsManager> mdns = nullptr,
-               IcePortmapClient* portmap_ext = nullptr);
+               IcePortmapClient* portmap_ext = nullptr,
+               exec::timed_thread_context* timer_ctx = nullptr
+               );
     ~IceSession();
 
     /// Start candidate gathering.
@@ -493,6 +534,18 @@ public:
     /// reads of in-flight RTT / retries are intentionally lossy.
     std::vector<PairState> check_list_states_for_test() const;
 
+    /// Test seam: overwrite check_list_[idx].state under local_state_mu_.
+    /// Used by tests that need specific Frozen/Failed/InProgress layouts
+    /// without forging STUN frames (e.g. regression for the any_pending
+    /// scan that broke when in_progress_count() >= kCheckConcurrencyCap).
+    void set_pair_state_for_test(std::size_t idx, PairState s);
+
+    /// Test seam: post one run_next_check() to the strand and block until
+    /// it completes. Valid after add_remote_candidates(eoc=true). Used in
+    /// conjunction with set_pair_state_for_test to observe FSM transitions
+    /// from a specific pair-state arrangement without a full STUN exchange.
+    void run_check_tick_for_test();
+
     /// Test seam: same role-conflict path the STUN dispatcher exercises
     /// on inbound BINDING_REQUEST, lifted to a synchronous call so a
     /// fixture can assert the resolution without forging a full STUN
@@ -561,6 +614,14 @@ public:
 private:
     asio::io_context& io_;
     asio::strand<asio::io_context::executor_type> strand_;
+    exec::timed_thread_context* timer_ctx_ = nullptr;
+    std::atomic<std::uint32_t>  check_gen_{0};
+    std::atomic<std::uint32_t>  keepalive_gen_{0};
+    std::atomic<std::uint32_t>  gather_gen_{0};
+    std::atomic<std::uint32_t>  nomination_wait_gen_{0};
+    std::atomic<std::uint32_t>  turn_allocate_gen_{0};
+    std::atomic<std::uint32_t>  turn_backup_gen_{0};
+    std::atomic<std::uint32_t>  pmtu_probe_gen_{0};
     gn::sdk::LinkCarrier* carrier_ = nullptr;
     /// Optional second carrier for TURN-over-TCP (RFC 5389 §7.2.2).
     /// Resolved from `gn.link.tcp` by `IceLink::set_host_api` and
@@ -609,7 +670,6 @@ private:
     std::vector<Candidate> remote_candidates_;
 
     std::vector<CheckPair> check_list_;
-    asio::steady_timer check_timer_;
     size_t current_check_ = 0;
 
     // ── Nominated pair (read from send(), written on strand) ────────────────
@@ -722,10 +782,8 @@ private:
     /// cleared on first hit. Total gather latency is bounded by the
     /// fastest reachable STUN server, not the sum of failed retries.
     std::vector<TransactionId>  pending_stun_probes_;
-    asio::steady_timer          gather_timer_;
 
     // Keepalive / consent
-    asio::steady_timer keepalive_timer_;
     std::atomic<uint32_t> consent_missed_{0};
     uint32_t consent_recovery_attempts_ = 0;
 
@@ -745,12 +803,10 @@ private:
     std::size_t turn_attempt_idx_ = 0;
     /// Per-attempt deadline; on expiry the in-flight TurnClient is
     /// torn down and `try_next_turn_attempt` advances.
-    asio::steady_timer turn_allocate_timer_;
     /// Entries in `cfg_.turn_servers` past the active primary —
     /// these get periodic ALLOCATE probes via `turn_backup_timer_`
     /// and stand by for failover when the primary degrades.
     std::vector<TurnConfig> turn_backups_;
-    asio::steady_timer      turn_backup_timer_;
     /// Most-recently-probed backup client; pinned across one probe
     /// cycle so a successful ALLOCATE can be promoted to the active
     /// relay. Reset between probes.
@@ -759,6 +815,10 @@ private:
     /// Wall-clock of the last failover commit. Compared against
     /// `cfg_.turn_failover_min_interval_s` to rate-limit oscillation.
     std::chrono::steady_clock::time_point turn_last_failover_{};
+
+    // Nomination wait timer (A-2) — armed by the controlled peer when the
+    // check list exhausts with valid pairs but no USE-CANDIDATE yet.
+    bool               nomination_wait_armed_{false};
 
     // mDNS responder + resolver. Borrowed from the parent `IceLink`
     // (one instance per plugin), so multiple sessions share the
@@ -858,6 +918,11 @@ private:
     gn_conn_id_t arm_tcp_so_connect(const std::string& ip,
                                       std::uint16_t port);
     void handle_check_response(const StunMessage& msg);
+    void handle_binding_request(const StunMessage& parsed,
+                                 gn_conn_id_t cid,
+                                 bool from_tcp);
+    void tear_down_cids();
+    void assign_initial_pair_states();
     void on_nominated(const std::string& ip, uint16_t port, bool relay,
                        gn_conn_id_t cid, TransportType transport);
 
@@ -867,6 +932,9 @@ private:
     /// the buf by const ref because the caller (`flush_*` /
     /// `send_on_strand` lambda) already owns the storage.
     void send_on_strand(const std::vector<std::uint8_t>& buf);
+    /// Strip the 4-byte seqno header, insert into the reorder buffer,
+    /// and flush consecutive frames to callbacks_.on_data. Strand-only.
+    void deliver_in_order(std::span<const std::uint8_t> raw);
 
     /// Drain `pending_app_data_` through `send_on_strand`. Called
     /// from `on_nominated` once `state_` is set to Connected and the
@@ -998,6 +1066,17 @@ private:
     /// only; ignored when `aggressive_nomination` is on.
     bool nominee_selected_ = false;
 
+    /// RFC 8445 §8.1.2 deferred nomination context (controlled agent).
+    /// When the controller sends USE-CANDIDATE for a pair that is still
+    /// Frozen/Waiting/InProgress, we store the nomination arguments
+    /// here and call on_nominated once the binding response succeeds.
+    /// All fields are strand-only; cleared when nomination completes.
+    std::string      pending_nom_ip_;
+    std::uint16_t    pending_nom_port_  = 0;
+    bool             pending_nom_relay_ = false;
+    gn_conn_id_t     pending_nom_cid_   = 0;
+    TransportType    pending_nom_tx_    = TransportType::Udp;
+
     /// RFC 8838 §10: peer indicated their trickle batch is complete.
     /// When set, `run_next_check` transitions the FSM to Failed as
     /// soon as the check list is exhausted with no valid pair — no
@@ -1059,11 +1138,26 @@ private:
     bool                            pmtu_inflight_       = false;
     /// Timer covering the in-flight probe; fires
     /// `on_path_mtu_probe_timeout` if no ACK arrives in time.
-    asio::steady_timer              pmtu_probe_timer_;
     /// Discovered MTU surfaced through `effective_path_mtu()` and
     /// the `gn.link.ice.path_mtu` extension. Atomic so callers can
     /// read without entering the strand.
     std::atomic<std::uint32_t>      effective_mtu_{0};
+
+    // ── Ordered delivery (UDP + Noise) ────────────────────────────────────
+    // Active only when cfg_.ordered_delivery is set. All fields are
+    // strand-exclusive (recv side never races, send_data_seq_ is atomic
+    // for the rare case where send() is called off-strand before posting).
+
+    /// Monotonically incrementing sequence number prepended to every
+    /// outbound application data frame on the UDP path.
+    std::atomic<std::uint32_t>      send_data_seq_{0};
+    /// Next expected receive sequence number; advanced as frames are
+    /// delivered in-order.
+    std::uint32_t                   recv_data_seq_{0};
+    /// Out-of-order frames keyed by sequence number; bounded to
+    /// kReorderWindow entries. Strand-exclusive.
+    std::map<std::uint32_t,
+             std::vector<std::uint8_t>> recv_reorder_buf_;
 };
 
 } // namespace gn::link::ice
