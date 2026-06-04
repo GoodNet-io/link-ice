@@ -7,6 +7,48 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### Known implementation mistake — conn_id / peer-PK conflation
+
+`IceSession` objects are keyed by `conn_id` inside the plugin rather than
+by the remote peer's public key.  The kernel's `ConnectionRegistry` model
+is: one logical session per remote PK, multiple `conn_id` values per
+session (one per nominated candidate pair).  The plugin inverts this —
+every new `conn_id` from the kernel spawns a fresh `IceSession`, so
+`conn_id` becomes the session identity instead of the peer PK.
+
+Observable consequences:
+
+- **Multi-connect / path migration**: when the same remote peer opens a
+  second connection the plugin creates a duplicate `IceSession` for the
+  same PK.  The two sessions run independent check ladders, never share
+  candidates, and the duplicate times out.  This is the primary cause of
+  the Docker ICE-3node 0 / 11 failure rate.
+- **TSan races**: concurrent `conn_id → session` map insertions from
+  the Asio strand and the test thread trigger data-race reports.
+- **`check_list_states_for_test()` deadlock**: the test accessor reads
+  `check_list_` without dispatching to the strand; `build_check_list()`
+  holds `local_state_mu_` on the strand and calls back into paths that
+  try to re-acquire the same mutex.
+
+The bug is invisible in the common single-connection case where
+`conn_id` and session happen to be 1:1.
+
+**Fix scope** (pending rewrite):
+
+1. Replace the `conn_id → IceSession` map with a `RemotePK → IceSession`
+   map; `conn_id` becomes an attribute of each session's nominated pair,
+   registered through `ConnectionRegistry` by the kernel — not by the
+   plugin.
+2. Remove `local_state_mu_` from all `check_list_` access paths; gate
+   every read and write behind the Asio strand.
+3. Remove `check_list_states_for_test()` or rewrite it as a
+   strand-dispatched future so tests don't race the I/O thread.
+4. Remove the `handle_new_conn` / `notify_connect` dual-path that exists
+   only to reconcile the duplicate-session corner case.
+
+Until the rewrite lands, the plugin should be treated as single-path
+only.
+
 ### `gn.link.portmap` integration: explicit-port-mapped srflx candidates
 
 `IceSession::gather()` now runs a new step `gather_portmap()` between
