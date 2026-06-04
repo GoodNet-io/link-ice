@@ -7,62 +7,42 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
-### Known implementation mistake — two-level conn_id layering
+### Known implementation mistake — multi-connect signal routing broken
 
-**Architecture background**: the kernel's `ConnectionRegistry` holds N
-`conn_id` entries per `peer_pk`.  A link plugin creates exactly one
-`conn_id` per `connect()` call via `notify_connect`.  Which `conn_id`
-to use for a given send is the strategy plugin's responsibility
-(`gn.float-send.*`).  `IceLink` correctly follows this: `sessions_`
-maps `conn_id → PeerEntry`, and `peer_to_ids_` maps `peer_pk → [conn_id, ...]`.
+**Architecture**: `IceLink` correctly implements the kernel's N-conn-per-peer
+model.  `sessions_` maps `conn_id → PeerEntry`; `peer_to_ids_` maps
+`peer_pk → [conn_id, ...]`.  Each `IceSession` internally holds
+composer-mode carrier handles (high-bit-tagged L1 ids, bypassing
+`notify_connect`) obtained via the composer `connect()` slot of
+`link-udp` / `link-tcp`.  These are private to the session and are
+not registered in `ConnectionRegistry`.  The two-handle-space model
+(kernel-registered ICE conn_id + composer-internal L1 handle) is
+correct by design and mirrors the WSS/TLS composer pattern.
 
-**First layer issue — carrier conn_ids leaking into the kernel**:
-`IceSession` calls `carrier_->connect(endpoint_uri, &cid)` (into
-`link-udp` / `link-tcp`) for every candidate endpoint it needs to probe.
-Each call produces a real kernel `conn_id` registered in
-`ConnectionRegistry` as a live UDP or TCP connection.  These carrier
-`conn_id` values are invisible to the application but are present in
-the kernel registry during the entire ICE negotiation.  `nominated_cid_`
-stores the carrier `conn_id` of the winning pair; all application data
-routes through `carrier_->send(nominated_cid_, data)`.  The
-ICE-level `conn_id` from `IceLink::connect` and the carrier-level
-`conn_id` inside `IceSession` are two independent kernel-visible
-namespaces simultaneously alive in the registry.
-
-Consequence: the kernel's connection count is inflated by all
-candidate-pair probes for the lifetime of each ICE session, and any
-subscriber to `GN_SUBSCRIBE_CONN_STATE` sees spurious `CONNECTED` /
-`DISCONNECTED` events for the carrier connections.
-
-**Second layer issue — signal routing ambiguity at multi-connect**:
+**What is broken — signal routing with `peer_to_ids_.size() > 1`**:
 OFFER/ANSWER blobs arrive at `IceLink::handle_new_conn` keyed by
 `peer_pk` (via the `gn.link.ice.signal` extension).  The signal
-envelope carries no session-specific token.  When `peer_to_ids_[peer_pk]
-.size() > 1` (multiple concurrent ICE sessions to the same peer), the
-plugin cannot determine which session an incoming OFFER belongs to and
-falls through to allocate a new `IceSession` via `notify_connect`.
-Each such fallthrough spawns a fully independent check ladder that
-cannot share candidates with the existing sessions, and the ladder
-times out.  Multi-connect to the same peer via ICE is therefore broken
-beyond the first session.
+envelope carries no session-specific token.  Current fallback: fold
+trickle candidates into the existing session only when exactly one
+session for the peer exists (`size() == 1` guard); when `size() > 1`
+allocate a new `IceSession` via `notify_connect`.  Each such
+fallthrough spawns a fully independent check ladder; incoming signals
+for the original sessions are lost and those ladders time out.
+Multi-connect to the same peer via ICE is therefore broken beyond the
+first session.
 
-**What is NOT broken**: single-connection path (one ICE session per
-peer) works correctly.  The `peer_to_ids_` / `sessions_` dual-map
-structure is sound; the issue is in signal routing, not session
-allocation.
+The single-connection path works correctly.
 
-**Fix scope** (pending rewrite):
+**Fix scope**:
 
-1. Add a session-token field (e.g. `ufrag` or an explicit 8-byte ID) to
-   the signal envelope so incoming OFFER/ANSWER can be routed to the
+1. Add a session token (local `ufrag` or an explicit nonce) to the
+   OFFER/ANSWER signal envelope so `handle_new_conn` can route to the
    correct existing session without relying on `size() == 1`.
-2. Stop registering candidate-probe connections in the kernel registry.
-   Carrier transport should be opaque: either use a raw socket directly
-   or go through a private carrier extension that does not call
-   `notify_connect` for probe connections.
-3. Gate all `check_list_` / `local_candidates_` reads and writes behind
+   The `AcceptFilterFn` on `LinkCarrier::on_accept` provides the
+   equivalent demux for inbound carrier data.
+2. Gate all `check_list_` / `local_candidates_` reads and writes behind
    the Asio strand; remove `local_state_mu_` from those paths.
-4. Rewrite `check_list_states_for_test()` as a strand-dispatched future
+3. Rewrite `check_list_states_for_test()` as a strand-dispatched future
    so tests do not race the I/O thread.
 
 Until the fix lands, treat the plugin as single-path only: one
