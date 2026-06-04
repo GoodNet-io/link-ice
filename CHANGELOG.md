@@ -7,6 +7,47 @@ versions track the kernel ABI through `gn_link_vtable_t` /
 
 ## [Unreleased]
 
+### P2300 timer migration, nomination logic, topology-aware config
+
+`asio::steady_timer` replaced throughout the session FSM with a
+generation-counter cancellation scheme backed by
+`exec::timed_thread_context` (P2300 / stdexec). Each timer
+arm increments an `uint64_t` generation; expired callbacks
+compare against the current generation and no-op if stale.
+The `asio::io_context` dependency is removed from the timer
+path; the session compiles and runs without Asio on platforms
+that provide only the stdexec runtime.
+
+New config knobs:
+
+- `ice.max_check_retries` — maximum per-pair retransmission
+  count before the pair is marked Failed (was hard-coded).
+- `ice.nomination_wait_ms` — time the controlling agent waits
+  after the first valid pair before sending a USE-CANDIDATE
+  nomination; allows lower-priority pairs to complete and
+  avoids nominating a relay pair when a direct path arrives
+  slightly later.
+
+New session methods wired from `on_topology_sealed`:
+
+- `set_prefer_turn_tcp(bool)` — prefer TCP-relay candidates
+  when the topology layer reports a TCP-friendly path.
+- `set_security_overhead(size_t)` — subtracts a cipher-overhead
+  budget from the discovered path MTU before publishing via
+  `gn.link.ice.path_mtu`.
+- `set_ordered_delivery(bool)` — hints the check ladder to
+  deprioritise UDP host pairs when the upper layer requires
+  ordered delivery (QUIC over ICE-TCP scenario).
+
+Log format: all `gn_log_info(…, "%.*s", …)` printf-style calls
+converted to `gn::log::info("{}", …)` format-style. Format-string
+type-safety is now enforced at compile time.
+
+New test: `tests/test_ice_nomination.cpp` — covers
+`nomination_wait_ms` window, early-nomination suppression, and
+the generation-counter cancellation path under timer-storm
+conditions.
+
 ### Known implementation mistake — multi-connect signal routing broken
 
 **Architecture**: `IceLink` correctly implements the kernel's N-conn-per-peer
